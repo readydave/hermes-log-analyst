@@ -84,14 +84,20 @@ fn run_command(binary: &str, args: &[&str]) -> Option<String> {
 }
 
 #[tauri::command]
-fn refresh_local_events() -> Result<usize, String> {
+async fn refresh_local_events() -> Result<usize, String> {
     let days = load_ingest_window_days();
     let now = Utc::now();
     let start = now - chrono::Duration::days(days as i64);
-    let events = collect_host_events_range(Some(start), Some(now), Some(2000));
-    save_local_events(&events)?;
-    let _ = prune_events_before(start.to_rfc3339().as_str());
-    Ok(events.len())
+    let start_str = start.to_rfc3339();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let events = collect_host_events_range(Some(start), Some(now), Some(2000));
+        save_local_events(&events)?;
+        let _ = prune_events_before(start_str.as_str());
+        Ok::<usize, String>(events.len())
+    })
+    .await
+    .map_err(|error| format!("Failed to collect events: {error}"))?
 }
 
 #[tauri::command]
@@ -137,11 +143,16 @@ fn set_ingest_window_days(days: u32) -> Result<u32, String> {
 }
 
 #[tauri::command]
-fn backfill_local_events(from: String, to: String) -> Result<usize, String> {
+async fn backfill_local_events(from: String, to: String) -> Result<usize, String> {
     let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
-    let events = collect_host_events_range(Some(start), Some(end), Some(5000));
-    save_local_events(&events)?;
-    Ok(events.len())
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let events = collect_host_events_range(Some(start), Some(end), Some(5000));
+        save_local_events(&events)?;
+        Ok::<usize, String>(events.len())
+    })
+    .await
+    .map_err(|error| format!("Failed to backfill events: {error}"))?
 }
 
 #[tauri::command]

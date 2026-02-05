@@ -141,6 +141,29 @@ function severityTint(severity: NormalizedEvent["severity"]) {
   }
 }
 
+const fieldLabelsByOs: Record<SupportedOs, { logName: string; provider: string; eventId?: string }> = {
+  windows: {
+    logName: "Log Name",
+    provider: "Provider",
+    eventId: "Event ID"
+  },
+  macos: {
+    logName: "Subsystem",
+    provider: "Process"
+  },
+  linux: {
+    logName: "Unit/Identifier",
+    provider: "Process"
+  }
+};
+
+function formatSelectedSummary(event: NormalizedEvent): string {
+  if (event.os === "windows" && event.eventId !== undefined) {
+    return `${event.provider} / ${event.eventId}`;
+  }
+  return `${event.provider} / ${event.logName}`;
+}
+
 export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("system");
   const [hostOs, setHostOs] = useState<SupportedOs>(browserDefaultOs);
@@ -171,6 +194,10 @@ export default function App() {
   const mergedEvents = useMemo(() => [...importedEvents, ...localEvents], [importedEvents, localEvents]);
   const filtered = useMemo(() => applyFilters(mergedEvents, activeFilters), [mergedEvents, activeFilters]);
   const visibleEvents = useMemo(() => sortEvents(filtered, sortState), [filtered, sortState]);
+  const hasWindowsEvents = useMemo(
+    () => mergedEvents.some((event) => event.os === "windows"),
+    [mergedEvents]
+  );
   const hasPendingFilterChanges = useMemo(
     () => JSON.stringify(filterDraft) !== JSON.stringify(activeFilters),
     [filterDraft, activeFilters]
@@ -179,10 +206,35 @@ export default function App() {
     () => crashes.find((crash) => crash.id === selectedCrashId) ?? null,
     [crashes, selectedCrashId]
   );
+  const selectedDetails = useMemo(() => {
+    if (!selected) return [];
+    const labels = fieldLabelsByOs[selected.os];
+    const details = [
+      { label: "OS", value: selected.os.toUpperCase() },
+      { label: "Timestamp", value: new Date(selected.timestamp).toLocaleString() },
+      { label: labels.logName, value: selected.logName },
+      { label: "Category", value: selected.category },
+      { label: labels.provider, value: selected.provider },
+      { label: "Severity", value: selected.severity }
+    ];
+
+    if (selected.os === "windows") {
+      details.splice(5, 0, {
+        label: labels.eventId ?? "Event ID",
+        value: selected.eventId?.toString() ?? "N/A"
+      });
+    }
+
+    details.push({ label: "Source", value: selected.imported ? "Imported" : "Live/Local" });
+    return details;
+  }, [selected]);
 
   const panelClass = "rounded-2xl border border-panel-border bg-panel backdrop-blur-xl shadow-glass";
   const inputClass = "h-9 w-full rounded-lg border border-panel-border bg-transparent px-3 text-sm text-text placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent/50";
   const selectClass = `${inputClass} pr-8`;
+  const filterGridClass = hasWindowsEvents
+    ? "grid gap-2 lg:grid-cols-[1.4fr_1fr_1fr_0.9fr_0.9fr_1fr]"
+    : "grid gap-2 lg:grid-cols-[1.4fr_1fr_0.9fr_0.9fr_1fr]";
 
   useEffect(() => {
     void (async () => {
@@ -193,6 +245,12 @@ export default function App() {
       await initialize();
     })();
   }, []);
+
+  useEffect(() => {
+    if (hasWindowsEvents) return;
+    setFilterDraft((prev) => (prev.eventId ? { ...prev, eventId: "" } : prev));
+    setActiveFilters((prev) => (prev.eventId ? { ...prev, eventId: "" } : prev));
+  }, [hasWindowsEvents]);
 
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
@@ -598,19 +656,21 @@ export default function App() {
 
           {!filtersCollapsed && (
             <div className="mt-3 space-y-3">
-              <div className="grid gap-2 lg:grid-cols-[1.4fr_1fr_1fr_0.9fr_0.9fr_1fr]">
+              <div className={filterGridClass}>
                 <input
                   className={inputClass}
                   value={filterDraft.text}
                   placeholder="Search message/log text"
                   onChange={(e) => updateFilter("text", e.target.value)}
                 />
-                <input
-                  className={inputClass}
-                  value={filterDraft.eventId}
-                  placeholder="Event ID"
-                  onChange={(e) => updateFilter("eventId", e.target.value)}
-                />
+                {hasWindowsEvents && (
+                  <input
+                    className={inputClass}
+                    value={filterDraft.eventId}
+                    placeholder="Event ID (Windows)"
+                    onChange={(e) => updateFilter("eventId", e.target.value)}
+                  />
+                )}
                 <input
                   className={inputClass}
                   value={filterDraft.source}
@@ -708,7 +768,7 @@ export default function App() {
         </section>
 
         <section className={cn(panelClass, "flex-1 min-h-0 overflow-auto")}> 
-          <table className="w-full min-w-[1100px] table-fixed">
+          <table className={cn("w-full table-fixed", hasWindowsEvents ? "min-w-[1100px]" : "min-w-[1000px]")}>
             <thead className="sticky top-0 z-10 bg-panel backdrop-blur">
               <tr className="text-left text-xs uppercase tracking-wide text-muted">
                 <th className="w-40 px-3 py-2">
@@ -726,11 +786,13 @@ export default function App() {
                     Provider <span className="text-muted">{sortIndicator("provider")}</span>
                   </button>
                 </th>
-                <th className="w-24 px-3 py-2">
-                  <button onClick={() => onColumnSort("eventId")} className="flex items-center gap-2 font-semibold">
-                    Event ID <span className="text-muted">{sortIndicator("eventId")}</span>
-                  </button>
-                </th>
+                {hasWindowsEvents && (
+                  <th className="w-24 px-3 py-2">
+                    <button onClick={() => onColumnSort("eventId")} className="flex items-center gap-2 font-semibold">
+                      Event ID <span className="text-muted">{sortIndicator("eventId")}</span>
+                    </button>
+                  </th>
+                )}
                 <th className="w-24 px-3 py-2">
                   <button onClick={() => onColumnSort("severity")} className="flex items-center gap-2 font-semibold">
                     Severity <span className="text-muted">{sortIndicator("severity")}</span>
@@ -751,7 +813,7 @@ export default function App() {
             <tbody className="text-sm">
               {visibleEvents.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-3 py-6 text-center text-sm text-muted">
+                  <td colSpan={hasWindowsEvents ? 7 : 6} className="px-3 py-6 text-center text-sm text-muted">
                     No events match the current filters.
                   </td>
                 </tr>
@@ -771,7 +833,9 @@ export default function App() {
                     {event.logName} / <span className="text-muted">{event.category}</span>
                   </td>
                   <td className="truncate px-3 py-2">{event.provider}</td>
-                  <td className="truncate px-3 py-2">{event.eventId ?? "-"}</td>
+                  {hasWindowsEvents && (
+                    <td className="truncate px-3 py-2">{event.eventId ?? "-"}</td>
+                  )}
                   <td className="truncate px-3 py-2 capitalize">{event.severity}</td>
                   <td className="truncate px-3 py-2" title={event.message}>{event.message}</td>
                   <td className="truncate px-3 py-2 text-xs text-muted">{event.imported ? "Imported" : "Live/Local"}</td>
@@ -781,13 +845,31 @@ export default function App() {
           </table>
         </section>
 
-        <footer className={cn(panelClass, "flex flex-wrap items-center justify-between gap-3 px-5 py-4")}> 
-          <div className="text-sm font-semibold">
-            Selected event: {selected ? `${selected.provider} / ${selected.eventId ?? "N/A"}` : "None"}
+        <footer className={cn(panelClass, "flex flex-wrap items-start justify-between gap-4 px-5 py-4")}> 
+          <div className="min-w-[240px] flex-1 space-y-2">
+            <div className="text-sm font-semibold">
+              Selected event: {selected ? formatSelectedSummary(selected) : "None"}
+            </div>
+            {!selected && (
+              <div className="text-xs text-muted">Select a row to enable actions and see details.</div>
+            )}
+            {selected && (
+              <>
+                <div className="grid gap-2 text-xs text-muted sm:grid-cols-2 lg:grid-cols-4">
+                  {selectedDetails.map((detail) => (
+                    <div key={detail.label} className="space-y-1">
+                      <div className="text-[10px] uppercase tracking-wide text-muted">{detail.label}</div>
+                      <div className="text-sm text-text">{detail.value}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="space-y-1">
+                  <div className="text-[10px] uppercase tracking-wide text-muted">Message</div>
+                  <div className="max-h-24 overflow-auto text-sm text-text">{selected.message}</div>
+                </div>
+              </>
+            )}
           </div>
-          {!selected && (
-            <div className="text-xs text-muted">Select a row to enable actions and see details.</div>
-          )}
           <div className="flex flex-wrap items-center gap-2">
             <Button size="sm" onClick={() => void openGoogle()} disabled={!selected}>Search Google</Button>
             <Button size="sm" onClick={() => void copyPrompt()} disabled={!selected}>
