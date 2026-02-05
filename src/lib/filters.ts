@@ -15,6 +15,32 @@ export const defaultFilters: EventFilters = {
   dateTo: ""
 };
 
+function parseLocalDateStart(value: string): number | null {
+  if (!value) return null;
+  if (value.includes("-")) {
+    const [year, month, day] = value.split("-").map(Number);
+    if (!year || !month || !day) return null;
+    return new Date(year, month - 1, day, 0, 0, 0, 0).getTime();
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return null;
+  const date = new Date(parsed);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0).getTime();
+}
+
+function parseLocalDateEnd(value: string): number | null {
+  if (!value) return null;
+  if (value.includes("-")) {
+    const [year, month, day] = value.split("-").map(Number);
+    if (!year || !month || !day) return null;
+    return new Date(year, month - 1, day, 23, 59, 59, 999).getTime();
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return null;
+  const date = new Date(parsed);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999).getTime();
+}
+
 export function applyFilters(events: NormalizedEvent[], filters: EventFilters): NormalizedEvent[] {
   return events.filter((event) => {
     if (!filters.severities[event.severity]) return false;
@@ -35,8 +61,15 @@ export function applyFilters(events: NormalizedEvent[], filters: EventFilters): 
     }
 
     const eventTime = Date.parse(event.timestamp);
-    if (filters.dateFrom && eventTime < Date.parse(filters.dateFrom)) return false;
-    if (filters.dateTo && eventTime > Date.parse(`${filters.dateTo}T23:59:59`)) return false;
+    let start = parseLocalDateStart(filters.dateFrom);
+    let end = parseLocalDateEnd(filters.dateTo);
+    if (start !== null && end !== null && start > end) {
+      const tmp = start;
+      start = end;
+      end = tmp;
+    }
+    if (start !== null && eventTime < start) return false;
+    if (end !== null && eventTime > end) return false;
 
     return true;
   });

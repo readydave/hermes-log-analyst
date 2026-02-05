@@ -2,7 +2,7 @@ mod linux;
 mod macos;
 mod windows;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -82,10 +82,14 @@ pub fn detect_host_os() -> SupportedOs {
     }
 }
 
-pub fn collect_host_events() -> Vec<NormalizedEvent> {
+pub fn collect_host_events_range(
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max_events: Option<u32>,
+) -> Vec<NormalizedEvent> {
     match detect_host_os() {
-        SupportedOs::Windows => windows::collect_events(),
-        SupportedOs::Linux => linux::collect_events(),
-        SupportedOs::Macos => macos::collect_events(),
+        SupportedOs::Windows => windows::collect_events_range(start, end, max_events),
+        SupportedOs::Linux => linux::collect_events_range(start, end, max_events),
+        SupportedOs::Macos => macos::collect_events_range(start, end, max_events),
     }
 }

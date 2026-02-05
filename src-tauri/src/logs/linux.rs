@@ -1,7 +1,12 @@
 use super::{NormalizedEvent, SupportedOs};
+use chrono::{DateTime, Utc};
 
-pub fn collect_events() -> Vec<NormalizedEvent> {
-    // TODO: Replace seeded events with journald/syslog live readers.
+pub fn collect_events_range(
+    _start: Option<DateTime<Utc>>,
+    _end: Option<DateTime<Utc>>,
+    _max_events: Option<u32>,
+) -> Vec<NormalizedEvent> {
+    // TODO: journald/syslog range query.
     vec![
         NormalizedEvent::new(
             SupportedOs::Linux,

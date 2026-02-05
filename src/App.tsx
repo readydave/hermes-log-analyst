@@ -14,7 +14,10 @@ import {
   openExternalUrl,
   quitApp,
   refreshLocalEvents,
-  setExportDirectory
+  setExportDirectory,
+  backfillLocalEvents,
+  getIngestWindowDays,
+  setIngestWindowDays
 } from "./lib/backend";
 import { exportAsCsv, exportAsJson } from "./lib/export";
 import { applyFilters, defaultFilters } from "./lib/filters";
@@ -145,6 +148,7 @@ export default function App() {
   const [filterDraft, setFilterDraft] = useState<EventFilters>(createDefaultFilters);
   const [activeFilters, setActiveFilters] = useState<EventFilters>(createDefaultFilters);
   const [filtersCollapsed, setFiltersCollapsed] = useState(false);
+  const [dataCollapsed, setDataCollapsed] = useState(true);
   const [localEvents, setLocalEvents] = useState<NormalizedEvent[]>(fallbackEvents);
   const [importedEvents, setImportedEvents] = useState<NormalizedEvent[]>([]);
   const [crashes, setCrashes] = useState<CrashRecord[]>([]);
@@ -154,6 +158,9 @@ export default function App() {
   const [sortState, setSortState] = useState<SortState | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [exportDirectory, setExportDirectoryState] = useState<string | null>(null);
+  const [ingestWindowDays, setIngestWindowDaysState] = useState<number>(7);
+  const [backfillFrom, setBackfillFrom] = useState("");
+  const [backfillTo, setBackfillTo] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [lastError, setLastError] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
@@ -257,6 +264,7 @@ export default function App() {
       const version = await getHostOsVersion().catch(() => "Unknown (not provided by host)");
       setHostOsVersion(version);
       setExportDirectoryState(await getExportDirectory());
+      setIngestWindowDaysState(await getIngestWindowDays());
       await refreshLocalEvents();
       const collected = await getLocalEvents();
       if (collected.length > 0) setLocalEvents(collected);
@@ -440,6 +448,37 @@ export default function App() {
     }
   }
 
+
+  async function saveIngestWindow(): Promise<void> {
+    setLastError("");
+    try {
+      const days = Math.max(1, Math.min(365, Math.floor(ingestWindowDays)));
+      const saved = await setIngestWindowDays(days);
+      setIngestWindowDaysState(saved);
+      await refreshLocalEvents();
+      setExportStatus(`Ingest window set to ${saved} days and synced.`);
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to update ingest window.");
+    }
+  }
+
+  async function backfillRange(): Promise<void> {
+    if (!backfillFrom || !backfillTo) {
+      setLastError("Backfill requires both From and To dates.");
+      return;
+    }
+    setLastError("");
+    try {
+      const count = await backfillLocalEvents(backfillFrom, backfillTo);
+      await refreshLocalEvents();
+      setExportStatus(`Backfilled ${count} events.`);
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to backfill events.");
+    }
+  }
+
   async function exportEvents(format: "json" | "csv", events: NormalizedEvent[], filename: string): Promise<void> {
     setLastError("");
     try {
@@ -463,8 +502,8 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen">
-      <div className="mx-auto flex min-h-screen max-w-screen-2xl flex-col gap-4 px-4 py-4">
+    <div className="h-screen overflow-hidden">
+      <div className="mx-auto flex h-full max-w-screen-2xl flex-col gap-4 px-4 py-4">
         <header className={cn(panelClass, "flex flex-wrap items-center justify-between gap-4 px-5 py-4")}> 
           <div>
             <h1 className="text-2xl font-bold tracking-tight">Hermes Log Analyst</h1>
@@ -495,15 +534,15 @@ export default function App() {
         )}
 
         {settingsOpen && (
-          <section className={cn(panelClass, "space-y-3 px-5 py-4")}> 
+          <section className={cn(panelClass, "space-y-4 px-5 py-4")}> 
             <div className="text-sm font-semibold">Settings</div>
             <div className="grid gap-2">
               <label className="text-xs text-muted">Export Folder</label>
               <input className={inputClass} value={exportDirectory ?? "Downloads (default)"} readOnly />
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={() => void chooseExportFolder()}>Choose Folder</Button>
-              <Button onClick={() => void clearExportFolder()}>Use Downloads Default</Button>
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => void chooseExportFolder()}>Choose Folder</Button>
+                <Button onClick={() => void clearExportFolder()}>Use Downloads Default</Button>
+              </div>
             </div>
           </section>
         )}
@@ -623,6 +662,43 @@ export default function App() {
             </div>
           )}
         </section>
+              <div className="mt-4 border-t border-panel-border pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-semibold">Data Window</div>
+                  <Button size="sm" onClick={() => setDataCollapsed((prev) => !prev)}>
+                    {dataCollapsed ? "Show Data" : "Hide Data"}
+                  </Button>
+                </div>
+
+                {!dataCollapsed && (
+                  <div className="mt-3 space-y-3">
+                    <div className="grid gap-2 md:grid-cols-[160px_1fr]">
+                      <label className="text-xs text-muted">Ingest Window (days)</label>
+                      <div className="flex flex-wrap gap-2">
+                        <input
+                          className={inputClass}
+                          type="number"
+                          min={1}
+                          max={365}
+                          value={ingestWindowDays}
+                          onChange={(e) => setIngestWindowDaysState(Number(e.target.value))}
+                        />
+                        <Button size="sm" variant="primary" onClick={() => void saveIngestWindow()}>
+                          Save & Sync
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="grid gap-2">
+                      <label className="text-xs text-muted">Backfill Range</label>
+                      <div className="grid gap-2 md:grid-cols-2">
+                        <input className={inputClass} type="date" value={backfillFrom} onChange={(e) => setBackfillFrom(e.target.value)} />
+                        <input className={inputClass} type="date" value={backfillTo} onChange={(e) => setBackfillTo(e.target.value)} />
+                      </div>
+                      <Button size="sm" onClick={() => void backfillRange()}>Sync Range</Button>
+                    </div>
+                  </div>
+                )}
+              </div>
 
         <section className={cn(panelClass, "flex flex-wrap items-center justify-between gap-3 px-5 py-3")}> 
           <Button size="sm" onClick={resetSort} disabled={!sortState}>Reset Sort</Button>
@@ -673,6 +749,13 @@ export default function App() {
               </tr>
             </thead>
             <tbody className="text-sm">
+              {visibleEvents.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="px-3 py-6 text-center text-sm text-muted">
+                    No events match the current filters.
+                  </td>
+                </tr>
+              )}
               {visibleEvents.map((event) => (
                 <tr
                   key={event.id}

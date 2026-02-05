@@ -6,10 +6,14 @@ mod settings;
 use crash::{build_sample_crash, CrashRecord};
 use db::{
     correlate_crash_events, get_crashes as read_crashes, get_local_events as read_local_events,
-    save_crashes, save_local_events,
+    prune_events_before, save_crashes, save_local_events,
 };
-use logs::{collect_host_events, detect_host_os, NormalizedEvent};
-use settings::{load_export_dir, load_theme, save_export_dir, save_theme};
+use logs::{collect_host_events_range, detect_host_os, NormalizedEvent};
+use settings::{
+    load_export_dir, load_ingest_window_days, load_theme, save_export_dir, save_ingest_window_days,
+    save_theme,
+};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
@@ -81,8 +85,12 @@ fn run_command(binary: &str, args: &[&str]) -> Option<String> {
 
 #[tauri::command]
 fn refresh_local_events() -> Result<usize, String> {
-    let events = collect_host_events();
+    let days = load_ingest_window_days();
+    let now = Utc::now();
+    let start = now - chrono::Duration::days(days as i64);
+    let events = collect_host_events_range(Some(start), Some(now), Some(2000));
     save_local_events(&events)?;
+    let _ = prune_events_before(start.to_rfc3339().as_str());
     Ok(events.len())
 }
 
@@ -115,6 +123,25 @@ fn get_crash_related_events(
     let window = window_minutes.unwrap_or(15).clamp(1, 180);
     let max_events = limit.unwrap_or(200).min(2000);
     correlate_crash_events(crash_id.as_str(), window, max_events)
+}
+
+#[tauri::command]
+fn get_ingest_window_days() -> u32 {
+    load_ingest_window_days()
+}
+
+#[tauri::command]
+fn set_ingest_window_days(days: u32) -> Result<u32, String> {
+    save_ingest_window_days(days)?;
+    Ok(load_ingest_window_days())
+}
+
+#[tauri::command]
+fn backfill_local_events(from: String, to: String) -> Result<usize, String> {
+    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
+    let events = collect_host_events_range(Some(start), Some(end), Some(5000));
+    save_local_events(&events)?;
+    Ok(events.len())
 }
 
 #[tauri::command]
@@ -250,6 +277,35 @@ fn setup_menu(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn parse_local_date_range(from: &str, to: &str) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    let start_date = NaiveDate::parse_from_str(from, "%Y-%m-%d")
+        .map_err(|_| "Invalid start date format (expected YYYY-MM-DD).")?;
+    let end_date = NaiveDate::parse_from_str(to, "%Y-%m-%d")
+        .map_err(|_| "Invalid end date format (expected YYYY-MM-DD).")?;
+
+    let start_local = Local
+        .from_local_datetime(&start_date.and_hms_opt(0, 0, 0).ok_or("Invalid start time")?)
+        .single()
+        .ok_or("Unable to interpret start date in local timezone.")?;
+    let end_local = Local
+        .from_local_datetime(&end_date.and_hms_opt(23, 59, 59).ok_or("Invalid end time")?)
+        .single()
+        .ok_or("Unable to interpret end date in local timezone.")?;
+
+    let mut start = start_local.with_timezone(&Utc);
+    let mut end = end_local.with_timezone(&Utc);
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+
+    let max_span = chrono::Duration::days(365);
+    if end - start > max_span {
+        return Err("Backfill range is too large (max 365 days).".to_string());
+    }
+
+    Ok((start, end))
+}
+
 fn sanitize_filename(filename: &str, extension: &str) -> String {
     let raw_name = Path::new(filename)
         .file_name()
@@ -329,6 +385,9 @@ fn main() {
             get_crashes,
             get_crash_related_events,
             open_external_url,
+            get_ingest_window_days,
+            set_ingest_window_days,
+            backfill_local_events,
             get_export_directory,
             choose_export_directory,
             set_export_directory,

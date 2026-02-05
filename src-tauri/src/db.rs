@@ -227,6 +227,17 @@ pub fn get_crashes(limit: u32) -> Result<Vec<CrashRecord>, String> {
     Ok(crashes)
 }
 
+pub fn prune_events_before(cutoff: &str) -> Result<usize, String> {
+    let conn = open_connection()?;
+    let deleted = conn
+        .execute(
+            "DELETE FROM events WHERE julianday(timestamp) < julianday(?1)",
+            [cutoff],
+        )
+        .map_err(|e| format!("Failed to prune events: {e}"))?;
+    Ok(deleted)
+}
+
 pub fn correlate_crash_events(
     crash_id: &str,
     window_minutes: i64,

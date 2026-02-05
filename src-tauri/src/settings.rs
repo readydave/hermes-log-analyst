@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 const THEME_FILE: &str = "theme.txt";
 const EXPORT_DIR_FILE: &str = "export_dir.txt";
+const INGEST_DAYS_FILE: &str = "ingest_window_days.txt";
+const DEFAULT_INGEST_DAYS: u32 = 7;
 
 fn settings_dir() -> Result<PathBuf, String> {
     let mut base = data_local_dir().ok_or("Unable to resolve local data directory")?;
@@ -21,6 +23,12 @@ fn theme_path() -> Result<PathBuf, String> {
 fn export_dir_path() -> Result<PathBuf, String> {
     let mut dir = settings_dir()?;
     dir.push(EXPORT_DIR_FILE);
+    Ok(dir)
+}
+
+fn ingest_days_path() -> Result<PathBuf, String> {
+    let mut dir = settings_dir()?;
+    dir.push(INGEST_DAYS_FILE);
     Ok(dir)
 }
 
@@ -85,4 +93,29 @@ pub fn load_export_dir() -> Option<String> {
     } else {
         None
     }
+}
+
+pub fn save_ingest_window_days(days: u32) -> Result<(), String> {
+    if days == 0 || days > 365 {
+        return Err("Ingest window must be between 1 and 365 days.".to_string());
+    }
+
+    let path = ingest_days_path()?;
+    fs::write(path, days.to_string().as_bytes())
+        .map_err(|e| format!("Failed to save ingest window: {e}"))?;
+    Ok(())
+}
+
+pub fn load_ingest_window_days() -> u32 {
+    let path = ingest_days_path();
+    if path.is_err() {
+        return DEFAULT_INGEST_DAYS;
+    }
+    let Ok(path) = path else {
+        return DEFAULT_INGEST_DAYS;
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return DEFAULT_INGEST_DAYS;
+    };
+    raw.trim().parse::<u32>().ok().filter(|value| *value > 0 && *value <= 365).unwrap_or(DEFAULT_INGEST_DAYS)
 }

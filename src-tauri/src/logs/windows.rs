@@ -1,4 +1,5 @@
 use super::{NormalizedEvent, SupportedOs};
+use chrono::{DateTime, Utc};
 #[cfg(target_os = "windows")]
 use serde::Deserialize;
 #[cfg(target_os = "windows")]
@@ -7,18 +8,40 @@ use serde_json::Value;
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
-pub fn collect_events() -> Vec<NormalizedEvent> {
+pub fn collect_events_range(
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max_events: Option<u32>,
+) -> Vec<NormalizedEvent> {
     let script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $logs = @('Application', 'Security', 'System')
-$events = Get-WinEvent -FilterHashtable @{LogName = $logs} -MaxEvents 500 |
+$startArg = $null
+$endArg = $null
+if ($env:HLA_START) { $startArg = [DateTime]::Parse($env:HLA_START) }
+if ($env:HLA_END) { $endArg = [DateTime]::Parse($env:HLA_END) }
+$filter = @{LogName = $logs}
+if ($null -ne $startArg) { $filter.StartTime = $startArg }
+if ($null -ne $endArg) { $filter.EndTime = $endArg }
+$limit = if ($env:HLA_MAX) { [int]$env:HLA_MAX } else { 500 }
+$events = Get-WinEvent -FilterHashtable $filter -MaxEvents $limit |
   Select-Object LogName, ProviderName, Id, LevelDisplayName, TimeCreated, Message, RecordId
 if ($null -eq $events) { '[]' } else { $events | ConvertTo-Json -Depth 5 -Compress }
 "#;
 
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output();
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    if let Some(value) = start {
+        command.env("HLA_START", value.to_rfc3339());
+    }
+    if let Some(value) = end {
+        command.env("HLA_END", value.to_rfc3339());
+    }
+    if let Some(value) = max_events {
+        command.env("HLA_MAX", value.to_string());
+    }
+
+    let output = command.output();
 
     match output {
         Ok(result) if result.status.success() => parse_events_json(&result.stdout),
@@ -28,7 +51,11 @@ if ($null -eq $events) { '[]' } else { $events | ConvertTo-Json -Depth 5 -Compre
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn collect_events() -> Vec<NormalizedEvent> {
+pub fn collect_events_range(
+    _start: Option<DateTime<Utc>>,
+    _end: Option<DateTime<Utc>>,
+    _max_events: Option<u32>,
+) -> Vec<NormalizedEvent> {
     fallback_seed_events(None)
 }
 

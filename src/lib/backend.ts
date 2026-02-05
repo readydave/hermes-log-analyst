@@ -29,6 +29,27 @@ export async function getHostOsVersion(): Promise<string> {
   return value?.trim() ? value.trim() : "Unknown (not provided by host)";
 }
 
+export async function getIngestWindowDays(): Promise<number> {
+  if (!isTauriRuntime()) return 7;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("get_ingest_window_days");
+}
+
+export async function setIngestWindowDays(days: number): Promise<number> {
+  if (!isTauriRuntime()) return days;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("set_ingest_window_days", { days });
+}
+
+export async function backfillLocalEvents(from: string, to: string): Promise<number> {
+  if (!isTauriRuntime()) return 0;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("backfill_local_events", { from, to });
+}
+
 export async function refreshLocalEvents(): Promise<number> {
   if (!isTauriRuntime()) return 0;
 

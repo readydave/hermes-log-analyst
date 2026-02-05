@@ -1,7 +1,12 @@
 use super::{NormalizedEvent, SupportedOs};
+use chrono::{DateTime, Utc};
 
-pub fn collect_events() -> Vec<NormalizedEvent> {
-    // TODO: Replace seeded events with Unified Logging live stream parser.
+pub fn collect_events_range(
+    _start: Option<DateTime<Utc>>,
+    _end: Option<DateTime<Utc>>,
+    _max_events: Option<u32>,
+) -> Vec<NormalizedEvent> {
+    // TODO: Unified Logging range query.
     vec![
         NormalizedEvent::new(
             SupportedOs::Macos,
