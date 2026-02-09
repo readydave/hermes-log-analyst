@@ -39,5 +39,6 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
 ## Notes
 
 - Imported events are intentionally kept out of SQLite for performance and to avoid mixing live and imported data.
-- Windows collector now attempts live reads with `Get-WinEvent` (Application/Security/System) and falls back to seeded events on failure.
-- Linux and macOS collectors still use seeded data and are scaffolded for native integration.
+- Windows collector uses the native Event Log API (wevtapi) for Application/System/Security and falls back to seeded events on failure.
+- Linux collector uses `journalctl --since/--until -o json`.
+- macOS collector uses `log show --style json` with start/end ranges.

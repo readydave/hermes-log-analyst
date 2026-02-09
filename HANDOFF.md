@@ -1,7 +1,7 @@
 # Hermes Log Analyst – Handoff
 
 ## Repo
-- Path: /Users/dave/Documents/code/hermes
+- Path: C:\Code\hermes
 - Branch: main
 - Stack: React + TypeScript + Tailwind (Vite), Rust + Tauri, SQLite
 
@@ -28,22 +28,31 @@
 - Ingest sync uses date ranges; pruning of old rows based on ingest window.
 - Backfill range supported (1–365 days).
 
+## Collector Status
+- Windows: native Event Log API (wevtapi) across Application/System/Security, XML render + message formatting.
+- macOS: Unified Logging via `log show --style json` with start/end range.
+- Linux: journald via `journalctl --since/--until -o json`.
+- All platforms fall back to seeded events if collection fails.
+
 ## What’s Still Stubbed
-- Linux/macOS collectors are seeded (no real log data yet).
-- Windows collector uses PowerShell (Get-WinEvent) with max events.
 - Real crash importers not implemented yet.
 
 ## Next Work Items (Recommended)
-1) Implement real log collectors:
-   - macOS: Unified Logging (`log show --start --end`)
-   - Linux: journald (`journalctl --since/--until`)
-   - Windows: native Event Log API for scale/perf
-2) UX polish:
+1) UX polish:
    - Data coverage hint (ingested range)
    - Warning if filters outside ingested range
-3) Crash importers (metadata-first)
-4) Performance: virtualized table rows
-5) Remote machine support (SSH/WinRM)
+2) Crash importers (metadata-first)
+3) Performance: virtualized table rows
+4) Remote machine support (SSH/WinRM)
+
+## Objective Recheck (2026-02-09)
+- 1) UX polish (coverage hint + out-of-range warning): `pending`
+- 2) Crash importers (metadata-first): `pending`
+- 3) Performance (virtualized table rows): `pending`
+- 4) Remote machine support (SSH/WinRM): `pending`
+- Notes:
+  - Collectors objective from prior handoff is complete (native Windows/macOS/Linux collectors now in place).
+  - Current crash flow is sample-driven for correlation/testing (`create_sample_crash`), not importer-driven.
 
 ## How to run
 - `npm install`
