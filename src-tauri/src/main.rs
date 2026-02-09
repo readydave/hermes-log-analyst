@@ -3,7 +3,7 @@ mod db;
 mod logs;
 mod settings;
 
-use crash::{build_sample_crash, import_host_crashes as collect_host_crashes, CrashRecord};
+use crash::{import_host_crashes as collect_host_crashes, CrashRecord};
 use db::{
     correlate_crash_events, get_crashes as read_crashes, get_local_events as read_local_events,
     get_local_events_range as read_local_events_range, prune_events_before, prune_events_outside,
@@ -124,14 +124,6 @@ fn get_local_events_range(
     let start_str = start.to_rfc3339();
     let end_str = end.to_rfc3339();
     read_local_events_range(start_str.as_str(), end_str.as_str(), limit)
-}
-
-#[tauri::command]
-fn create_sample_crash() -> Result<CrashRecord, String> {
-    let os = detect_host_os().to_string();
-    let crash = build_sample_crash(os.as_str());
-    save_crashes(std::slice::from_ref(&crash))?;
-    Ok(crash)
 }
 
 #[tauri::command]
@@ -474,7 +466,6 @@ fn main() {
             refresh_local_events,
             get_local_events,
             get_local_events_range,
-            create_sample_crash,
             import_host_crashes,
             get_crashes,
             get_crash_related_events,

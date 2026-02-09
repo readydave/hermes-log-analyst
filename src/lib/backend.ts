@@ -112,13 +112,6 @@ export async function getLocalEventsRange(
   return invoke<NormalizedEvent[]>("get_local_events_range", { from, to, limit });
 }
 
-export async function createSampleCrash(): Promise<CrashRecord | null> {
-  if (!isTauriRuntime()) return null;
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<CrashRecord>("create_sample_crash");
-}
-
 export async function importHostCrashes(limit = 200): Promise<number> {
   if (!isTauriRuntime()) return 0;
 

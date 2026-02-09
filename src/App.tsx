@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   chooseExportDirectory,
-  createSampleCrash,
   importHostCrashes,
   exportEventsToFile,
   getCrashRelatedEvents,
@@ -37,31 +36,6 @@ const browserDefaultOs: SupportedOs = navigator.userAgent.includes("Windows")
   : navigator.userAgent.includes("Mac")
     ? "macos"
     : "linux";
-
-const fallbackEvents: NormalizedEvent[] = [
-  {
-    id: "a1",
-    timestamp: new Date().toISOString(),
-    os: browserDefaultOs,
-    logName: browserDefaultOs === "windows" ? "Application" : "system",
-    category: "application",
-    provider: "SampleProvider",
-    eventId: 1001,
-    severity: "information",
-    message: "Service started successfully."
-  },
-  {
-    id: "a2",
-    timestamp: new Date(Date.now() - 3600000).toISOString(),
-    os: browserDefaultOs,
-    logName: browserDefaultOs === "windows" ? "System" : "kernel",
-    category: "system",
-    provider: "Kernel",
-    eventId: 41,
-    severity: "warning",
-    message: "Unexpected restart detected."
-  }
-];
 
 const windowsChannelOptions = ["Application", "System", "Security"] as const;
 
@@ -204,7 +178,7 @@ export default function App() {
   const [crashCollapsed, setCrashCollapsed] = useState(false);
   const [filtersCollapsed, setFiltersCollapsed] = useState(false);
   const [dataCollapsed, setDataCollapsed] = useState(true);
-  const [localEvents, setLocalEvents] = useState<NormalizedEvent[]>(fallbackEvents);
+  const [localEvents, setLocalEvents] = useState<NormalizedEvent[]>([]);
   const [importedEvents, setImportedEvents] = useState<NormalizedEvent[]>([]);
   const [crashes, setCrashes] = useState<CrashRecord[]>([]);
   const [selectedCrashId, setSelectedCrashId] = useState<string>("");
@@ -494,19 +468,6 @@ export default function App() {
 
     setSelectedCrashId(targetId);
     setCorrelatedEvents(await getCrashRelatedEvents(targetId, 15, 250));
-  }
-
-  async function createCrashSampleNow(): Promise<void> {
-    setLastError("");
-    try {
-      const crash = await createSampleCrash();
-      if (!crash) return;
-      await refreshCrashes();
-      setSelectedCrashId(crash.id);
-      setCorrelatedEvents(await getCrashRelatedEvents(crash.id, 15, 250));
-    } catch (error) {
-      setLastError(error instanceof Error ? error.message : "Failed to create sample crash.");
-    }
   }
 
   async function importHostCrashesNow(): Promise<void> {
@@ -913,7 +874,6 @@ export default function App() {
                   <div className="mt-3 space-y-3">
                     <div className="flex flex-wrap items-center gap-3">
                       <Button size="sm" variant="primary" onClick={() => void importHostCrashesNow()}>Import Host Crashes</Button>
-                      <Button size="sm" onClick={() => void createCrashSampleNow()}>Simulate Crash</Button>
                       <label className="text-xs text-muted">Crash</label>
                       <select className={cn(selectClass, "max-w-xs text-xs")} value={selectedCrashId} onChange={(e) => void onCrashSelectionChange(e.target.value)}>
                         {crashes.length === 0 && <option value="">No crashes recorded</option>}

@@ -50,41 +50,6 @@ impl CrashRecord {
     }
 }
 
-pub fn build_sample_crash(os: &str) -> CrashRecord {
-    match os {
-        "windows" => CrashRecord::new(
-            "windows",
-            "WER",
-            "BSOD",
-            Some("0x0000009F"),
-            "Bugcheck indicates DRIVER_POWER_STATE_FAILURE during resume.",
-            Some("nvlddmkm.sys"),
-            Some("C:\\Windows\\Minidump\\sample.dmp"),
-            false,
-        ),
-        "macos" => CrashRecord::new(
-            "macos",
-            "DiagnosticReports",
-            "Kernel Panic",
-            Some("panic(cpu 0 caller 0xffff...)"),
-            "Kernel panic appears related to GPU watchdog timeout.",
-            Some("AppleGPUWrangler"),
-            Some("/Library/Logs/DiagnosticReports/Kernel_sample.panic"),
-            false,
-        ),
-        _ => CrashRecord::new(
-            "linux",
-            "kdump",
-            "Kernel Panic",
-            Some("kernel panic - not syncing"),
-            "Kernel panic likely triggered by filesystem I/O timeout.",
-            Some("ext4"),
-            Some("/var/crash/vmcore"),
-            false,
-        ),
-    }
-}
-
 pub fn import_host_crashes(limit: usize) -> Result<Vec<CrashRecord>, String> {
     let capped = limit.clamp(1, 2000);
 

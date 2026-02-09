@@ -53,7 +53,7 @@ pub fn collect_events_range_with_channels(
 
     match collect_with_wevtapi(start, end, max, selected_channels.as_slice()) {
         Ok(events) => events,
-        Err(error) => fallback_seed_events(Some(error)),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -64,7 +64,7 @@ pub fn collect_events_range_with_channels(
     _max_events: Option<u32>,
     _channels: Option<&[String]>,
 ) -> Vec<NormalizedEvent> {
-    fallback_seed_events(None)
+    Vec::new()
 }
 
 #[cfg(target_os = "windows")]
@@ -467,38 +467,3 @@ fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
 
-fn fallback_seed_events(reason: Option<String>) -> Vec<NormalizedEvent> {
-    let note = reason
-        .map(|value| format!(" (fallback: {})", value.lines().next().unwrap_or("unknown")))
-        .unwrap_or_default();
-
-    vec![
-        NormalizedEvent::new(
-            SupportedOs::Windows,
-            "Application",
-            "application",
-            "Service Control Manager",
-            Some(1001),
-            "information",
-            &format!("Service startup completed{note}."),
-        ),
-        NormalizedEvent::new(
-            SupportedOs::Windows,
-            "Security",
-            "security",
-            "Microsoft Windows security auditing.",
-            Some(4625),
-            "error",
-            "An account failed to log on.",
-        ),
-        NormalizedEvent::new(
-            SupportedOs::Windows,
-            "System",
-            "system",
-            "Microsoft-Windows-Kernel-Power",
-            Some(41),
-            "warning",
-            "The system rebooted without cleanly shutting down.",
-        ),
-    ]
-}

@@ -29,12 +29,12 @@ pub fn collect_events_range(
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return fallback_seed_events(Some(error.to_string())),
+        Err(_) => return Vec::new(),
     };
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
-        None => return fallback_seed_events(Some("log show stdout unavailable".to_string())),
+        None => return Vec::new(),
     };
 
     let reader = BufReader::new(stdout);
@@ -57,8 +57,8 @@ pub fn collect_events_range(
     let status = child.wait();
     match status {
         Ok(status) if status.success() => events,
-        Ok(_) if events.is_empty() => fallback_seed_events(Some("log show failed".to_string())),
-        Err(error) if events.is_empty() => fallback_seed_events(Some(error.to_string())),
+        Ok(_) if events.is_empty() => Vec::new(),
+        Err(_) if events.is_empty() => Vec::new(),
         _ => events,
     }
 }
@@ -164,38 +164,3 @@ fn sanitize_message(message: &str) -> &str {
     message
 }
 
-fn fallback_seed_events(reason: Option<String>) -> Vec<NormalizedEvent> {
-    let note = reason
-        .map(|value| format!(" (fallback: {})", value.lines().next().unwrap_or("unknown")))
-        .unwrap_or_default();
-
-    vec![
-        NormalizedEvent::new(
-            SupportedOs::Macos,
-            "system",
-            "system",
-            "kernel",
-            None,
-            "warning",
-            &format!("Previous shutdown cause indicates power interruption{note}."),
-        ),
-        NormalizedEvent::new(
-            SupportedOs::Macos,
-            "security",
-            "security",
-            "securityd",
-            None,
-            "error",
-            "Code signing check failed for process.",
-        ),
-        NormalizedEvent::new(
-            SupportedOs::Macos,
-            "application",
-            "application",
-            "launchd",
-            None,
-            "information",
-            "Agent loaded successfully.",
-        ),
-    ]
-}
