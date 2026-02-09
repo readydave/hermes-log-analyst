@@ -20,6 +20,10 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - Date-range `Load Events` with loading/ready status.
   - Ingest window controls.
   - Coverage hint and out-of-range warning.
+- Memory controls:
+  - In-memory local event cache capped at `10,000`.
+  - In-memory imported event cache capped at `5,000`.
+  - Virtualized event table rendering to prevent full-row DOM inflation.
 - Collection settings (saved):
   - Auto-sync on startup.
   - Max events per sync.
@@ -41,8 +45,8 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
 ## Runtime model
 
 - Startup can either:
-  - auto-sync host logs (default), or
-  - load existing cached data only.
+  - load existing cached data only (default), or
+  - auto-sync host logs when enabled in settings.
 - `Refresh Logs` pulls the configured ingest window using saved collection profile.
 - `Load Events` in Data Window pulls the selected date range and applies a range-focused view.
 
@@ -58,7 +62,7 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
 ## Startup and range-load guidance
 
 For fastest Windows startup with useful signal:
-- Keep `Auto-sync on startup` enabled.
+- Keep `Auto-sync on startup` disabled if startup responsiveness is the priority.
 - Start with `Application + System` channels; add `Security` when needed.
 - Keep `Max events per sync` around `1000-5000` for interactive use.
 
@@ -89,7 +93,7 @@ For historical investigations:
 ## Recommended Windows baseline
 
 Use these defaults for fast startup with useful breadth:
-- Auto-sync on startup: on
+- Auto-sync on startup: off
 - Max events per sync: 1000
 - Channels: Application + System (enable Security when needed)
 
@@ -110,7 +114,6 @@ Use these defaults for fast startup with useful breadth:
 
 ## Planned next
 
-- Virtualized event rows for very large datasets.
 - Remote machine connectors (SSH/WinRM).
 - Deeper crash artifact parsing and optional symbolication pipeline.
 - After current priorities, target Garuda Linux (Arch-based) validation and compatibility hardening.

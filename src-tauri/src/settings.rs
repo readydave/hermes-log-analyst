@@ -24,7 +24,7 @@ pub struct IngestProfile {
 impl Default for IngestProfile {
     fn default() -> Self {
         Self {
-            auto_sync_on_startup: true,
+            auto_sync_on_startup: false,
             max_events_per_sync: DEFAULT_MAX_EVENTS_PER_SYNC,
             windows_channels: DEFAULT_WINDOWS_CHANNELS.iter().map(|value| value.to_string()).collect(),
         }

@@ -50,7 +50,7 @@ export async function getIngestWindowDays(): Promise<number> {
 export async function getIngestProfile(): Promise<IngestProfile> {
   if (!isTauriRuntime()) {
     return {
-      autoSyncOnStartup: true,
+      autoSyncOnStartup: false,
       maxEventsPerSync: 2000,
       windowsChannels: ["Application", "System", "Security"]
     };

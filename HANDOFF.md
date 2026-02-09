@@ -33,6 +33,11 @@
   - explicit date-range `Load Events`
   - loading state and success status: `Data loaded and ready: ...`
   - range-focused view reminder to return with `Refresh Logs`
+- Memory controls:
+  - startup auto-sync default disabled (`autoSyncOnStartup: false`)
+  - in-memory local event cache cap: `10,000`
+  - in-memory imported event cache cap: `5,000`
+  - virtualized event-table row rendering (only viewport rows + overscan)
 - Export/actions:
   - filtered and single-event export to JSON/CSV
   - Google search and copy-ready LLM prompt
@@ -49,7 +54,7 @@
 ## Data and Settings Model
 - Ingest window default: `7` days.
 - Ingest profile default:
-  - `autoSyncOnStartup: true`
+  - `autoSyncOnStartup: false`
   - `maxEventsPerSync: 2000` (clamped `100..20000`)
   - Windows channels default: `Application,System,Security`
 - Settings location (Windows): `%LOCALAPPDATA%\hermes-log-analyst\`
@@ -73,13 +78,14 @@
 - Large ranges plus high max-event settings can still create startup/refresh latency.
 - Ingest telemetry is basic; per-channel timing/count breakdown is not yet surfaced.
 - Collector warning details are summarized in UI; full context remains diagnostics-log first.
+- Local/imported event lists are memory-capped; large loads are intentionally truncated in-memory for stability.
 - Common terminal message during `tauri dev` is usually benign:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
 
 ## Objective Recheck (2026-02-09)
 - 1) UX polish (coverage hint + out-of-range warning): `done`
 - 2) Crash importers (metadata-first): `done`
-- 3) Performance (virtualized table rows): `pending`
+- 3) Performance (virtualized table rows): `done`
 - 4) Remote machine support (SSH/WinRM): `pending`
 - Notes:
   - Collectors objective is complete (native Windows/macOS/Linux collectors in place).
@@ -87,11 +93,10 @@
   - Log-type filtering and persisted ingest profile controls are complete.
 
 ## Next Work Items (Recommended)
-1. Add table virtualization for large datasets.
-2. Add remote machine connectors (SSH/WinRM).
-3. Enrich crash importers with minidump/panic/core parsing and optional symbolication.
-4. Add ingest diagnostics in UI (per-channel counts + timing).
-5. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
+1. Add remote machine connectors (SSH/WinRM).
+2. Enrich crash importers with minidump/panic/core parsing and optional symbolication.
+3. Add ingest diagnostics in UI (per-channel counts + timing).
+4. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
 
 ## Quick Validation Checklist
 1. Run `npm run tauri dev`.

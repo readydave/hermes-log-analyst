@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   chooseExportDirectory,
   importHostCrashes,
@@ -38,6 +38,11 @@ const browserDefaultOs: SupportedOs = navigator.userAgent.includes("Windows")
     : "linux";
 
 const windowsChannelOptions = ["Application", "System", "Security"] as const;
+const MAX_LOCAL_EVENTS_IN_MEMORY = 10000;
+const MAX_IMPORTED_EVENTS_IN_MEMORY = 5000;
+const LOCAL_FETCH_LIMIT = MAX_LOCAL_EVENTS_IN_MEMORY + 1;
+const VIRTUAL_ROW_HEIGHT = 36;
+const VIRTUAL_OVERSCAN_ROWS = 20;
 
 function createDefaultFilters(): EventFilters {
   return {
@@ -168,6 +173,14 @@ function normalizeDateRange(from: string, to: string): { from: string; to: strin
   return from <= to ? { from, to } : { from: to, to: from };
 }
 
+function capEvents(events: NormalizedEvent[], max: number): { kept: NormalizedEvent[]; truncated: number } {
+  if (events.length <= max) return { kept: events, truncated: 0 };
+  return {
+    kept: events.slice(0, max),
+    truncated: events.length - max
+  };
+}
+
 export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("system");
   const [hostOs, setHostOs] = useState<SupportedOs>(browserDefaultOs);
@@ -191,7 +204,7 @@ export default function App() {
   const [exportDirectory, setExportDirectoryState] = useState<string | null>(null);
   const [ingestWindowDays, setIngestWindowDaysState] = useState<number>(7);
   const [ingestProfile, setIngestProfileState] = useState<IngestProfile>({
-    autoSyncOnStartup: true,
+    autoSyncOnStartup: false,
     maxEventsPerSync: 2000,
     windowsChannels: ["Application", "System", "Security"]
   });
@@ -203,13 +216,19 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [lastError, setLastError] = useState<string>("");
   const [collectorWarning, setCollectorWarning] = useState<string>("");
+  const [memoryNotice, setMemoryNotice] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
   const [exportStatus, setExportStatus] = useState<string>("");
+  const tableContainerRef = useRef<HTMLElement | null>(null);
+  const [tableScrollTop, setTableScrollTop] = useState(0);
+  const [tableViewportHeight, setTableViewportHeight] = useState(540);
 
   document.documentElement.dataset.theme = theme;
 
-  const mergedEvents = useMemo(() => [...importedEvents, ...localEvents], [importedEvents, localEvents]);
-  const filtered = useMemo(() => applyFilters(mergedEvents, activeFilters), [mergedEvents, activeFilters]);
+  const filtered = useMemo(
+    () => [...applyFilters(importedEvents, activeFilters), ...applyFilters(localEvents, activeFilters)],
+    [importedEvents, localEvents, activeFilters]
+  );
   const preCrashFocus = useMemo(() => {
     if (!preCrashFocusEnabled) return null;
     const crash = crashes.find((entry) => entry.id === selectedCrashId);
@@ -233,17 +252,20 @@ export default function App() {
     });
   }, [filtered, preCrashFocus]);
   const visibleEvents = useMemo(() => sortEvents(eventListInput, sortState), [eventListInput, sortState]);
-  const hasWindowsEvents = useMemo(
-    () => mergedEvents.some((event) => event.os === "windows"),
-    [mergedEvents]
-  );
+  const hasWindowsEvents = useMemo(() => {
+    if (localEvents.some((event) => event.os === "windows")) return true;
+    return importedEvents.some((event) => event.os === "windows");
+  }, [importedEvents, localEvents]);
   const logTypes = useMemo(() => {
     const values = new Set<string>();
-    for (const event of mergedEvents) {
+    for (const event of localEvents) {
+      if (event.logName.trim()) values.add(event.logName);
+    }
+    for (const event of importedEvents) {
       if (event.logName.trim()) values.add(event.logName);
     }
     return Array.from(values).sort((left, right) => left.localeCompare(right));
-  }, [mergedEvents]);
+  }, [importedEvents, localEvents]);
   const hasPendingFilterChanges = useMemo(
     () => JSON.stringify(filterDraft) !== JSON.stringify(activeFilters),
     [filterDraft, activeFilters]
@@ -324,6 +346,26 @@ export default function App() {
     details.push({ label: "Source", value: selected.imported ? "Imported" : "Live/Local" });
     return details;
   }, [selected]);
+  const tableColumnCount = hasWindowsEvents ? 7 : 6;
+  const virtualRows = useMemo(() => {
+    const total = visibleEvents.length;
+    if (total === 0) {
+      return {
+        slice: [] as NormalizedEvent[],
+        topSpacer: 0,
+        bottomSpacer: 0
+      };
+    }
+
+    const viewportRows = Math.ceil(tableViewportHeight / VIRTUAL_ROW_HEIGHT);
+    const start = Math.max(0, Math.floor(tableScrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_OVERSCAN_ROWS);
+    const end = Math.min(total, start + viewportRows + VIRTUAL_OVERSCAN_ROWS * 2);
+    return {
+      slice: visibleEvents.slice(start, end),
+      topSpacer: start * VIRTUAL_ROW_HEIGHT,
+      bottomSpacer: (total - end) * VIRTUAL_ROW_HEIGHT
+    };
+  }, [tableScrollTop, tableViewportHeight, visibleEvents]);
 
   const panelClass = "rounded-2xl border border-panel-border bg-panel backdrop-blur-xl shadow-glass";
   const inputClass = "h-9 w-full rounded-lg border border-panel-border bg-transparent px-3 text-sm text-text placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent/50";
@@ -343,6 +385,25 @@ export default function App() {
       ? ` (+${result.warnings.length - 2} more; see diagnostics logs.)`
       : " (see diagnostics logs).";
     setCollectorWarning(`${context}: ${preview}${suffix}`);
+  }
+
+  function applyLocalEventsCache(events: NormalizedEvent[], context: string): number {
+    const capped = capEvents(events, MAX_LOCAL_EVENTS_IN_MEMORY);
+    setLocalEvents(capped.kept);
+    if (capped.truncated > 0) {
+      setMemoryNotice(
+        `${context}: showing ${MAX_LOCAL_EVENTS_IN_MEMORY.toLocaleString()} local events in memory; ${capped.truncated.toLocaleString()} more were omitted to keep RAM stable.`
+      );
+    } else {
+      setMemoryNotice("");
+    }
+    return capped.truncated;
+  }
+
+  function updateTableViewportHeight(): void {
+    const next = tableContainerRef.current?.clientHeight;
+    if (!next || next <= 0) return;
+    setTableViewportHeight(next);
   }
 
   useEffect(() => {
@@ -421,6 +482,27 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    updateTableViewportHeight();
+    const node = tableContainerRef.current;
+    if (!node || typeof ResizeObserver === "undefined") {
+      const onResize = () => updateTableViewportHeight();
+      window.addEventListener("resize", onResize);
+      return () => window.removeEventListener("resize", onResize);
+    }
+
+    const observer = new ResizeObserver(() => updateTableViewportHeight());
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setTableScrollTop(0);
+    if (tableContainerRef.current) {
+      tableContainerRef.current.scrollTop = 0;
+    }
+  }, [visibleEvents.length, sortState, activeFilters.dateFrom, activeFilters.dateTo, activeFilters.logType]);
+
   async function initialize(): Promise<void> {
     setIsLoading(true);
     setLastError("");
@@ -439,8 +521,13 @@ export default function App() {
         const syncResult = await refreshLocalEvents();
         applyCollectorWarnings("Startup sync warning", syncResult);
       }
-      const collected = await getLocalEvents(50000);
-      if (collected.length > 0) setLocalEvents(collected);
+      const collected = await getLocalEvents(LOCAL_FETCH_LIMIT);
+      if (collected.length > 0) {
+        applyLocalEventsCache(collected, "Startup load");
+      } else {
+        setLocalEvents([]);
+        setMemoryNotice("");
+      }
       setRangeViewActive(false);
       setRangeLoadMessage("");
       await refreshCrashes();
@@ -458,7 +545,7 @@ export default function App() {
     try {
       const result = await refreshLocalEvents();
       applyCollectorWarnings("Refresh warning", result);
-      setLocalEvents(await getLocalEvents(50000));
+      applyLocalEventsCache(await getLocalEvents(LOCAL_FETCH_LIMIT), "Refresh load");
       setRangeViewActive(false);
       setRangeLoadMessage("");
       setExportStatus(`Refresh complete: ${result.collected.toLocaleString()} events collected.`);
@@ -554,7 +641,14 @@ export default function App() {
 
     try {
       const imported = await importSessionEvents(file, hostOs);
-      setImportedEvents((prev) => [...imported, ...prev]);
+      const mergedImported = [...imported, ...importedEvents];
+      const capped = capEvents(mergedImported, MAX_IMPORTED_EVENTS_IN_MEMORY);
+      setImportedEvents(capped.kept);
+      if (capped.truncated > 0) {
+        setMemoryNotice(
+          `Imported event cache is capped at ${MAX_IMPORTED_EVENTS_IN_MEMORY.toLocaleString()} events; ${capped.truncated.toLocaleString()} imported events were omitted from memory.`
+        );
+      }
     } catch (error) {
       alert(error instanceof Error ? error.message : "Import failed");
     }
@@ -700,7 +794,7 @@ export default function App() {
       setIngestWindowDaysState(saved);
       const syncResult = await refreshLocalEvents();
       applyCollectorWarnings("Sync warning", syncResult);
-      setLocalEvents(await getLocalEvents(50000));
+      applyLocalEventsCache(await getLocalEvents(LOCAL_FETCH_LIMIT), "Sync load");
       setRangeViewActive(false);
       setRangeLoadMessage("");
       setExportStatus(
@@ -732,10 +826,14 @@ export default function App() {
     try {
       const syncResult = await syncLocalEventsRange(normalized.from, normalized.to, false);
       applyCollectorWarnings("Range load warning", syncResult);
-      const events = await getLocalEventsRange(normalized.from, normalized.to);
-      setLocalEvents(events);
+      const events = await getLocalEventsRange(normalized.from, normalized.to, LOCAL_FETCH_LIMIT);
+      const truncated = applyLocalEventsCache(events, "Range load");
       applyViewDateRange(normalized.from, normalized.to);
-      setRangeLoadMessage(`Data loaded and ready: ${events.length.toLocaleString()} events in range.`);
+      setRangeLoadMessage(
+        truncated > 0
+          ? `Data loaded with memory cap: ${MAX_LOCAL_EVENTS_IN_MEMORY.toLocaleString()} events shown for this range.`
+          : `Data loaded and ready: ${events.length.toLocaleString()} events in range.`
+      );
       setExportStatus(`Data loaded and ready for ${normalized.from} to ${normalized.to}.`);
       window.setTimeout(() => setExportStatus(""), 3000);
     } catch (error) {
@@ -800,6 +898,11 @@ export default function App() {
         {collectorWarning && (
           <div className={cn(panelClass, "border-panel-border bg-[var(--sev-warning)] text-text px-4 py-3 text-sm")}>
             {collectorWarning}
+          </div>
+        )}
+        {memoryNotice && (
+          <div className={cn(panelClass, "border-panel-border bg-accent/10 px-4 py-3 text-sm text-text")}>
+            {memoryNotice}
           </div>
         )}
         {exportStatus && (
@@ -1122,7 +1225,11 @@ export default function App() {
           )}
         </section>
 
-        <section className={cn(panelClass, "overflow-auto")}> 
+        <section
+          ref={tableContainerRef}
+          onScroll={(event) => setTableScrollTop(event.currentTarget.scrollTop)}
+          className={cn(panelClass, "overflow-auto")}
+        >
           <table className={cn("w-full table-fixed", hasWindowsEvents ? "min-w-[1100px]" : "min-w-[1000px]")}>
             <thead className="sticky top-0 z-10 bg-panel backdrop-blur">
               <tr className="text-left text-xs uppercase tracking-wide text-muted">
@@ -1168,14 +1275,20 @@ export default function App() {
             <tbody className="text-sm">
               {visibleEvents.length === 0 && (
                 <tr>
-                  <td colSpan={hasWindowsEvents ? 7 : 6} className="px-3 py-6 text-center text-sm text-muted">
+                  <td colSpan={tableColumnCount} className="px-3 py-6 text-center text-sm text-muted">
                     No events match the current filters.
                   </td>
                 </tr>
               )}
-              {visibleEvents.map((event) => (
+              {visibleEvents.length > 0 && virtualRows.topSpacer > 0 && (
+                <tr aria-hidden="true">
+                  <td colSpan={tableColumnCount} style={{ height: `${virtualRows.topSpacer}px`, padding: 0 }} />
+                </tr>
+              )}
+              {virtualRows.slice.map((event) => (
                 <tr
                   key={event.id}
+                  style={{ height: `${VIRTUAL_ROW_HEIGHT}px` }}
                   className={cn(
                     "border-b border-panel-border transition hover:bg-white/30",
                     severityTint(event.severity),
@@ -1196,6 +1309,11 @@ export default function App() {
                   <td className="truncate px-3 py-2 text-xs text-muted">{event.imported ? "Imported" : "Live/Local"}</td>
                 </tr>
               ))}
+              {visibleEvents.length > 0 && virtualRows.bottomSpacer > 0 && (
+                <tr aria-hidden="true">
+                  <td colSpan={tableColumnCount} style={{ height: `${virtualRows.bottomSpacer}px`, padding: 0 }} />
+                </tr>
+              )}
             </tbody>
           </table>
         </section>
