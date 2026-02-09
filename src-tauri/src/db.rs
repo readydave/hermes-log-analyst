@@ -158,6 +158,33 @@ pub fn get_local_events(limit: u32) -> Result<Vec<NormalizedEvent>, String> {
     Ok(events)
 }
 
+pub fn get_local_events_range(from: &str, to: &str, limit: u32) -> Result<Vec<NormalizedEvent>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, imported
+            FROM events
+            WHERE julianday(timestamp) >= julianday(?1)
+              AND julianday(timestamp) <= julianday(?2)
+            ORDER BY timestamp DESC
+            LIMIT ?3
+            ",
+        )
+        .map_err(|e| format!("Failed to prepare range query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![from, to, limit], row_to_event)
+        .map_err(|e| format!("Failed to execute range query: {e}"))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.map_err(|e| format!("Failed to parse range row: {e}"))?);
+    }
+
+    Ok(events)
+}
+
 pub fn save_crashes(crashes: &[CrashRecord]) -> Result<(), String> {
     let mut conn = open_connection()?;
     let tx = conn
@@ -235,6 +262,21 @@ pub fn prune_events_before(cutoff: &str) -> Result<usize, String> {
             [cutoff],
         )
         .map_err(|e| format!("Failed to prune events: {e}"))?;
+    Ok(deleted)
+}
+
+pub fn prune_events_outside(start: &str, end: &str) -> Result<usize, String> {
+    let conn = open_connection()?;
+    let deleted = conn
+        .execute(
+            "
+            DELETE FROM events
+            WHERE julianday(timestamp) < julianday(?1)
+               OR julianday(timestamp) > julianday(?2)
+            ",
+            params![start, end],
+        )
+        .map_err(|e| format!("Failed to prune events outside range: {e}"))?;
     Ok(deleted)
 }
 

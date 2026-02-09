@@ -2,6 +2,12 @@ import type { CrashRecord, NormalizedEvent, SupportedOs } from "../types/events"
 import type { ThemeMode } from "../types/events";
 import type { ExportFormat } from "../types/events";
 
+export interface IngestProfile {
+  autoSyncOnStartup: boolean;
+  maxEventsPerSync: number;
+  windowsChannels: string[];
+}
+
 function detectBrowserOs(): SupportedOs {
   if (navigator.userAgent.includes("Windows")) return "windows";
   if (navigator.userAgent.includes("Mac")) return "macos";
@@ -36,6 +42,26 @@ export async function getIngestWindowDays(): Promise<number> {
   return invoke<number>("get_ingest_window_days");
 }
 
+export async function getIngestProfile(): Promise<IngestProfile> {
+  if (!isTauriRuntime()) {
+    return {
+      autoSyncOnStartup: true,
+      maxEventsPerSync: 2000,
+      windowsChannels: ["Application", "System", "Security"]
+    };
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<IngestProfile>("get_ingest_profile");
+}
+
+export async function setIngestProfile(profile: IngestProfile): Promise<IngestProfile> {
+  if (!isTauriRuntime()) return profile;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<IngestProfile>("set_ingest_profile", { profile });
+}
+
 export async function setIngestWindowDays(days: number): Promise<number> {
   if (!isTauriRuntime()) return days;
 
@@ -50,6 +76,17 @@ export async function backfillLocalEvents(from: string, to: string): Promise<num
   return invoke<number>("backfill_local_events", { from, to });
 }
 
+export async function syncLocalEventsRange(
+  from: string,
+  to: string,
+  replaceOutsideRange = false
+): Promise<number> {
+  if (!isTauriRuntime()) return 0;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("sync_local_events_range", { from, to, replaceOutsideRange });
+}
+
 export async function refreshLocalEvents(): Promise<number> {
   if (!isTauriRuntime()) return 0;
 
@@ -57,11 +94,22 @@ export async function refreshLocalEvents(): Promise<number> {
   return invoke<number>("refresh_local_events");
 }
 
-export async function getLocalEvents(limit = 2000): Promise<NormalizedEvent[]> {
+export async function getLocalEvents(limit = 10000): Promise<NormalizedEvent[]> {
   if (!isTauriRuntime()) return [];
 
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<NormalizedEvent[]>("get_local_events", { limit });
+}
+
+export async function getLocalEventsRange(
+  from: string,
+  to: string,
+  limit = 20000
+): Promise<NormalizedEvent[]> {
+  if (!isTauriRuntime()) return [];
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<NormalizedEvent[]>("get_local_events_range", { from, to, limit });
 }
 
 export async function createSampleCrash(): Promise<CrashRecord | null> {

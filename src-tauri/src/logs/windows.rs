@@ -21,7 +21,7 @@ use windows_sys::Win32::System::EventLog::{
 };
 
 #[cfg(target_os = "windows")]
-const CHANNELS: [&str; 3] = ["Application", "System", "Security"];
+const DEFAULT_CHANNELS: [&str; 3] = ["Application", "System", "Security"];
 
 #[cfg(target_os = "windows")]
 struct EvtHandle(EVT_HANDLE);
@@ -38,27 +38,31 @@ impl Drop for EvtHandle {
 }
 
 #[cfg(target_os = "windows")]
-pub fn collect_events_range(
+pub fn collect_events_range_with_channels(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
+    channels: Option<&[String]>,
 ) -> Vec<NormalizedEvent> {
     let max = max_events.unwrap_or(2000).min(10000) as usize;
     if max == 0 {
         return Vec::new();
     }
 
-    match collect_with_wevtapi(start, end, max) {
+    let selected_channels = normalize_channels(channels);
+
+    match collect_with_wevtapi(start, end, max, selected_channels.as_slice()) {
         Ok(events) => events,
         Err(error) => fallback_seed_events(Some(error)),
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn collect_events_range(
+pub fn collect_events_range_with_channels(
     _start: Option<DateTime<Utc>>,
     _end: Option<DateTime<Utc>>,
     _max_events: Option<u32>,
+    _channels: Option<&[String]>,
 ) -> Vec<NormalizedEvent> {
     fallback_seed_events(None)
 }
@@ -68,23 +72,24 @@ fn collect_with_wevtapi(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     max: usize,
+    channels: &[&'static str],
 ) -> Result<Vec<NormalizedEvent>, String> {
     let query = build_time_query(start, end);
     let mut events = Vec::new();
     let mut had_channel = false;
     let mut last_error: Option<String> = None;
 
-    for channel in CHANNELS {
+    for channel in channels {
         if events.len() >= max {
             break;
         }
-        match collect_channel_events(channel, query.as_deref(), max - events.len()) {
+        match collect_channel_events(*channel, query.as_deref(), max - events.len()) {
             Ok(mut channel_events) => {
                 had_channel = true;
                 events.append(&mut channel_events);
             }
             Err(error) => {
-                if channel == "Security" {
+                if *channel == "Security" {
                     last_error = Some(error);
                 } else {
                     return Err(error);
@@ -352,10 +357,33 @@ fn extract_xml_attr(xml: &str, element: &str, attr: &str) -> Option<String> {
     let rest = &xml[start..];
     let end = rest.find('>')?;
     let segment = &rest[..end];
-    let needle = format!("{attr}=\"");
-    let attr_start = segment.find(&needle)? + needle.len();
-    let attr_end = segment[attr_start..].find('"')? + attr_start;
-    Some(segment[attr_start..attr_end].to_string())
+    extract_segment_attr(segment, attr)
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_channels(channels: Option<&[String]>) -> Vec<&'static str> {
+    let mut selected = Vec::new();
+    if let Some(values) = channels {
+        for value in values {
+            let normalized = match value.trim().to_ascii_lowercase().as_str() {
+                "application" => Some("Application"),
+                "system" => Some("System"),
+                "security" => Some("Security"),
+                _ => None,
+            };
+            if let Some(channel) = normalized {
+                if !selected.contains(&channel) {
+                    selected.push(channel);
+                }
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        DEFAULT_CHANNELS.to_vec()
+    } else {
+        selected
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -384,13 +412,7 @@ fn extract_event_data(xml: &str) -> Option<String> {
         };
         let after_tag = cursor[tag_start..].find('>')? + tag_start;
         let tag_body = &cursor[tag_start..after_tag];
-        let name = if let Some(name_start) = tag_body.find("Name=\"") {
-            let value_start = name_start + "Name=\"".len();
-            let value_end = tag_body[value_start..].find('"')? + value_start;
-            tag_body[value_start..value_end].to_string()
-        } else {
-            "Data".to_string()
-        };
+        let name = extract_segment_attr(tag_body, "Name").unwrap_or_else(|| "Data".to_string());
         let value_start = after_tag + 1;
         let value_end = match cursor[value_start..].find("</Data>") {
             Some(value) => value + value_start,
@@ -408,6 +430,25 @@ fn extract_event_data(xml: &str) -> Option<String> {
     } else {
         Some(format!("Data: {}", pairs.join(", ")))
     }
+}
+
+#[cfg(target_os = "windows")]
+fn extract_segment_attr(segment: &str, attr: &str) -> Option<String> {
+    let double = format!("{attr}=\"");
+    if let Some(start) = segment.find(&double) {
+        let value_start = start + double.len();
+        let value_end = segment[value_start..].find('"')? + value_start;
+        return Some(segment[value_start..value_end].to_string());
+    }
+
+    let single = format!("{attr}='");
+    if let Some(start) = segment.find(&single) {
+        let value_start = start + single.len();
+        let value_end = segment[value_start..].find('\'')? + value_start;
+        return Some(segment[value_start..value_end].to_string());
+    }
+
+    None
 }
 
 #[cfg(target_os = "windows")]

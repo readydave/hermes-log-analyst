@@ -6,12 +6,13 @@ mod settings;
 use crash::{build_sample_crash, import_host_crashes as collect_host_crashes, CrashRecord};
 use db::{
     correlate_crash_events, get_crashes as read_crashes, get_local_events as read_local_events,
-    prune_events_before, save_crashes, save_local_events,
+    get_local_events_range as read_local_events_range, prune_events_before, prune_events_outside,
+    save_crashes, save_local_events,
 };
-use logs::{collect_host_events_range, detect_host_os, NormalizedEvent};
+use logs::{collect_host_events_range_with_windows_channels, detect_host_os, NormalizedEvent};
 use settings::{
-    load_export_dir, load_ingest_window_days, load_theme, save_export_dir, save_ingest_window_days,
-    save_theme,
+    load_export_dir, load_ingest_profile, load_ingest_window_days, load_theme, save_export_dir,
+    save_ingest_profile, save_ingest_window_days, save_theme, IngestProfile,
 };
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use std::path::{Path, PathBuf};
@@ -86,12 +87,18 @@ fn run_command(binary: &str, args: &[&str]) -> Option<String> {
 #[tauri::command]
 async fn refresh_local_events() -> Result<usize, String> {
     let days = load_ingest_window_days();
+    let profile = load_ingest_profile();
     let now = Utc::now();
     let start = now - chrono::Duration::days(days as i64);
     let start_str = start.to_rfc3339();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let events = collect_host_events_range(Some(start), Some(now), Some(2000));
+        let events = collect_host_events_range_with_windows_channels(
+            Some(start),
+            Some(now),
+            Some(profile.max_events_per_sync),
+            Some(profile.windows_channels.as_slice()),
+        );
         save_local_events(&events)?;
         let _ = prune_events_before(start_str.as_str());
         Ok::<usize, String>(events.len())
@@ -102,8 +109,21 @@ async fn refresh_local_events() -> Result<usize, String> {
 
 #[tauri::command]
 fn get_local_events(limit: Option<u32>) -> Result<Vec<NormalizedEvent>, String> {
-    let limit = limit.unwrap_or(2000).min(10000);
+    let limit = limit.unwrap_or(10000).min(50000);
     read_local_events(limit)
+}
+
+#[tauri::command]
+fn get_local_events_range(
+    from: String,
+    to: String,
+    limit: Option<u32>,
+) -> Result<Vec<NormalizedEvent>, String> {
+    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
+    let limit = limit.unwrap_or(10000).min(50000);
+    let start_str = start.to_rfc3339();
+    let end_str = end.to_rfc3339();
+    read_local_events_range(start_str.as_str(), end_str.as_str(), limit)
 }
 
 #[tauri::command]
@@ -159,16 +179,61 @@ fn set_ingest_window_days(days: u32) -> Result<u32, String> {
 }
 
 #[tauri::command]
+fn get_ingest_profile() -> IngestProfile {
+    load_ingest_profile()
+}
+
+#[tauri::command]
+fn set_ingest_profile(profile: IngestProfile) -> Result<IngestProfile, String> {
+    save_ingest_profile(profile)
+}
+
+#[tauri::command]
 async fn backfill_local_events(from: String, to: String) -> Result<usize, String> {
     let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
+    let profile = load_ingest_profile();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let events = collect_host_events_range(Some(start), Some(end), Some(5000));
+        let events = collect_host_events_range_with_windows_channels(
+            Some(start),
+            Some(end),
+            Some(profile.max_events_per_sync),
+            Some(profile.windows_channels.as_slice()),
+        );
         save_local_events(&events)?;
         Ok::<usize, String>(events.len())
     })
     .await
     .map_err(|error| format!("Failed to backfill events: {error}"))?
+}
+
+#[tauri::command]
+async fn sync_local_events_range(
+    from: String,
+    to: String,
+    replace_outside_range: Option<bool>,
+) -> Result<usize, String> {
+    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
+    let profile = load_ingest_profile();
+    let start_str = start.to_rfc3339();
+    let end_str = end.to_rfc3339();
+    let replace = replace_outside_range.unwrap_or(false);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let events = collect_host_events_range_with_windows_channels(
+            Some(start),
+            Some(end),
+            Some(profile.max_events_per_sync),
+            Some(profile.windows_channels.as_slice()),
+        );
+        save_local_events(&events)?;
+        if replace {
+            let _ = prune_events_outside(start_str.as_str(), end_str.as_str())?;
+        }
+        Ok::<usize, String>(events.len())
+    })
+    .await
+    .map_err(|error| format!("Failed to sync range events: {error}"))?
 }
 
 #[tauri::command]
@@ -408,6 +473,7 @@ fn main() {
             host_os_version,
             refresh_local_events,
             get_local_events,
+            get_local_events_range,
             create_sample_crash,
             import_host_crashes,
             get_crashes,
@@ -415,7 +481,10 @@ fn main() {
             open_external_url,
             get_ingest_window_days,
             set_ingest_window_days,
+            get_ingest_profile,
+            set_ingest_profile,
             backfill_local_events,
+            sync_local_events_range,
             get_export_directory,
             choose_export_directory,
             set_export_directory,

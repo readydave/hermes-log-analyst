@@ -82,13 +82,14 @@ pub fn detect_host_os() -> SupportedOs {
     }
 }
 
-pub fn collect_host_events_range(
+pub fn collect_host_events_range_with_windows_channels(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
+    windows_channels: Option<&[String]>,
 ) -> Vec<NormalizedEvent> {
     match detect_host_os() {
-        SupportedOs::Windows => windows::collect_events_range(start, end, max_events),
+        SupportedOs::Windows => windows::collect_events_range_with_channels(start, end, max_events, windows_channels),
         SupportedOs::Linux => linux::collect_events_range(start, end, max_events),
         SupportedOs::Macos => macos::collect_events_range(start, end, max_events),
     }

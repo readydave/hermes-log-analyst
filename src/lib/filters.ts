@@ -8,6 +8,7 @@ export const defaultFilters: EventFilters = {
     error: true,
     critical: true
   },
+  logType: "all",
   category: "all",
   eventId: "",
   source: "",
@@ -44,6 +45,7 @@ function parseLocalDateEnd(value: string): number | null {
 export function applyFilters(events: NormalizedEvent[], filters: EventFilters): NormalizedEvent[] {
   return events.filter((event) => {
     if (!filters.severities[event.severity]) return false;
+    if (filters.logType !== "all" && event.logName !== filters.logType) return false;
     if (filters.category !== "all" && event.category !== filters.category) return false;
 
     if (filters.eventId.trim()) {

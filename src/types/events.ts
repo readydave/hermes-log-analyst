@@ -45,6 +45,7 @@ export interface CrashRecord {
 export interface EventFilters {
   text: string;
   severities: Record<EventSeverity, boolean>;
+  logType: string;
   category: "all" | EventCategory;
   eventId: string;
   source: string;
