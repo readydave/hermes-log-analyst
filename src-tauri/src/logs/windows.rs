@@ -1,7 +1,7 @@
-use super::{NormalizedEvent, SupportedOs};
-use chrono::{DateTime, Utc};
+use super::{CollectionResult, NormalizedEvent, SupportedOs};
 #[cfg(target_os = "windows")]
 use chrono::SecondsFormat;
+use chrono::{DateTime, Utc};
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsStr;
@@ -12,7 +12,7 @@ use std::ptr::{null, null_mut};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, GetLastError,
+    GetLastError, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::EventLog::{
@@ -43,18 +43,14 @@ pub fn collect_events_range_with_channels(
     end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
     channels: Option<&[String]>,
-) -> Vec<NormalizedEvent> {
+) -> CollectionResult {
     let max = max_events.unwrap_or(2000).min(10000) as usize;
     if max == 0 {
-        return Vec::new();
+        return CollectionResult::default();
     }
 
     let selected_channels = normalize_channels(channels);
-
-    match collect_with_wevtapi(start, end, max, selected_channels.as_slice()) {
-        Ok(events) => events,
-        Err(_) => Vec::new(),
-    }
+    collect_with_wevtapi(start, end, max, selected_channels.as_slice())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -63,8 +59,8 @@ pub fn collect_events_range_with_channels(
     _end: Option<DateTime<Utc>>,
     _max_events: Option<u32>,
     _channels: Option<&[String]>,
-) -> Vec<NormalizedEvent> {
-    Vec::new()
+) -> CollectionResult {
+    CollectionResult::default()
 }
 
 #[cfg(target_os = "windows")]
@@ -73,36 +69,36 @@ fn collect_with_wevtapi(
     end: Option<DateTime<Utc>>,
     max: usize,
     channels: &[&'static str],
-) -> Result<Vec<NormalizedEvent>, String> {
+) -> CollectionResult {
     let query = build_time_query(start, end);
-    let mut events = Vec::new();
-    let mut had_channel = false;
-    let mut last_error: Option<String> = None;
+    let mut result = CollectionResult::default();
 
     for channel in channels {
-        if events.len() >= max {
+        if result.events.len() >= max {
             break;
         }
-        match collect_channel_events(*channel, query.as_deref(), max - events.len()) {
+        match collect_channel_events(*channel, query.as_deref(), max - result.events.len()) {
             Ok(mut channel_events) => {
-                had_channel = true;
-                events.append(&mut channel_events);
+                result.events.append(&mut channel_events);
             }
             Err(error) => {
-                if *channel == "Security" {
-                    last_error = Some(error);
+                if error.to_ascii_lowercase().contains("access denied") {
+                    result.warnings.push(error);
                 } else {
-                    return Err(error);
+                    result.errors.push(error);
                 }
             }
         }
     }
 
-    if events.is_empty() && !had_channel {
-        Err(last_error.unwrap_or_else(|| "No event channels available.".to_string()))
-    } else {
-        Ok(events)
+    if result.events.is_empty() && !result.warnings.is_empty() && result.errors.is_empty() {
+        result.errors.push(
+            "Collector could not read any requested Windows channels. Check channel permissions."
+                .to_string(),
+        );
     }
+
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -114,18 +110,13 @@ fn collect_channel_events(
     let query = query.unwrap_or("*");
     let channel_w = to_wide(channel);
     let query_w = to_wide(query);
-    let handle = unsafe {
-        EvtQuery(
-            0,
-            channel_w.as_ptr(),
-            query_w.as_ptr(),
-            EvtQueryChannelPath,
-        )
-    };
+    let handle = unsafe { EvtQuery(0, channel_w.as_ptr(), query_w.as_ptr(), EvtQueryChannelPath) };
     if handle == 0 {
         let error = last_error();
-        if error == ERROR_ACCESS_DENIED && channel == "Security" {
-            return Ok(Vec::new());
+        if error == ERROR_ACCESS_DENIED {
+            return Err(format!(
+                "Access denied reading Windows '{channel}' channel (win32 {error})."
+            ));
         }
         return Err(format!("EvtQuery failed for {channel}: win32 {error}"));
     }
@@ -136,7 +127,16 @@ fn collect_channel_events(
 
     loop {
         let mut returned: u32 = 0;
-        let ok = unsafe { EvtNext(handle, handles.len() as u32, handles.as_mut_ptr(), 0, 0, &mut returned) };
+        let ok = unsafe {
+            EvtNext(
+                handle,
+                handles.len() as u32,
+                handles.as_mut_ptr(),
+                0,
+                0,
+                &mut returned,
+            )
+        };
         if ok == 0 {
             let error = last_error();
             if error == ERROR_NO_MORE_ITEMS {
@@ -157,7 +157,11 @@ fn collect_channel_events(
             if let Some(event) = rendered {
                 events.push(event);
                 if events.len() >= max {
-                    for rest in handles.iter().skip(idx + 1).take(returned as usize - idx - 1) {
+                    for rest in handles
+                        .iter()
+                        .skip(idx + 1)
+                        .take(returned as usize - idx - 1)
+                    {
                         if *rest != 0 {
                             unsafe { EvtClose(*rest) };
                         }
@@ -174,9 +178,12 @@ fn collect_channel_events(
 #[cfg(target_os = "windows")]
 fn render_event(handle: EVT_HANDLE, fallback_channel: &str) -> Option<NormalizedEvent> {
     let xml = render_event_xml(handle)?;
-    let provider = extract_xml_attr(&xml, "Provider", "Name").unwrap_or_else(|| "Unknown Provider".to_string());
-    let log_name = extract_xml_tag_value(&xml, "Channel").unwrap_or_else(|| fallback_channel.to_string());
-    let event_id = extract_xml_tag_value(&xml, "EventID").and_then(|value| value.parse::<u32>().ok());
+    let provider = extract_xml_attr(&xml, "Provider", "Name")
+        .unwrap_or_else(|| "Unknown Provider".to_string());
+    let log_name =
+        extract_xml_tag_value(&xml, "Channel").unwrap_or_else(|| fallback_channel.to_string());
+    let event_id =
+        extract_xml_tag_value(&xml, "EventID").and_then(|value| value.parse::<u32>().ok());
     let level = extract_xml_tag_value(&xml, "Level").and_then(|value| value.parse::<u32>().ok());
     let severity = map_severity(level);
     let category = map_category(&log_name);
@@ -453,7 +460,10 @@ fn extract_segment_attr(segment: &str, attr: &str) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn to_wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
@@ -466,4 +476,3 @@ fn wide_to_string(value: &[u16]) -> String {
 fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
-

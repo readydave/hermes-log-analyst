@@ -8,6 +8,11 @@ export interface IngestProfile {
   windowsChannels: string[];
 }
 
+export interface SyncOperationResult {
+  collected: number;
+  warnings: string[];
+}
+
 function detectBrowserOs(): SupportedOs {
   if (navigator.userAgent.includes("Windows")) return "windows";
   if (navigator.userAgent.includes("Mac")) return "macos";
@@ -69,29 +74,29 @@ export async function setIngestWindowDays(days: number): Promise<number> {
   return invoke<number>("set_ingest_window_days", { days });
 }
 
-export async function backfillLocalEvents(from: string, to: string): Promise<number> {
-  if (!isTauriRuntime()) return 0;
+export async function backfillLocalEvents(from: string, to: string): Promise<SyncOperationResult> {
+  if (!isTauriRuntime()) return { collected: 0, warnings: [] };
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("backfill_local_events", { from, to });
+  return invoke<SyncOperationResult>("backfill_local_events", { from, to });
 }
 
 export async function syncLocalEventsRange(
   from: string,
   to: string,
   replaceOutsideRange = false
-): Promise<number> {
-  if (!isTauriRuntime()) return 0;
+): Promise<SyncOperationResult> {
+  if (!isTauriRuntime()) return { collected: 0, warnings: [] };
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("sync_local_events_range", { from, to, replaceOutsideRange });
+  return invoke<SyncOperationResult>("sync_local_events_range", { from, to, replaceOutsideRange });
 }
 
-export async function refreshLocalEvents(): Promise<number> {
-  if (!isTauriRuntime()) return 0;
+export async function refreshLocalEvents(): Promise<SyncOperationResult> {
+  if (!isTauriRuntime()) return { collected: 0, warnings: [] };
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("refresh_local_events");
+  return invoke<SyncOperationResult>("refresh_local_events");
 }
 
 export async function getLocalEvents(limit = 10000): Promise<NormalizedEvent[]> {

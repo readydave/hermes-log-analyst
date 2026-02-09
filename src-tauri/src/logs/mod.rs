@@ -40,6 +40,14 @@ pub struct NormalizedEvent {
     pub imported: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionResult {
+    pub events: Vec<NormalizedEvent>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+}
+
 impl NormalizedEvent {
     pub fn new(
         os: SupportedOs,
@@ -87,9 +95,11 @@ pub fn collect_host_events_range_with_windows_channels(
     end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
     windows_channels: Option<&[String]>,
-) -> Vec<NormalizedEvent> {
+) -> CollectionResult {
     match detect_host_os() {
-        SupportedOs::Windows => windows::collect_events_range_with_channels(start, end, max_events, windows_channels),
+        SupportedOs::Windows => {
+            windows::collect_events_range_with_channels(start, end, max_events, windows_channels)
+        }
         SupportedOs::Linux => linux::collect_events_range(start, end, max_events),
         SupportedOs::Macos => macos::collect_events_range(start, end, max_events),
     }

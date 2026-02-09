@@ -24,10 +24,15 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - Auto-sync on startup.
   - Max events per sync.
   - Windows channel selection.
+- Diagnostics logging:
+  - JSONL app diagnostics written to `logs` under the app data directory.
+  - Captures collector failures, access denied conditions, startup/runtime exceptions, and storage/settings read-write failures.
+  - Automatic pruning retains only the most recent 7 days of log files.
 - UX:
   - Collapsible Analysis Panels (group + per panel).
   - Sticky table headers, sortable columns, and row detail footer actions.
   - Fixed top and bottom bars with scrollable middle content region.
+  - Collector warning banner shown when sync/backfill completes with recoverable collector issues.
 - Export and actions:
   - Export filtered/single events to JSON or CSV.
   - Google search and copy-ready LLM prompt for selected event.
@@ -91,6 +96,11 @@ Use these defaults for fast startup with useful breadth:
 ## Notes and troubleshooting
 
 - Imported events are intentionally kept out of SQLite for performance and to avoid mixing live and imported data.
+- Diagnostics logs location (daily files, 7-day retention):
+  - Windows: `%LOCALAPPDATA%\hermes-log-analyst\logs\diagnostics-YYYY-MM-DD.log`
+  - macOS: `~/Library/Application Support/hermes-log-analyst/logs/diagnostics-YYYY-MM-DD.log`
+  - Linux: `~/.local/share/hermes-log-analyst/logs/diagnostics-YYYY-MM-DD.log`
+- If sync/backfill succeeds with warnings (for example, access denied to a selected channel), the app shows a yellow warning status and details are also written to diagnostics logs.
 - If no events appear for a chosen date range, confirm:
   - `Load Events` completed for that exact range.
   - Filters (date/log type/severity/category/text) are not excluding results.
@@ -103,8 +113,4 @@ Use these defaults for fast startup with useful breadth:
 - Virtualized event rows for very large datasets.
 - Remote machine connectors (SSH/WinRM).
 - Deeper crash artifact parsing and optional symbolication pipeline.
-- Application diagnostics logging:
-  - write logs to `/logs`
-  - cover access/read/write and runtime collector errors
-  - keep only the last 7 days of log files
 - After current priorities, target Garuda Linux (Arch-based) validation and compatibility hardening.

@@ -1,20 +1,25 @@
 mod crash;
 mod db;
+mod diagnostics;
 mod logs;
 mod settings;
 
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use crash::{import_host_crashes as collect_host_crashes, CrashRecord};
 use db::{
     correlate_crash_events, get_crashes as read_crashes, get_local_events as read_local_events,
     get_local_events_range as read_local_events_range, prune_events_before, prune_events_outside,
     save_crashes, save_local_events,
 };
-use logs::{collect_host_events_range_with_windows_channels, detect_host_os, NormalizedEvent};
+use logs::{
+    collect_host_events_range_with_windows_channels, detect_host_os, CollectionResult,
+    NormalizedEvent,
+};
+use serde::Serialize;
 use settings::{
     load_export_dir, load_ingest_profile, load_ingest_window_days, load_theme, save_export_dir,
     save_ingest_profile, save_ingest_window_days, save_theme, IngestProfile,
 };
-use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
@@ -34,7 +39,8 @@ fn detect_host_os_version() -> String {
     #[cfg(target_os = "macos")]
     {
         let name = run_command("sw_vers", &["-productName"]).unwrap_or_else(|| "macOS".to_string());
-        let version = run_command("sw_vers", &["-productVersion"]).unwrap_or_else(|| "Unknown".to_string());
+        let version =
+            run_command("sw_vers", &["-productVersion"]).unwrap_or_else(|| "Unknown".to_string());
         return format!("{name} {version}");
     }
 
@@ -55,7 +61,10 @@ fn detect_host_os_version() -> String {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
-            if let Some(line) = content.lines().find(|line| line.starts_with("PRETTY_NAME=")) {
+            if let Some(line) = content
+                .lines()
+                .find(|line| line.starts_with("PRETTY_NAME="))
+            {
                 let value = line
                     .trim_start_matches("PRETTY_NAME=")
                     .trim_matches('"')
@@ -75,6 +84,10 @@ fn detect_host_os_version() -> String {
 fn run_command(binary: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(binary).args(args).output().ok()?;
     if !output.status.success() {
+        diagnostics::warn(
+            "runtime",
+            format!("Command '{binary}' exited unsuccessfully while resolving host metadata."),
+        );
         return None;
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -84,8 +97,74 @@ fn run_command(binary: &str, args: &[&str]) -> Option<String> {
     Some(value)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncOperationResult {
+    collected: usize,
+    warnings: Vec<String>,
+}
+
+fn summarize_messages(messages: &[String], max_count: usize) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+
+    let mut summary = messages
+        .iter()
+        .take(max_count)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if messages.len() > max_count {
+        let extra = messages.len() - max_count;
+        let suffix = format!(" (+{extra} more; see diagnostics logs)");
+        summary.push_str(suffix.as_str());
+    }
+
+    summary
+}
+
+fn report_collection_outcome(
+    context: &str,
+    outcome: &CollectionResult,
+) -> Result<SyncOperationResult, String> {
+    for warning in &outcome.warnings {
+        diagnostics::warn("collector", format!("{context}: {warning}"));
+    }
+    for error in &outcome.errors {
+        diagnostics::error("collector", format!("{context}: {error}"));
+    }
+
+    if outcome.events.is_empty() && !outcome.errors.is_empty() {
+        return Err(format!(
+            "{context} failed before any events were collected. {}",
+            summarize_messages(&outcome.errors, 2)
+        ));
+    }
+
+    let mut warnings = outcome.warnings.clone();
+    if !outcome.errors.is_empty() {
+        warnings.push(format!(
+            "Collector reported recoverable errors. {}",
+            summarize_messages(&outcome.errors, 2)
+        ));
+    }
+
+    Ok(SyncOperationResult {
+        collected: outcome.events.len(),
+        warnings,
+    })
+}
+
+fn command_error(subsystem: &str, context: &str, error: impl AsRef<str>) -> String {
+    let message = error.as_ref().to_string();
+    diagnostics::error(subsystem, format!("{context}: {message}"));
+    message
+}
+
 #[tauri::command]
-async fn refresh_local_events() -> Result<usize, String> {
+async fn refresh_local_events() -> Result<SyncOperationResult, String> {
     let days = load_ingest_window_days();
     let profile = load_ingest_profile();
     let now = Utc::now();
@@ -93,24 +172,35 @@ async fn refresh_local_events() -> Result<usize, String> {
     let start_str = start.to_rfc3339();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let events = collect_host_events_range_with_windows_channels(
+        let outcome = collect_host_events_range_with_windows_channels(
             Some(start),
             Some(now),
             Some(profile.max_events_per_sync),
             Some(profile.windows_channels.as_slice()),
         );
-        save_local_events(&events)?;
-        let _ = prune_events_before(start_str.as_str());
-        Ok::<usize, String>(events.len())
+        let report = report_collection_outcome("Refresh collection", &outcome)?;
+        save_local_events(outcome.events.as_slice())
+            .map_err(|error| command_error("storage", "Failed to save refreshed events", error))?;
+        if let Err(error) = prune_events_before(start_str.as_str()) {
+            diagnostics::warn("storage", format!("Prune after refresh failed: {error}"));
+        }
+        Ok::<SyncOperationResult, String>(report)
     })
     .await
-    .map_err(|error| format!("Failed to collect events: {error}"))?
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join refresh collection task",
+            error.to_string(),
+        )
+    })?
 }
 
 #[tauri::command]
 fn get_local_events(limit: Option<u32>) -> Result<Vec<NormalizedEvent>, String> {
     let limit = limit.unwrap_or(10000).min(50000);
     read_local_events(limit)
+        .map_err(|error| command_error("storage", "Failed to read local events", error))
 }
 
 #[tauri::command]
@@ -119,11 +209,13 @@ fn get_local_events_range(
     to: String,
     limit: Option<u32>,
 ) -> Result<Vec<NormalizedEvent>, String> {
-    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
+    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())
+        .map_err(|error| command_error("runtime", "Invalid local events range", error))?;
     let limit = limit.unwrap_or(10000).min(50000);
     let start_str = start.to_rfc3339();
     let end_str = end.to_rfc3339();
     read_local_events_range(start_str.as_str(), end_str.as_str(), limit)
+        .map_err(|error| command_error("storage", "Failed to read local events for range", error))
 }
 
 #[tauri::command]
@@ -131,21 +223,29 @@ async fn import_host_crashes(limit: Option<u32>) -> Result<usize, String> {
     let max = limit.unwrap_or(200).clamp(1, 2000) as usize;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let crashes = collect_host_crashes(max)?;
+        let crashes = collect_host_crashes(max)
+            .map_err(|error| command_error("collector", "Crash import failed", error))?;
         if crashes.is_empty() {
             return Ok::<usize, String>(0);
         }
-        save_crashes(&crashes)?;
+        save_crashes(&crashes)
+            .map_err(|error| command_error("storage", "Failed to save imported crashes", error))?;
         Ok(crashes.len())
     })
     .await
-    .map_err(|error| format!("Failed to import host crashes: {error}"))?
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join crash import task",
+            error.to_string(),
+        )
+    })?
 }
 
 #[tauri::command]
 fn get_crashes(limit: Option<u32>) -> Result<Vec<CrashRecord>, String> {
     let limit = limit.unwrap_or(250).min(5000);
-    read_crashes(limit)
+    read_crashes(limit).map_err(|error| command_error("storage", "Failed to read crashes", error))
 }
 
 #[tauri::command]
@@ -157,6 +257,7 @@ fn get_crash_related_events(
     let window = window_minutes.unwrap_or(15).clamp(1, 180);
     let max_events = limit.unwrap_or(200).min(2000);
     correlate_crash_events(crash_id.as_str(), window, max_events)
+        .map_err(|error| command_error("storage", "Failed to correlate crash events", error))
 }
 
 #[tauri::command]
@@ -166,7 +267,8 @@ fn get_ingest_window_days() -> u32 {
 
 #[tauri::command]
 fn set_ingest_window_days(days: u32) -> Result<u32, String> {
-    save_ingest_window_days(days)?;
+    save_ingest_window_days(days)
+        .map_err(|error| command_error("settings", "Failed to save ingest window", error))?;
     Ok(load_ingest_window_days())
 }
 
@@ -178,25 +280,35 @@ fn get_ingest_profile() -> IngestProfile {
 #[tauri::command]
 fn set_ingest_profile(profile: IngestProfile) -> Result<IngestProfile, String> {
     save_ingest_profile(profile)
+        .map_err(|error| command_error("settings", "Failed to save ingest profile", error))
 }
 
 #[tauri::command]
-async fn backfill_local_events(from: String, to: String) -> Result<usize, String> {
-    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
+async fn backfill_local_events(from: String, to: String) -> Result<SyncOperationResult, String> {
+    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())
+        .map_err(|error| command_error("runtime", "Invalid backfill range", error))?;
     let profile = load_ingest_profile();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let events = collect_host_events_range_with_windows_channels(
+        let outcome = collect_host_events_range_with_windows_channels(
             Some(start),
             Some(end),
             Some(profile.max_events_per_sync),
             Some(profile.windows_channels.as_slice()),
         );
-        save_local_events(&events)?;
-        Ok::<usize, String>(events.len())
+        let report = report_collection_outcome("Range backfill collection", &outcome)?;
+        save_local_events(outcome.events.as_slice())
+            .map_err(|error| command_error("storage", "Failed to save backfilled events", error))?;
+        Ok::<SyncOperationResult, String>(report)
     })
     .await
-    .map_err(|error| format!("Failed to backfill events: {error}"))?
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join backfill collection task",
+            error.to_string(),
+        )
+    })?
 }
 
 #[tauri::command]
@@ -204,28 +316,40 @@ async fn sync_local_events_range(
     from: String,
     to: String,
     replace_outside_range: Option<bool>,
-) -> Result<usize, String> {
-    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())?;
+) -> Result<SyncOperationResult, String> {
+    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())
+        .map_err(|error| command_error("runtime", "Invalid sync range", error))?;
     let profile = load_ingest_profile();
     let start_str = start.to_rfc3339();
     let end_str = end.to_rfc3339();
     let replace = replace_outside_range.unwrap_or(false);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let events = collect_host_events_range_with_windows_channels(
+        let outcome = collect_host_events_range_with_windows_channels(
             Some(start),
             Some(end),
             Some(profile.max_events_per_sync),
             Some(profile.windows_channels.as_slice()),
         );
-        save_local_events(&events)?;
+        let report = report_collection_outcome("Range sync collection", &outcome)?;
+        save_local_events(outcome.events.as_slice()).map_err(|error| {
+            command_error("storage", "Failed to save range-synced events", error)
+        })?;
         if replace {
-            let _ = prune_events_outside(start_str.as_str(), end_str.as_str())?;
+            prune_events_outside(start_str.as_str(), end_str.as_str()).map_err(|error| {
+                command_error("storage", "Failed to prune out-of-range events", error)
+            })?;
         }
-        Ok::<usize, String>(events.len())
+        Ok::<SyncOperationResult, String>(report)
     })
     .await
-    .map_err(|error| format!("Failed to sync range events: {error}"))?
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join range sync task",
+            error.to_string(),
+        )
+    })?
 }
 
 #[tauri::command]
@@ -241,7 +365,7 @@ fn open_external_url(url: String) -> Result<(), String> {
 
     webbrowser::open(url.as_str())
         .map(|_| ())
-        .map_err(|e| format!("Failed to open URL: {e}"))
+        .map_err(|error| command_error("runtime", "Failed to open external URL", error.to_string()))
 }
 
 #[tauri::command]
@@ -257,13 +381,20 @@ fn choose_export_directory() -> Result<Option<String>, String> {
     };
 
     let value = path.to_string_lossy().to_string();
-    save_export_dir(Some(value.as_str()))?;
+    save_export_dir(Some(value.as_str())).map_err(|error| {
+        command_error(
+            "settings",
+            "Failed to persist chosen export directory",
+            error,
+        )
+    })?;
     Ok(Some(value))
 }
 
 #[tauri::command]
 fn set_export_directory(path: Option<String>) -> Result<(), String> {
     save_export_dir(path.as_deref())
+        .map_err(|error| command_error("settings", "Failed to update export directory", error))
 }
 
 #[tauri::command]
@@ -282,7 +413,13 @@ fn export_events(
     let base_dir = load_export_dir()
         .map(PathBuf::from)
         .or_else(dirs::download_dir)
-        .ok_or("Unable to resolve export directory.")?;
+        .ok_or_else(|| {
+            command_error(
+                "storage",
+                "Unable to resolve export directory",
+                "Unable to resolve export directory.",
+            )
+        })?;
 
     if !base_dir.exists() || !base_dir.is_dir() {
         return Err("Configured export directory is invalid.".to_string());
@@ -292,12 +429,20 @@ fn export_events(
     let output_path = base_dir.join(safe_name);
 
     let payload = if extension == "json" {
-        serde_json::to_string_pretty(&events).map_err(|e| format!("Failed to serialize JSON: {e}"))?
+        serde_json::to_string_pretty(&events).map_err(|error| {
+            command_error(
+                "runtime",
+                "Failed to serialize export JSON payload",
+                error.to_string(),
+            )
+        })?
     } else {
         build_csv(&events)
     };
 
-    std::fs::write(&output_path, payload).map_err(|e| format!("Failed to write export file: {e}"))?;
+    std::fs::write(&output_path, payload).map_err(|error| {
+        command_error("storage", "Failed to write export file", error.to_string())
+    })?;
     Ok(output_path.to_string_lossy().to_string())
 }
 
@@ -317,7 +462,12 @@ fn set_app_theme(app: AppHandle, theme: String) {
 }
 
 fn apply_theme(app: &AppHandle, theme: &str) {
-    let _ = save_theme(theme);
+    if let Err(error) = save_theme(theme) {
+        diagnostics::warn(
+            "settings",
+            format!("Failed to persist theme '{theme}': {error}"),
+        );
+    }
 
     let native_theme = match theme {
         "light" => Some(tauri::Theme::Light),
@@ -326,10 +476,25 @@ fn apply_theme(app: &AppHandle, theme: &str) {
     };
 
     for window in app.webview_windows().values() {
-        let _ = window.set_theme(native_theme);
-        let _ = window.emit("hla://theme-changed", theme);
+        if let Err(error) = window.set_theme(native_theme) {
+            diagnostics::warn(
+                "runtime",
+                format!("Failed to apply native theme to window: {error}"),
+            );
+        }
+        if let Err(error) = window.emit("hla://theme-changed", theme) {
+            diagnostics::warn(
+                "runtime",
+                format!("Failed to emit theme change to window: {error}"),
+            );
+        }
     }
-    let _ = app.emit("hla://theme-changed", theme);
+    if let Err(error) = app.emit("hla://theme-changed", theme) {
+        diagnostics::warn(
+            "runtime",
+            format!("Failed to broadcast theme change: {error}"),
+        );
+    }
 }
 
 fn setup_menu(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -368,7 +533,11 @@ fn parse_local_date_range(from: &str, to: &str) -> Result<(DateTime<Utc>, DateTi
         .map_err(|_| "Invalid end date format (expected YYYY-MM-DD).")?;
 
     let start_local = Local
-        .from_local_datetime(&start_date.and_hms_opt(0, 0, 0).ok_or("Invalid start time")?)
+        .from_local_datetime(
+            &start_date
+                .and_hms_opt(0, 0, 0)
+                .ok_or("Invalid start time")?,
+        )
         .single()
         .ok_or("Unable to interpret start date in local timezone.")?;
     let end_local = Local
@@ -411,7 +580,10 @@ fn sanitize_filename(filename: &str, extension: &str) -> String {
         clean = "hermes-events".to_string();
     }
 
-    if !clean.to_ascii_lowercase().ends_with(&format!(".{extension}")) {
+    if !clean
+        .to_ascii_lowercase()
+        .ends_with(&format!(".{extension}"))
+    {
         clean.push('.');
         clean.push_str(extension);
     }
@@ -429,7 +601,8 @@ fn csv_escape(value: &str) -> String {
 
 fn build_csv(events: &[NormalizedEvent]) -> String {
     let mut lines = Vec::with_capacity(events.len() + 1);
-    lines.push("timestamp,os,logName,category,provider,eventId,severity,message,source".to_string());
+    lines
+        .push("timestamp,os,logName,category,provider,eventId,severity,message,source".to_string());
 
     for event in events {
         let row = [
@@ -438,10 +611,20 @@ fn build_csv(events: &[NormalizedEvent]) -> String {
             csv_escape(event.log_name.as_str()),
             csv_escape(event.category.as_str()),
             csv_escape(event.provider.as_str()),
-            csv_escape(event.event_id.map(|id| id.to_string()).unwrap_or_default().as_str()),
+            csv_escape(
+                event
+                    .event_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
             csv_escape(event.severity.as_str()),
             csv_escape(event.message.as_str()),
-            csv_escape(if event.imported { "Imported" } else { "Live/Local" }),
+            csv_escape(if event.imported {
+                "Imported"
+            } else {
+                "Live/Local"
+            }),
         ]
         .join(",");
         lines.push(row);
@@ -451,7 +634,23 @@ fn build_csv(events: &[NormalizedEvent]) -> String {
 }
 
 fn main() {
-    tauri::Builder::default()
+    std::panic::set_hook(Box::new(|info| {
+        diagnostics::error("panic", format!("Unhandled panic: {info}"));
+    }));
+
+    match diagnostics::init_logging() {
+        Ok(path) => diagnostics::info(
+            "startup",
+            format!("Diagnostics logs directory ready: {}", path.display()),
+        ),
+        Err(error) => {
+            eprintln!("Failed to initialize diagnostics logging: {error}");
+        }
+    }
+
+    diagnostics::info("startup", "Launching Hermes application");
+
+    let builder = tauri::Builder::default()
         .setup(setup_menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "theme_system" => apply_theme(app, "system"),
@@ -483,7 +682,13 @@ fn main() {
             quit_app,
             set_app_theme,
             get_saved_theme
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        ]);
+
+    if let Err(error) = builder.run(tauri::generate_context!()) {
+        diagnostics::error(
+            "startup",
+            format!("Error while running Tauri application: {error}"),
+        );
+        panic!("error while running tauri application: {error}");
+    }
 }

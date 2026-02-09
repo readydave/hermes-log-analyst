@@ -40,6 +40,11 @@
   - theme
   - export directory
   - ingest profile (`autoSyncOnStartup`, `maxEventsPerSync`, `windowsChannels`)
+- Diagnostics logging:
+  - daily JSONL diagnostics logs (`diagnostics-YYYY-MM-DD.log`)
+  - automatic 7-day retention prune on startup/day rollover
+  - captures collector issues (including access denied), startup/runtime exceptions, and storage/settings failures
+  - sync/backfill warning details are surfaced in UI when collection is partially successful
 
 ## Data and Settings Model
 - Ingest window default: `7` days.
@@ -52,11 +57,13 @@
   - `ingest_profile.json`
   - `theme.txt`
   - `export_dir.txt`
+  - `logs\diagnostics-YYYY-MM-DD.log`
 
 ## Runtime Behavior
 - `npm run tauri dev`:
   - full host collection and persistence enabled
   - startup auto-sync runs if enabled in ingest profile
+  - diagnostics logger initializes at startup and prunes stale log files older than 7 days
 - `npm run dev`:
   - browser mode, no host collector bridge
   - UI still works with imported data and frontend controls
@@ -65,6 +72,7 @@
 - Crash import is metadata-first (no deep dump/core symbolication yet).
 - Large ranges plus high max-event settings can still create startup/refresh latency.
 - Ingest telemetry is basic; per-channel timing/count breakdown is not yet surfaced.
+- Collector warning details are summarized in UI; full context remains diagnostics-log first.
 - Common terminal message during `tauri dev` is usually benign:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
 
@@ -83,11 +91,7 @@
 2. Add remote machine connectors (SSH/WinRM).
 3. Enrich crash importers with minidump/panic/core parsing and optional symbolication.
 4. Add ingest diagnostics in UI (per-channel counts + timing).
-5. Add application diagnostics logging:
-   - write structured app logs to `/logs`
-   - capture typical operational failures (access denied, read/write failures, collector errors, startup/sync exceptions)
-   - enforce retention to keep only the last 7 days of log files
-6. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
+5. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
 
 ## Quick Validation Checklist
 1. Run `npm run tauri dev`.
@@ -96,17 +100,20 @@
 4. Apply log-type filter and confirm visible rows update as expected.
 5. Select/clear event selection and confirm footer actions enable/disable correctly.
 
-## Planned Logging Spec (Not Yet Implemented)
-- Scope:
-  - backend/runtime operational logs for troubleshooting and support
-  - include access errors, file/db read-write failures, and collector/runtime exceptions
-- Storage:
-  - persist to `/logs` directory
-  - rotate/prune so only the most recent 7 days are retained
-- Follow-up implementation notes:
-  - initialize logger during app startup
-  - include timestamp, level, subsystem, and error context in each entry
-  - add startup check that prunes stale log files before normal operations
+## Diagnostics Logging Implementation
+- Logger module: `src-tauri/src/diagnostics.rs`
+  - writes JSONL records with `timestamp`, `level`, `subsystem`, and `message`
+  - file naming: `diagnostics-YYYY-MM-DD.log`
+- Log directory:
+  - resolved via `dirs::data_local_dir()/hermes-log-analyst/logs`
+  - on Windows this is `%LOCALAPPDATA%\hermes-log-analyst\logs`
+- Retention:
+  - startup prune removes log files older than 7 days
+  - day rollover also triggers prune after opening the next daily log
+- Collector behavior changes:
+  - collectors now return structured `events + warnings + errors`
+  - sync/backfill commands fail when collectors return no events and hard errors
+  - partial-success collection warnings are returned to UI and logged
 
 ## How to run
 - `npm install`

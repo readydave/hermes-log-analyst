@@ -22,7 +22,7 @@ import {
   getIngestWindowDays,
   setIngestWindowDays
 } from "./lib/backend";
-import type { IngestProfile } from "./lib/backend";
+import type { IngestProfile, SyncOperationResult } from "./lib/backend";
 import { exportAsCsv, exportAsJson } from "./lib/export";
 import { applyFilters, defaultFilters } from "./lib/filters";
 import { importSessionEvents } from "./lib/import";
@@ -202,6 +202,7 @@ export default function App() {
   const [isRangeLoading, setIsRangeLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [lastError, setLastError] = useState<string>("");
+  const [collectorWarning, setCollectorWarning] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
   const [exportStatus, setExportStatus] = useState<string>("");
 
@@ -331,6 +332,19 @@ export default function App() {
     ? "grid gap-2 lg:grid-cols-[1.35fr_1fr_1fr_1fr_0.9fr_0.9fr_1fr]"
     : "grid gap-2 lg:grid-cols-[1.35fr_1fr_1fr_0.9fr_0.9fr_1fr]";
 
+  function applyCollectorWarnings(context: string, result: SyncOperationResult): void {
+    if (result.warnings.length === 0) {
+      setCollectorWarning("");
+      return;
+    }
+
+    const preview = result.warnings.slice(0, 2).join(" ");
+    const suffix = result.warnings.length > 2
+      ? ` (+${result.warnings.length - 2} more; see diagnostics logs.)`
+      : " (see diagnostics logs).";
+    setCollectorWarning(`${context}: ${preview}${suffix}`);
+  }
+
   useEffect(() => {
     void (async () => {
       const savedTheme = await getSavedTheme();
@@ -410,6 +424,7 @@ export default function App() {
   async function initialize(): Promise<void> {
     setIsLoading(true);
     setLastError("");
+    setCollectorWarning("");
 
     try {
       const os = await getHostOs();
@@ -421,7 +436,8 @@ export default function App() {
       const profile = await getIngestProfile();
       setIngestProfileState(profile);
       if (profile.autoSyncOnStartup) {
-        await refreshLocalEvents();
+        const syncResult = await refreshLocalEvents();
+        applyCollectorWarnings("Startup sync warning", syncResult);
       }
       const collected = await getLocalEvents(50000);
       if (collected.length > 0) setLocalEvents(collected);
@@ -440,10 +456,13 @@ export default function App() {
     setLastError("");
 
     try {
-      await refreshLocalEvents();
+      const result = await refreshLocalEvents();
+      applyCollectorWarnings("Refresh warning", result);
       setLocalEvents(await getLocalEvents(50000));
       setRangeViewActive(false);
       setRangeLoadMessage("");
+      setExportStatus(`Refresh complete: ${result.collected.toLocaleString()} events collected.`);
+      window.setTimeout(() => setExportStatus(""), 2500);
     } catch (error) {
       setLastError(error instanceof Error ? error.message : "Refresh failed.");
     } finally {
@@ -679,11 +698,14 @@ export default function App() {
       const days = Math.max(1, Math.min(365, Math.floor(ingestWindowDays)));
       const saved = await setIngestWindowDays(days);
       setIngestWindowDaysState(saved);
-      await refreshLocalEvents();
+      const syncResult = await refreshLocalEvents();
+      applyCollectorWarnings("Sync warning", syncResult);
       setLocalEvents(await getLocalEvents(50000));
       setRangeViewActive(false);
       setRangeLoadMessage("");
-      setExportStatus(`Ingest window set to ${saved} days and synced.`);
+      setExportStatus(
+        `Ingest window set to ${saved} days and synced (${syncResult.collected.toLocaleString()} events).`
+      );
       window.setTimeout(() => setExportStatus(""), 2500);
     } catch (error) {
       setLastError(error instanceof Error ? error.message : "Failed to update ingest window.");
@@ -708,7 +730,8 @@ export default function App() {
     setRangeLoadMessage(`Loading events for ${normalized.from} to ${normalized.to}...`);
     setIsRangeLoading(true);
     try {
-      await syncLocalEventsRange(normalized.from, normalized.to, false);
+      const syncResult = await syncLocalEventsRange(normalized.from, normalized.to, false);
+      applyCollectorWarnings("Range load warning", syncResult);
       const events = await getLocalEventsRange(normalized.from, normalized.to);
       setLocalEvents(events);
       applyViewDateRange(normalized.from, normalized.to);
@@ -773,6 +796,11 @@ export default function App() {
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
         {lastError && (
           <div className={cn(panelClass, "border-danger text-danger")}>{lastError}</div>
+        )}
+        {collectorWarning && (
+          <div className={cn(panelClass, "border-panel-border bg-[var(--sev-warning)] text-text px-4 py-3 text-sm")}>
+            {collectorWarning}
+          </div>
         )}
         {exportStatus && (
           <div className={cn(panelClass, "border-ok text-ok")}>{exportStatus}</div>
