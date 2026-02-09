@@ -87,6 +87,7 @@
    - write structured app logs to `/logs`
    - capture typical operational failures (access denied, read/write failures, collector errors, startup/sync exceptions)
    - enforce retention to keep only the last 7 days of log files
+6. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
 
 ## Quick Validation Checklist
 1. Run `npm run tauri dev`.

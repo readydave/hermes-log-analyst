@@ -107,3 +107,4 @@ Use these defaults for fast startup with useful breadth:
   - write logs to `/logs`
   - cover access/read/write and runtime collector errors
   - keep only the last 7 days of log files
+- After current priorities, target Garuda Linux (Arch-based) validation and compatibility hardening.
