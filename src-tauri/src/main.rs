@@ -3,7 +3,7 @@ mod db;
 mod logs;
 mod settings;
 
-use crash::{build_sample_crash, CrashRecord};
+use crash::{build_sample_crash, import_host_crashes as collect_host_crashes, CrashRecord};
 use db::{
     correlate_crash_events, get_crashes as read_crashes, get_local_events as read_local_events,
     prune_events_before, save_crashes, save_local_events,
@@ -112,6 +112,22 @@ fn create_sample_crash() -> Result<CrashRecord, String> {
     let crash = build_sample_crash(os.as_str());
     save_crashes(std::slice::from_ref(&crash))?;
     Ok(crash)
+}
+
+#[tauri::command]
+async fn import_host_crashes(limit: Option<u32>) -> Result<usize, String> {
+    let max = limit.unwrap_or(200).clamp(1, 2000) as usize;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let crashes = collect_host_crashes(max)?;
+        if crashes.is_empty() {
+            return Ok::<usize, String>(0);
+        }
+        save_crashes(&crashes)?;
+        Ok(crashes.len())
+    })
+    .await
+    .map_err(|error| format!("Failed to import host crashes: {error}"))?
 }
 
 #[tauri::command]
@@ -393,6 +409,7 @@ fn main() {
             refresh_local_events,
             get_local_events,
             create_sample_crash,
+            import_host_crashes,
             get_crashes,
             get_crash_related_events,
             open_external_url,

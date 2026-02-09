@@ -71,6 +71,13 @@ export async function createSampleCrash(): Promise<CrashRecord | null> {
   return invoke<CrashRecord>("create_sample_crash");
 }
 
+export async function importHostCrashes(limit = 200): Promise<number> {
+  if (!isTauriRuntime()) return 0;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("import_host_crashes", { limit });
+}
+
 export async function getCrashes(limit = 250): Promise<CrashRecord[]> {
   if (!isTauriRuntime()) return [];
 

@@ -42,3 +42,4 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
 - Windows collector uses the native Event Log API (wevtapi) for Application/System/Security and falls back to seeded events on failure.
 - Linux collector uses `journalctl --since/--until -o json`.
 - macOS collector uses `log show --style json` with start/end ranges.
+- Crash import supports host metadata import (Windows WER + dumps, macOS DiagnosticReports, Linux apport/coredump) and stores normalized crash records for correlation.

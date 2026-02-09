@@ -17,6 +17,7 @@
 ## Key Features Implemented
 - Local SQLite cache for events + crashes.
 - Crash model + correlation query.
+- Host crash importer (metadata-first) with OS-specific source scanning and dedupe by source path.
 - Prompt redaction & improved prompt template (security risk flagging; commands in code fences).
 - Export settings with saved export directory.
 - Theme persistence across launches.
@@ -35,24 +36,23 @@
 - All platforms fall back to seeded events if collection fails.
 
 ## What’s Still Stubbed
-- Real crash importers not implemented yet.
+- Crash importers are metadata-first (no deep dump/panic symbolication yet).
 
 ## Next Work Items (Recommended)
-1) UX polish:
-   - Data coverage hint (ingested range)
-   - Warning if filters outside ingested range
-2) Crash importers (metadata-first)
-3) Performance: virtualized table rows
-4) Remote machine support (SSH/WinRM)
+1) Performance: virtualized table rows
+2) Remote machine support (SSH/WinRM)
+3) Crash importer depth:
+   - Minidump / panic / core parser enrichment
+   - Optional symbolication pipeline
 
 ## Objective Recheck (2026-02-09)
 - 1) UX polish (coverage hint + out-of-range warning): `done`
-- 2) Crash importers (metadata-first): `pending`
+- 2) Crash importers (metadata-first): `done`
 - 3) Performance (virtualized table rows): `pending`
 - 4) Remote machine support (SSH/WinRM): `pending`
 - Notes:
   - Collectors objective from prior handoff is complete (native Windows/macOS/Linux collectors now in place).
-  - Current crash flow is sample-driven for correlation/testing (`create_sample_crash`), not importer-driven.
+  - Crash correlation now supports real host-imported crash metadata (`import_host_crashes`) plus sample crash generation for demos.
 
 ## How to run
 - `npm install`

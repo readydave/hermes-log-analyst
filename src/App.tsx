@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   chooseExportDirectory,
   createSampleCrash,
+  importHostCrashes,
   exportEventsToFile,
   getCrashRelatedEvents,
   getCrashes,
@@ -447,6 +448,22 @@ export default function App() {
     }
   }
 
+  async function importHostCrashesNow(): Promise<void> {
+    setLastError("");
+    try {
+      const count = await importHostCrashes(300);
+      await refreshCrashes();
+      setExportStatus(
+        count > 0
+          ? `Imported ${count} crash report${count === 1 ? "" : "s"} from host.`
+          : "No host crash reports found."
+      );
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to import host crashes.");
+    }
+  }
+
   async function onCrashSelectionChange(crashId: string): Promise<void> {
     setSelectedCrashId(crashId);
     if (!crashId) {
@@ -675,6 +692,7 @@ export default function App() {
 
         <section className={cn(panelClass, "flex flex-wrap items-center gap-3 px-5 py-4")}> 
           <div className="text-sm font-semibold">Crash Correlation</div>
+          <Button size="sm" variant="primary" onClick={() => void importHostCrashesNow()}>Import Host Crashes</Button>
           <Button size="sm" onClick={() => void createCrashSampleNow()}>Simulate Crash</Button>
           <label className="text-xs text-muted">Crash</label>
           <select className={cn(selectClass, "max-w-xs text-xs")} value={selectedCrashId} onChange={(e) => void onCrashSelectionChange(e.target.value)}>
