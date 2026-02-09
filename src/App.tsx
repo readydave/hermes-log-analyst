@@ -164,6 +164,24 @@ function formatSelectedSummary(event: NormalizedEvent): string {
   return `${event.provider} / ${event.logName}`;
 }
 
+function parseLocalDateStart(value: string): number | null {
+  if (!value) return null;
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return null;
+  return new Date(year, month - 1, day, 0, 0, 0, 0).getTime();
+}
+
+function parseLocalDateEnd(value: string): number | null {
+  if (!value) return null;
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return null;
+  return new Date(year, month - 1, day, 23, 59, 59, 999).getTime();
+}
+
+function formatLocalDate(value: number): string {
+  return new Date(value).toLocaleDateString();
+}
+
 export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("system");
   const [hostOs, setHostOs] = useState<SupportedOs>(browserDefaultOs);
@@ -202,6 +220,56 @@ export default function App() {
     () => JSON.stringify(filterDraft) !== JSON.stringify(activeFilters),
     [filterDraft, activeFilters]
   );
+  const localCoverage = useMemo(() => {
+    let min = Number.POSITIVE_INFINITY;
+    let max = Number.NEGATIVE_INFINITY;
+    let count = 0;
+
+    for (const event of localEvents) {
+      const time = Date.parse(event.timestamp);
+      if (!Number.isFinite(time)) continue;
+      if (time < min) min = time;
+      if (time > max) max = time;
+      count += 1;
+    }
+
+    if (count === 0) return null;
+    return { start: min, end: max, count };
+  }, [localEvents]);
+  const localCoverageSummary = useMemo(() => {
+    if (!localCoverage) {
+      return "Local cache coverage: unavailable until logs are synced.";
+    }
+    return `Local cache coverage: ${formatLocalDate(localCoverage.start)} - ${formatLocalDate(localCoverage.end)} (${localCoverage.count.toLocaleString()} events).`;
+  }, [localCoverage]);
+  const activeDateCoverageWarning = useMemo(() => {
+    if (!localCoverage) return "";
+
+    let start = parseLocalDateStart(activeFilters.dateFrom);
+    let end = parseLocalDateEnd(activeFilters.dateTo);
+    if (start === null && end === null) return "";
+
+    if (start !== null && end !== null && start > end) {
+      const swapped = start;
+      start = end;
+      end = swapped;
+    }
+
+    const fullyOutside =
+      (end !== null && end < localCoverage.start) ||
+      (start !== null && start > localCoverage.end);
+    if (fullyOutside) {
+      return `Active date filters are outside local coverage (${formatLocalDate(localCoverage.start)} - ${formatLocalDate(localCoverage.end)}).`;
+    }
+
+    const startsBefore = start !== null && start < localCoverage.start;
+    const endsAfter = end !== null && end > localCoverage.end;
+    if (startsBefore || endsAfter) {
+      return `Active date filters extend beyond local coverage (${formatLocalDate(localCoverage.start)} - ${formatLocalDate(localCoverage.end)}). Results may be incomplete.`;
+    }
+
+    return "";
+  }, [activeFilters.dateFrom, activeFilters.dateTo, localCoverage]);
   const selectedCrash = useMemo(
     () => crashes.find((crash) => crash.id === selectedCrashId) ?? null,
     [crashes, selectedCrashId]
@@ -719,6 +787,12 @@ export default function App() {
                   Apply Filters
                 </Button>
               </div>
+
+              {activeDateCoverageWarning && (
+                <div className="rounded-lg border border-panel-border bg-[var(--sev-warning)] px-3 py-2 text-xs">
+                  {activeDateCoverageWarning}
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -729,6 +803,7 @@ export default function App() {
                     {dataCollapsed ? "Show Data" : "Hide Data"}
                   </Button>
                 </div>
+                <p className="mt-2 text-xs text-muted">{localCoverageSummary}</p>
 
                 {!dataCollapsed && (
                   <div className="mt-3 space-y-3">

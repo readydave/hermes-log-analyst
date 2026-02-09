@@ -328,7 +328,7 @@ fn map_category(log_name: &str) -> &str {
 }
 
 #[cfg(target_os = "windows")]
-fn map_severity(level: Option<u32>) -> &str {
+fn map_severity(level: Option<u32>) -> &'static str {
     match level {
         Some(1) => "critical",
         Some(2) => "error",

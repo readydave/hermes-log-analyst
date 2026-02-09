@@ -15,7 +15,7 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 webbrowser = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_EventLog", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_EventLog", "Win32_Foundation", "Win32_Security"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

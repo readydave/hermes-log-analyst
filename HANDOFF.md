@@ -46,7 +46,7 @@
 4) Remote machine support (SSH/WinRM)
 
 ## Objective Recheck (2026-02-09)
-- 1) UX polish (coverage hint + out-of-range warning): `pending`
+- 1) UX polish (coverage hint + out-of-range warning): `done`
 - 2) Crash importers (metadata-first): `pending`
 - 3) Performance (virtualized table rows): `pending`
 - 4) Remote machine support (SSH/WinRM): `pending`
