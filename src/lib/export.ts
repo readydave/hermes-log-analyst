@@ -15,11 +15,22 @@ export function exportAsJson(events: NormalizedEvent[], filename: string): void 
 }
 
 function escapeCsv(value: unknown): string {
-  const text = String(value ?? "");
+  const text = csvFormulaSafe(String(value ?? ""));
   if (text.includes(",") || text.includes("\"") || text.includes("\n")) {
     return `"${text.replaceAll("\"", "\"\"")}"`;
   }
   return text;
+}
+
+function csvFormulaSafe(value: string): string {
+  const leadingTrimmed = value.replace(/^[\s\u0000]+/, "");
+  if (!leadingTrimmed) return value;
+
+  const first = leadingTrimmed[0];
+  if (first === "=" || first === "+" || first === "-" || first === "@") {
+    return `'${value}`;
+  }
+  return value;
 }
 
 export function exportAsCsv(events: NormalizedEvent[], filename: string): void {

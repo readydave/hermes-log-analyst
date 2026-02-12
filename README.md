@@ -32,6 +32,10 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - JSONL app diagnostics written to `logs` under the app data directory.
   - Captures collector failures, access denied conditions, startup/runtime exceptions, and storage/settings read-write failures.
   - Automatic pruning retains only the most recent 7 days of log files.
+- Security hardening:
+  - CSV export now neutralizes formula-prefixed cells (`=`, `+`, `-`, `@`) to prevent spreadsheet formula injection.
+  - Tauri app CSP is now explicitly configured (previously `null`).
+  - CSV import parser now handles quoted fields and escaped quotes correctly (instead of naive `split(",")` parsing).
 - UX:
   - Collapsible Analysis Panels (group + per panel).
   - Sticky table headers, sortable columns, and row detail footer actions.
@@ -100,6 +104,9 @@ Use these defaults for fast startup with useful breadth:
 ## Notes and troubleshooting
 
 - Imported events are intentionally kept out of SQLite for performance and to avoid mixing live and imported data.
+- Dependency audit status:
+  - `npm audit` (including dev dependencies): 0 vulnerabilities.
+  - `cargo audit`: 0 vulnerabilities (transitive GTK3 maintenance warnings remain on Linux-target dependency chain).
 - Diagnostics logs location (daily files, 7-day retention):
   - Windows: `%LOCALAPPDATA%\hermes-log-analyst\logs\diagnostics-YYYY-MM-DD.log`
   - macOS: `~/Library/Application Support/hermes-log-analyst/logs/diagnostics-YYYY-MM-DD.log`

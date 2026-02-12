@@ -592,10 +592,19 @@ fn sanitize_filename(filename: &str, extension: &str) -> String {
 }
 
 fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
-        format!("\"{}\"", value.replace('"', "\"\""))
+    let text = csv_formula_safe(value);
+    if text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r') {
+        format!("\"{}\"", text.replace('"', "\"\""))
     } else {
-        value.to_string()
+        text
+    }
+}
+
+fn csv_formula_safe(value: &str) -> String {
+    let leading_trimmed = value.trim_start_matches([' ', '\t', '\r', '\n']);
+    match leading_trimmed.chars().next() {
+        Some('=') | Some('+') | Some('-') | Some('@') => format!("'{value}"),
+        _ => value.to_string(),
     }
 }
 

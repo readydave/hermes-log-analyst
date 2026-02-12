@@ -34,13 +34,12 @@ function parseJson(content: string, hostOs: SupportedOs): NormalizedEvent[] {
 }
 
 function parseCsv(content: string, hostOs: SupportedOs): NormalizedEvent[] {
-  const lines = content.split(/\r?\n/).filter(Boolean);
-  if (lines.length < 2) return [];
+  const rows = parseCsvRows(content);
+  if (rows.length < 2) return [];
 
-  const headers = lines[0].split(",").map((h) => h.trim().toLowerCase());
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
 
-  return lines.slice(1).map((line, index) => {
-    const cells = line.split(",");
+  return rows.slice(1).map((cells, index) => {
     const row = Object.fromEntries(headers.map((h, i) => [h, cells[i] ?? ""]));
 
     return {
@@ -57,6 +56,64 @@ function parseCsv(content: string, hostOs: SupportedOs): NormalizedEvent[] {
       imported: true
     };
   });
+}
+
+function parseCsvRows(content: string): string[][] {
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let currentCell = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < content.length; i += 1) {
+    const ch = content[i];
+
+    if (inQuotes) {
+      if (ch === "\"") {
+        if (content[i + 1] === "\"") {
+          currentCell += "\"";
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        currentCell += ch;
+      }
+      continue;
+    }
+
+    if (ch === "\"") {
+      inQuotes = true;
+      continue;
+    }
+
+    if (ch === ",") {
+      currentRow.push(currentCell);
+      currentCell = "";
+      continue;
+    }
+
+    if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && content[i + 1] === "\n") {
+        i += 1;
+      }
+      currentRow.push(currentCell);
+      currentCell = "";
+      if (currentRow.length > 1 || currentRow[0]?.trim()) {
+        rows.push(currentRow);
+      }
+      currentRow = [];
+      continue;
+    }
+
+    currentCell += ch;
+  }
+
+  currentRow.push(currentCell);
+  if (currentRow.length > 1 || currentRow[0]?.trim()) {
+    rows.push(currentRow);
+  }
+
+  return rows;
 }
 
 function normalizeSeverity(value: string): NormalizedEvent["severity"] {

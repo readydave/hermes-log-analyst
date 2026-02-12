@@ -50,6 +50,11 @@
   - automatic 7-day retention prune on startup/day rollover
   - captures collector issues (including access denied), startup/runtime exceptions, and storage/settings failures
   - sync/backfill warning details are surfaced in UI when collection is partially successful
+- Security hardening:
+  - CSV export formula-injection mitigation on frontend and backend export paths
+  - explicit Tauri CSP configured (replaced `csp: null`)
+  - CSV import parser upgraded from naive comma split to quoted-field parser
+  - frontend dev toolchain upgraded to Vite 7.x (`npm audit` now clean)
 
 ## Data and Settings Model
 - Ingest window default: `7` days.
@@ -79,6 +84,7 @@
 - Ingest telemetry is basic; per-channel timing/count breakdown is not yet surfaced.
 - Collector warning details are summarized in UI; full context remains diagnostics-log first.
 - Local/imported event lists are memory-capped; large loads are intentionally truncated in-memory for stability.
+- `cargo audit` reports no vulnerabilities, but Linux-target transitive GTK3 dependencies are flagged as unmaintained/unsound informational warnings via Tauri/Wry stack.
 - Common terminal message during `tauri dev` is usually benign:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
 
