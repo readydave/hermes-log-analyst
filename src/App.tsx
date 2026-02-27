@@ -1656,8 +1656,8 @@ export default function App() {
               <div className="space-y-3 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
                 <div className="text-xs font-semibold uppercase tracking-wide text-muted">Step 3: Custom Filters</div>
                 <div className="grid gap-2 md:grid-cols-2 lg:grid-cols-3">
-                  <label className="text-xs text-muted">
-                    From
+                  <label className="flex w-full items-center gap-2 text-xs text-muted">
+                    <span className="shrink-0">From</span>
                     <input
                       className={inputClass}
                       type="date"
@@ -1668,8 +1668,8 @@ export default function App() {
                       }}
                     />
                   </label>
-                  <label className="text-xs text-muted">
-                    To
+                  <label className="flex w-full items-center gap-2 text-xs text-muted">
+                    <span className="shrink-0">To</span>
                     <input
                       className={inputClass}
                       type="date"
@@ -1929,8 +1929,8 @@ export default function App() {
                   </option>
                 ))}
               </select>
-              <label className="text-xs text-muted">
-                From
+              <label className="flex w-full items-center gap-2 text-xs text-muted">
+                <span className="shrink-0">From</span>
                 <input
                   className={inputClass}
                   type="date"
@@ -1941,8 +1941,8 @@ export default function App() {
                   }}
                 />
               </label>
-              <label className="text-xs text-muted">
-                To
+              <label className="flex w-full items-center gap-2 text-xs text-muted">
+                <span className="shrink-0">To</span>
                 <input
                   className={inputClass}
                   type="date"
@@ -2035,24 +2035,30 @@ export default function App() {
                 One-time explicit date span for investigations. `Load Events` fetches this exact range.
               </div>
               <div className="grid gap-2 md:grid-cols-2">
-                <input
-                  className={inputClass}
-                  type="date"
-                  value={backfillFrom}
-                  onChange={(e) => {
-                    setBackfillFrom(e.currentTarget.value);
-                    blurDateInputIfComplete(e.currentTarget);
-                  }}
-                />
-                <input
-                  className={inputClass}
-                  type="date"
-                  value={backfillTo}
-                  onChange={(e) => {
-                    setBackfillTo(e.currentTarget.value);
-                    blurDateInputIfComplete(e.currentTarget);
-                  }}
-                />
+                <label className="flex w-full items-center gap-2 text-xs text-muted">
+                  <span className="shrink-0">From</span>
+                  <input
+                    className={inputClass}
+                    type="date"
+                    value={backfillFrom}
+                    onChange={(e) => {
+                      setBackfillFrom(e.currentTarget.value);
+                      blurDateInputIfComplete(e.currentTarget);
+                    }}
+                  />
+                </label>
+                <label className="flex w-full items-center gap-2 text-xs text-muted">
+                  <span className="shrink-0">To</span>
+                  <input
+                    className={inputClass}
+                    type="date"
+                    value={backfillTo}
+                    onChange={(e) => {
+                      setBackfillTo(e.currentTarget.value);
+                      blurDateInputIfComplete(e.currentTarget);
+                    }}
+                  />
+                </label>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button size="sm" variant="primary" onClick={() => void loadEventsForRange()} disabled={isRangeLoading}>

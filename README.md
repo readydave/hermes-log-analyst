@@ -42,7 +42,8 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - Fixed top and bottom bars with scrollable middle content region.
   - Collector warning banner shown when sync/backfill completes with recoverable collector issues.
 - Export and actions:
-  - Export filtered/single events to JSON or CSV.
+  - Export filtered/single events to JSON, CSV, or TXT.
+  - Guided save dialog export workflow in desktop runtime.
   - Google search and copy-ready LLM prompt for selected event.
 - Theme switcher: `System`, `Light`, `Dark`.
 
@@ -121,6 +122,11 @@ Use these defaults for fast startup with useful breadth:
 
 ## Planned next
 
-- Remote machine connectors (SSH/WinRM).
+- LLM-assisted research panel and settings:
+  - Local providers: Ollama and LM Studio (localhost detection + optional LAN discovery).
+  - Cloud providers: OpenAI, Gemini, Claude, and Perplexity.
+  - Generic OpenAI-compatible connector for custom/self-hosted endpoints.
+  - OS-aware built-in prompt templates for Windows, Linux, and macOS event triage.
 - Deeper crash artifact parsing and optional symbolication pipeline.
-- After current priorities, target Garuda Linux (Arch-based) validation and compatibility hardening.
+- Remote machine log access (future state): connect to remote host collectors for investigation without mandatory full download.
+- Continue Garuda Linux (Arch-based) packaging/compatibility hardening (AppImage path and install validation).

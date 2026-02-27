@@ -123,24 +123,29 @@ Acceptance criteria:
 2. Install, launch, and uninstall validated on Win11, latest macOS, and Garuda.
 3. Checksums (`sha256`) generated for all downloadable artifacts.
 
-### Milestone 2 - Local LLM Provider Layer (Ollama + LM Studio)
-- Add provider abstraction in backend/frontend with provider ids `ollama` and `lmstudio`.
+### Milestone 2 - LLM Provider Layer (Local + Cloud + Generic)
+- Add provider abstraction in backend/frontend with provider ids:
+  - local: `ollama`, `lmstudio`
+  - cloud: `openai`, `gemini`, `claude`, `perplexity`
+  - generic: `openai_compatible` (free-form base URL + key + model mapping)
 - Support common provider actions: list models, test connection, submit prompt, return response.
 - Add localhost auto-detection on startup/manual refresh:
-- Ollama probe: `http://127.0.0.1:11434/api/tags`.
-- LM Studio probe (OpenAI-compatible): `http://127.0.0.1:1234/v1/models`.
-- Add provider settings UI for preferred provider, model, timeout, max tokens, and temperature.
+  - Ollama probe: `http://127.0.0.1:11434/api/tags`
+  - LM Studio probe (OpenAI-compatible): `http://127.0.0.1:1234/v1/models`
+- Add provider settings UI for preferred provider, model, endpoint (when applicable), timeout, max tokens, and temperature.
 - Keep fallback mode: "Prompt only (no model call)".
+- Add built-in prompt templates with OS-aware variants for Windows, Linux, and macOS.
 
 Acceptance criteria:
 1. App can detect and connect to Ollama and LM Studio when running locally.
-2. User can choose provider/model and run log-entry lookup from selected event.
-3. Connection failures are surfaced as actionable warnings and diagnostics log entries.
+2. App can connect to OpenAI, Gemini, Claude, Perplexity, and a generic OpenAI-compatible endpoint using saved credentials.
+3. User can choose provider/model and run log-entry lookup from selected event with OS-aware prompt templates.
+4. Connection failures are surfaced as actionable warnings and diagnostics log entries.
 
 ### Milestone 3 - LAN Discovery (Optional, Security-First)
 - Add a separate opt-in action: `Discover providers on LAN`.
 - Default behavior: LAN scanning disabled; localhost detection always allowed.
-- Scan strategy: probe active-interface RFC1918 ranges on configured ports (`11434`, `1234` by default) using lightweight health/model endpoint checks only.
+- Scan strategy: determine local subnet(s) from active interfaces, then probe RFC1918 hosts on configured ports (`11434`, `1234` by default) using lightweight health/model endpoint checks only.
 - Safety UX and trust controls: first-use warning modal; discovered hosts default to `Untrusted`; per-host trust allowlist persisted in settings.
 - Add guardrail (default on): `Never send raw event message to untrusted hosts`.
 
@@ -173,13 +178,20 @@ Acceptance criteria:
 
 ### Implementation Notes
 - Add new settings file for LLM configuration and trusted LAN hosts (under app data dir).
+- Store provider secrets per platform-secure mechanism where possible (OS credential vault/keychain); avoid plaintext API keys in app settings files.
 - Add diagnostics entries for provider detection results, LAN scan start/end and host counts, and blocked/untrusted inference attempts.
 - Keep network operations in backend (Rust) and expose typed Tauri commands to frontend.
 
 ### Test Matrix for User-Owned Devices
-- Windows 11: verify installer + portable launch, local Ollama and LM Studio detection.
-- macOS (latest): verify app launch, codesign/notarization path, local provider detection.
-- Garuda Linux: verify AppImage + AUR install path, `journalctl` permissions behavior, local and optional LAN provider discovery.
+- Windows 11: verify installer + portable launch, local Ollama/LM Studio detection, and at least one cloud provider + generic endpoint connectivity.
+- macOS (latest): verify app launch, codesign/notarization path, local provider detection, and at least one cloud provider + generic endpoint connectivity.
+- Garuda Linux: verify AppImage + AUR install path, `journalctl` permissions behavior, local/LAN provider discovery, and at least one cloud provider + generic endpoint connectivity.
+
+## Future State Backlog
+- Remote machine log access:
+  - connect to remote hosts for targeted investigation
+  - avoid full log downloads unless explicitly requested
+  - preserve local-first security defaults and explicit consent prompts for remote access
 
 ## Quick Validation Checklist
 1. Run `npm run tauri dev`.
@@ -441,6 +453,8 @@ Result:
   - Frontend `ExportFormat` expanded to include `txt`; browser fallback supports text export.
   - Dependency audit resolved via `npm audit fix` (Rollup updated to `4.59.0`; audit now zero vulnerabilities).
   - Validation re-run: `npm run build` pass, `cargo check` pass (existing non-blocking warnings only).
+- UI consistency:
+  - standardized `From/To` date input alignment across Events, Export, and Data tabs.
 
 ## Windows Revalidation Handoff (After Pulling `3bf3dd7`)
 1. Sync code on Windows machine:
