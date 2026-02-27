@@ -1,10 +1,11 @@
 # Hermes Log Analyst - Handoff
 
 ## Repo
-- Path: `C:\Code\hermes`
+- Path (Linux): `/home/dave/scripts/hermes-log-analyst`
+- Path (Windows): `C:\Code\hermes`
 - Branch: `main`
 - Stack: React + TypeScript + Tailwind (Vite), Rust + Tauri, SQLite
-- Status date: `2026-02-09`
+- Status date: `2026-02-27`
 
 ## Current Product State
 - Desktop-first log triage app with real host collectors and local SQLite cache.
@@ -410,3 +411,65 @@ Result:
   - Add headless/integration command harness for `refresh_local_events`, `sync_local_events_range`, `import_host_crashes`, and `export_events` to validate core functions without fragile GUI automation.
   - Re-run GUI-only checks in an interactive desktop session (manual operator pass) after display/backend stabilization.
 - Owner: dave
+
+## Changelog - 2026-02-27 (Commit `3bf3dd7`)
+- Runtime launch hardening:
+  - Added `scripts/tauri-runner.mjs` and switched `npm run tauri` to use it.
+  - Runner clears inherited `LD_LIBRARY_PATH` and sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` on Linux when unset.
+  - Backend also applies Linux startup default for `WEBKIT_DISABLE_DMABUF_RENDERER` with diagnostics logging.
+- Browser launch behavior fix:
+  - `open_external_url` now prefers `xdg-open` on Linux and strips `BROWSER` from child env to honor desktop default browser associations.
+- Workspace/navigation restructure:
+  - Added tabbed workspace flow with dedicated `Home`, `Events`, `Crashes`, `Data`, `Import`, `Export`, `Settings`, and closable `Help` tab.
+  - Added Tools menu Help entry (`Tools -> Help`) that opens/targets Help sections.
+  - Removed top-bar `Export Logs` and moved import workflow out of the header into its own `Import` tab.
+- Export redesign:
+  - Replaced immediate header JSON/CSV exports with guided `Export` tab workflow.
+  - Export scope options: current loaded list or custom filtered host-OS subset.
+  - Custom export filters: date range, severity, log type, category, provider/source contains.
+  - Format options expanded to `JSON`, `CSV`, and `TXT`.
+  - Added backend save-dialog command `export_events_with_dialog`; exports now prompt user for destination filename/path.
+  - Added timestamped suggested filenames with short type tags.
+  - Added explicit preview diagnostics explaining why preview is `0` (date coverage, log type/category/source/severity mismatch).
+- Crash/date-range usability:
+  - Added one-click "Auto-Load Filter Range" action when active date filters exceed local cache coverage.
+  - Crash pre-window investigation auto-loads required range when crash timestamp lies outside current local cache.
+  - Crash results messaging clarifies strict pre-crash mode vs correlated fallback mode.
+- Event actions:
+  - Added `Copy Event Text` action in selected-event footer.
+- Security/reliability:
+  - Frontend `ExportFormat` expanded to include `txt`; browser fallback supports text export.
+  - Dependency audit resolved via `npm audit fix` (Rollup updated to `4.59.0`; audit now zero vulnerabilities).
+  - Validation re-run: `npm run build` pass, `cargo check` pass (existing non-blocking warnings only).
+
+## Windows Revalidation Handoff (After Pulling `3bf3dd7`)
+1. Sync code on Windows machine:
+   - `git checkout main`
+   - `git pull origin main`
+2. Preflight:
+   - `npm install`
+   - `npm run build`
+   - `npm run tauri info`
+3. Launch:
+   - `npm run tauri dev`
+4. Functional pass (live host data only):
+   - Refresh logs and confirm non-zero local events.
+   - Events tab: apply older date range outside current coverage and click `Auto-Load Filter Range`; verify range load status and table population behavior.
+   - Crashes tab: import host crashes, select crash, click `Investigate Pre-Crash`, verify strict pre-crash results or explicit correlated fallback notice.
+   - Export tab:
+     - test `Current loaded list` export (JSON and CSV).
+     - test `Custom filtered export` with date/log type/category/severity/source.
+     - verify preview explanation text when results are zero.
+     - verify save dialog appears and chosen path is used.
+   - Import tab: import a known prior JSON/CSV export and verify import status + event count update.
+   - Selected event footer: verify `Copy Event Text`, `Search Google`, `Copy LLM Prompt`, and single-event export actions.
+5. Browser behavior check:
+   - Click `Search Google` from selected event and confirm it opens Windows default browser.
+6. Packaging pass (if toolchain available):
+   - `npm run tauri build`
+   - record produced artifacts (`msi/nsis/exe`) and install/uninstall results.
+
+Expected notes to capture in Windows retest:
+- Whether pre-crash strict window returns rows for known crash windows.
+- Whether export save dialog path selection is intuitive for IT users.
+- Any dark-mode readability regressions still present in input/select/date controls.
