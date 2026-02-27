@@ -1,6 +1,6 @@
 export type SupportedOs = "windows" | "linux" | "macos";
 export type ThemeMode = "system" | "light" | "dark";
-export type ExportFormat = "json" | "csv";
+export type ExportFormat = "json" | "csv" | "txt";
 
 export type EventSeverity =
   | "information"

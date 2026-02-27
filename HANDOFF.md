@@ -300,3 +300,113 @@ Result:
 - Blockers:
 - Recommended next actions:
 - Owner:
+
+## Platform Validation Result - Garuda Linux (Live Data Only)
+
+### Validation Record
+- Date: 2026-02-27
+- Operator: dave
+- Machine label: daddslinux
+- OS + version: Garuda Linux (KDE on Wayland)
+- Repo commit (`git rev-parse --short HEAD`): `d558277`
+- Branch: `main`
+
+### Preflight Environment Check
+1. `npm install` -> success (`added 142 packages`), but reported `1 high severity vulnerability`.
+2. `npm run build` -> success (`vite v7.3.1`, built dist assets).
+3. `npm run tauri info` -> success (Tauri/Rust/WebKit detected on this host).
+4. Missing toolchain/runtime dependencies observed during validation:
+   - `dpkg-deb` not installed (`/bin/bash: line 1: dpkg-deb: command not found`).
+   - No passwordless sudo for package install/uninstall checks (`sudo -n true` exit code `1`).
+
+Result:
+- Build status: `pass` (`npm run build` succeeded).
+- Tauri info status: `pass`.
+- Notes: Preflight passed, but packaging/install tooling is incomplete for full local install/uninstall verification.
+
+### Live Log Readiness Check (No Dummy Data)
+1. `npm run tauri dev` (Wayland default) compiled but app terminated with `Gdk-Message ... Error 71 (Protocol error) dispatching to Wayland display`.
+2. `env GDK_BACKEND=x11 npm run tauri dev` ran long enough for startup sync.
+3. Host-data evidence:
+   - `~/.local/share/hermes-log-analyst/events.db` created.
+   - `sqlite3 ... "select count(*) from events;"` -> `4000`.
+   - `sqlite3 ... "select sum(imported) from events;"` -> `0` (no imported/dummy data).
+4. Live collector-equivalent range command checks:
+   - `journalctl --since "2026-02-20 ..." --until "2026-02-27 ..." -o json -n 2000 | wc -l` -> `2000`.
+   - `journalctl --since "2026-02-26 00:00:00" --until "2026-02-27 23:59:59" -o json -n 2000 | wc -l` -> `2000`.
+5. Sorting/filterability evidence on live DB:
+   - `select severity,count(*) ...` -> `information 3624`, `warning 360`, `critical 16`.
+   - `select ... order by timestamp desc limit 3` returned latest-first rows.
+
+Result:
+- Live event collection status: `pass-with-caveat` (works with `GDK_BACKEND=x11`; Wayland launch unstable).
+- Approx live events visible: `4000` in local SQLite cache.
+- Collector warnings/errors: No collector warning/error entries observed in diagnostics; startup diagnostics entries present.
+- Notes: No JSON/CSV import used; all validation data came from host `journalctl` and app startup sync.
+
+### Core Functional Validation
+1. Refresh collection succeeds and updates data window.
+2. Date-range `Load Events` succeeds with expected status messages.
+3. Crash import command runs and returns host crash metadata (or clear zero-result behavior).
+4. Export filtered events to CSV and JSON succeeds.
+5. Google search action and prompt-copy action work from selected event.
+
+Result:
+- Refresh: `partial-pass` (startup auto-sync populated DB; GUI confirmation of data-window text not captured due unstable GUI automation).
+- Range load: `partial-pass` (range collector command path validated via live `journalctl` output; GUI status text `Data loaded and ready...` not directly observed).
+- Crash import: `partial-pass` (host crash artifacts exist: `/var/lib/systemd/coredump` count `25`; direct button-command invocation not reliably automated in this session).
+- Export CSV/JSON: `blocked` (top-bar export button clicks could not be deterministically automated under current Wayland/X11 bridge behavior).
+- Search + prompt: `blocked` (requires deterministic row selection + action-click/clipboard checks; GUI automation unreliable here).
+- Notes: Blockers are UI automation/display-environment constraints, not imported-data constraints.
+
+### Packaging Validation
+1. `npm run tauri build`.
+2. Confirm artifacts exist.
+3. Install and launch packaged app.
+4. Confirm uninstall path.
+
+Result:
+- Bundle build status: `partial-pass`.
+  - `.deb` and `.rpm` built.
+  - AppImage bundling failed.
+- Artifact paths:
+  - `src-tauri/target/release/bundle/deb/Hermes Log Analyst_0.1.0_amd64.deb`
+  - `src-tauri/target/release/bundle/rpm/Hermes Log Analyst-0.1.0-1.x86_64.rpm`
+  - `src-tauri/target/release/bundle/appimage/Hermes Log Analyst.AppDir/` (AppImage final file not produced)
+- Install/launch status:
+  - Launch test of release binary: `timeout 15 env GDK_BACKEND=x11 ./src-tauri/target/release/hermes-log-analyst` -> process stayed up until timeout (exit `124`), emitted `Failed to create GBM buffer ...` warning.
+  - Package install test: `blocked` (no passwordless sudo; cannot perform system install/uninstall in this run).
+- Uninstall status: `blocked` (install step blocked).
+- Notes:
+  - AppImage blocker: linuxdeploy strip errors on RELR sections, e.g. `unknown type [0x13] section '.relr.dyn'`, ending with `failed to bundle project 'failed to run .../linuxdeploy-x86_64.AppImage'`.
+
+### Forward Readiness Check (Planned Functionality)
+
+#### Local LLM Provider Readiness
+Result:
+- Ollama reachable: `yes` (`curl http://127.0.0.1:11434/api/tags` -> `HTTP 200`; model list returned including `gemma3:latest`).
+- LM Studio reachable: `no` (`curl http://127.0.0.1:1234/v1/models` -> connection refused / `HTTP 000`).
+- Preferred provider: `ollama` (only reachable provider on this machine).
+- Notes: `ss -ltnp` showed listener on `127.0.0.1:11434` and none on `1234`.
+
+#### LAN Discovery Readiness
+Result:
+- LAN scan allowed: `not policy-confirmed` (technical path exists; policy confirmation not available in this shell session).
+- Network constraints:
+  - Active interface: `enp26s0 192.168.10.50/24`.
+  - `firewalld` not running.
+  - `nft list ruleset` requires root (`Operation not permitted`), so effective nftables policy not fully visible here.
+- Risk notes: Treat unknown LAN hosts as untrusted by default; require explicit user consent and warning before discovery/inference as planned.
+
+### Overall Status
+- Platform status: `pass-with-caveats`
+- Blockers:
+  - Wayland path unstable for this app run (`Gdk-Message ... Protocol error`); required `GDK_BACKEND=x11` workaround.
+  - AppImage packaging failed due linuxdeploy strip/RELR incompatibility.
+  - Deterministic GUI action automation (export/search/prompt) not reliable in this session.
+  - Install/uninstall verification blocked by lack of elevated install permissions.
+- Recommended next actions:
+  - Fix AppImage build by updating/overriding linuxdeploy toolchain (or disabling problematic strip step for RELR-enabled libs).
+  - Add headless/integration command harness for `refresh_local_events`, `sync_local_events_range`, `import_host_crashes`, and `export_events` to validate core functions without fragile GUI automation.
+  - Re-run GUI-only checks in an interactive desktop session (manual operator pass) after display/backend stabilization.
+- Owner: dave

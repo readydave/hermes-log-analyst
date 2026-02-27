@@ -197,6 +197,21 @@ export async function exportEventsToFile(
   return invoke<string>("export_events", { format, filename, events });
 }
 
+export async function exportEventsWithDialog(
+  format: ExportFormat,
+  suggestedFilename: string,
+  events: NormalizedEvent[]
+): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string | null>("export_events_with_dialog", {
+    format,
+    suggestedFilename,
+    events
+  });
+}
+
 export async function quitApp(): Promise<void> {
   if (!isTauriRuntime()) {
     window.close();

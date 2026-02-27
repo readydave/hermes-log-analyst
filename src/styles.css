@@ -7,6 +7,9 @@
     --bg: #edf2ff;
     --panel: rgba(255, 255, 255, 0.72);
     --panel-border: rgba(148, 163, 184, 0.4);
+    --field-bg: rgba(255, 255, 255, 0.92);
+    --field-bg-disabled: rgba(148, 163, 184, 0.2);
+    --field-border: rgba(148, 163, 184, 0.55);
     --text: #0f172a;
     --muted: #64748b;
     --accent: #2563eb;
@@ -19,14 +22,18 @@
     --sev-warning: rgba(234, 179, 8, 0.18);
     --sev-error: rgba(251, 146, 60, 0.18);
     --sev-critical: rgba(239, 68, 68, 0.2);
+    color-scheme: light;
   }
 
   :root[data-theme="dark"] {
     --bg: #0b1222;
     --panel: rgba(15, 23, 42, 0.72);
     --panel-border: rgba(148, 163, 184, 0.18);
+    --field-bg: rgba(8, 14, 30, 0.96);
+    --field-bg-disabled: rgba(148, 163, 184, 0.14);
+    --field-border: rgba(148, 163, 184, 0.56);
     --text: #e2e8f0;
-    --muted: #94a3b8;
+    --muted: #c3cfdf;
     --accent: #38bdf8;
     --accent-strong: #0ea5e9;
     --danger: #fca5a5;
@@ -37,6 +44,7 @@
     --sev-warning: rgba(253, 224, 71, 0.14);
     --sev-error: rgba(251, 146, 60, 0.18);
     --sev-critical: rgba(248, 113, 113, 0.2);
+    color-scheme: dark;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -44,8 +52,11 @@
       --bg: #0b1222;
       --panel: rgba(15, 23, 42, 0.72);
       --panel-border: rgba(148, 163, 184, 0.18);
+      --field-bg: rgba(8, 14, 30, 0.96);
+      --field-bg-disabled: rgba(148, 163, 184, 0.14);
+      --field-border: rgba(148, 163, 184, 0.56);
       --text: #e2e8f0;
-      --muted: #94a3b8;
+      --muted: #c3cfdf;
       --accent: #38bdf8;
       --accent-strong: #0ea5e9;
       --danger: #fca5a5;
@@ -56,6 +67,7 @@
       --sev-warning: rgba(253, 224, 71, 0.14);
       --sev-error: rgba(251, 146, 60, 0.18);
       --sev-critical: rgba(248, 113, 113, 0.2);
+      color-scheme: dark;
     }
   }
 
@@ -71,5 +83,28 @@
       radial-gradient(circle at 20% 20%, rgba(59, 130, 246, 0.18), transparent 35%);
     color: var(--text);
     font-family: "Space Grotesk", "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  }
+
+  select option {
+    color: var(--text);
+    background: var(--bg);
+  }
+
+  input,
+  select,
+  textarea {
+    color: var(--text);
+    background-color: var(--field-bg);
+    border-color: var(--field-border);
+  }
+
+  :root[data-theme="dark"] input[type="date"]::-webkit-calendar-picker-indicator {
+    filter: invert(0.85);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root[data-theme="system"] input[type="date"]::-webkit-calendar-picker-indicator {
+      filter: invert(0.85);
+    }
   }
 }

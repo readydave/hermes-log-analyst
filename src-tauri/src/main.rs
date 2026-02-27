@@ -363,6 +363,24 @@ fn open_external_url(url: String) -> Result<(), String> {
         return Err("Only http/https URLs are allowed.".to_string());
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        // Prefer desktop association (xdg defaults) instead of inheriting a global
+        // BROWSER override from shell/session environment.
+        let spawn_result = Command::new("xdg-open")
+            .arg(url.as_str())
+            .env_remove("BROWSER")
+            .spawn();
+
+        match spawn_result {
+            Ok(_) => return Ok(()),
+            Err(error) => diagnostics::warn(
+                "runtime",
+                format!("xdg-open launch failed, falling back to webbrowser crate: {error}"),
+            ),
+        }
+    }
+
     webbrowser::open(url.as_str())
         .map(|_| ())
         .map_err(|error| command_error("runtime", "Failed to open external URL", error.to_string()))
@@ -407,6 +425,7 @@ fn export_events(
     let extension = match output_format.as_str() {
         "json" => "json",
         "csv" => "csv",
+        "txt" => "txt",
         _ => return Err("Unsupported export format.".to_string()),
     };
 
@@ -427,23 +446,54 @@ fn export_events(
 
     let safe_name = sanitize_filename(filename.as_str(), extension);
     let output_path = base_dir.join(safe_name);
-
-    let payload = if extension == "json" {
-        serde_json::to_string_pretty(&events).map_err(|error| {
-            command_error(
-                "runtime",
-                "Failed to serialize export JSON payload",
-                error.to_string(),
-            )
-        })?
-    } else {
-        build_csv(&events)
-    };
+    let payload = build_export_payload(extension, &events)?;
 
     std::fs::write(&output_path, payload).map_err(|error| {
         command_error("storage", "Failed to write export file", error.to_string())
     })?;
     Ok(output_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn export_events_with_dialog(
+    format: String,
+    suggested_filename: String,
+    events: Vec<NormalizedEvent>,
+) -> Result<Option<String>, String> {
+    let output_format = format.to_ascii_lowercase();
+    let (extension, filter_name): (&str, &str) = match output_format.as_str() {
+        "json" => ("json", "JSON"),
+        "csv" => ("csv", "CSV"),
+        "txt" => ("txt", "Text"),
+        _ => return Err("Unsupported export format.".to_string()),
+    };
+
+    let safe_name = sanitize_filename(suggested_filename.as_str(), extension);
+    let mut dialog = rfd::FileDialog::new().set_file_name(safe_name.as_str());
+    dialog = match extension {
+        "json" => dialog.add_filter(filter_name, &["json"]),
+        "csv" => dialog.add_filter(filter_name, &["csv"]),
+        "txt" => dialog.add_filter(filter_name, &["txt"]),
+        _ => dialog,
+    };
+
+    if let Some(base_dir) = load_export_dir()
+        .map(PathBuf::from)
+        .or_else(dirs::download_dir)
+        .filter(|path| path.exists() && path.is_dir())
+    {
+        dialog = dialog.set_directory(base_dir);
+    }
+
+    let Some(output_path) = dialog.save_file() else {
+        return Ok(None);
+    };
+
+    let payload = build_export_payload(extension, &events)?;
+    std::fs::write(&output_path, payload).map_err(|error| {
+        command_error("storage", "Failed to write export file", error.to_string())
+    })?;
+    Ok(Some(output_path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -506,6 +556,8 @@ fn setup_menu(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let tools_submenu = SubmenuBuilder::new(app, "Tools")
         .item(&theme_submenu)
+        .separator()
+        .text("tools_help", "Help")
         .build()?;
 
     let app_submenu = SubmenuBuilder::new(app, "App")
@@ -558,6 +610,35 @@ fn parse_local_date_range(from: &str, to: &str) -> Result<(DateTime<Utc>, DateTi
 
     Ok((start, end))
 }
+
+#[cfg(target_os = "linux")]
+fn configure_linux_runtime_defaults() {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .or_else(|_| std::env::var("DESKTOP_SESSION"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".to_string());
+
+    diagnostics::info(
+        "startup",
+        format!("Linux desktop/session detected: desktop='{desktop}', session='{session}'"),
+    );
+
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        diagnostics::info(
+            "startup",
+            "Enabled WEBKIT_DISABLE_DMABUF_RENDERER=1 for safer startup on KDE/GNOME Linux environments.",
+        );
+    } else {
+        diagnostics::info(
+            "startup",
+            "WEBKIT_DISABLE_DMABUF_RENDERER already set in environment; keeping caller-provided value.",
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_runtime_defaults() {}
 
 fn sanitize_filename(filename: &str, extension: &str) -> String {
     let raw_name = Path::new(filename)
@@ -642,6 +723,50 @@ fn build_csv(events: &[NormalizedEvent]) -> String {
     lines.join("\n")
 }
 
+fn build_plain_text(events: &[NormalizedEvent]) -> String {
+    let mut lines = Vec::with_capacity(events.len() * 10);
+    for event in events {
+        lines.push(format!("Timestamp: {}", event.timestamp));
+        lines.push(format!("OS: {}", event.os));
+        lines.push(format!("Type: {} / {}", event.log_name, event.category));
+        lines.push(format!("Provider: {}", event.provider));
+        lines.push(format!(
+            "Event ID: {}",
+            event
+                .event_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
+        lines.push(format!("Severity: {}", event.severity));
+        lines.push(format!(
+            "Source: {}",
+            if event.imported {
+                "Imported"
+            } else {
+                "Live/Local"
+            }
+        ));
+        lines.push(format!("Message: {}", event.message));
+        lines.push("---".to_string());
+    }
+    lines.join("\n")
+}
+
+fn build_export_payload(extension: &str, events: &[NormalizedEvent]) -> Result<String, String> {
+    match extension {
+        "json" => serde_json::to_string_pretty(events).map_err(|error| {
+            command_error(
+                "runtime",
+                "Failed to serialize export JSON payload",
+                error.to_string(),
+            )
+        }),
+        "csv" => Ok(build_csv(events)),
+        "txt" => Ok(build_plain_text(events)),
+        _ => Err("Unsupported export format.".to_string()),
+    }
+}
+
 fn main() {
     std::panic::set_hook(Box::new(|info| {
         diagnostics::error("panic", format!("Unhandled panic: {info}"));
@@ -658,6 +783,7 @@ fn main() {
     }
 
     diagnostics::info("startup", "Launching Hermes application");
+    configure_linux_runtime_defaults();
 
     let builder = tauri::Builder::default()
         .setup(setup_menu)
@@ -665,6 +791,14 @@ fn main() {
             "theme_system" => apply_theme(app, "system"),
             "theme_light" => apply_theme(app, "light"),
             "theme_dark" => apply_theme(app, "dark"),
+            "tools_help" => {
+                if let Err(error) = app.emit("hla://open-help", "quick-start") {
+                    diagnostics::warn(
+                        "runtime",
+                        format!("Failed to emit help-open event: {error}"),
+                    );
+                }
+            }
             "app_exit" => app.exit(0),
             _ => {}
         })
@@ -688,6 +822,7 @@ fn main() {
             choose_export_directory,
             set_export_directory,
             export_events,
+            export_events_with_dialog,
             quit_app,
             set_app_theme,
             get_saved_theme
