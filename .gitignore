@@ -5,3 +5,7 @@ dist/
 *.log
 src-tauri/target/
 tsconfig.tsbuildinfo
+
+# Generated PDF artifacts
+output/pdf/
+tmp/pdfs/
