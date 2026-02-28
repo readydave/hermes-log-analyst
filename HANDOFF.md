@@ -142,6 +142,17 @@ Acceptance criteria:
 3. User can choose provider/model and run log-entry lookup from selected event with OS-aware prompt templates.
 4. Connection failures are surfaced as actionable warnings and diagnostics log entries.
 
+Current implementation status (2026-02-28):
+- Completed foundation:
+  - persisted LLM settings model in backend (`llm_settings.json`) and Settings UI bindings.
+  - provider profiles for local (`ollama`, `lmstudio`) + cloud (`openai`, `gemini`, `claude`, `perplexity`) + generic OpenAI-compatible endpoint.
+  - local endpoint detection command for Ollama/LM Studio.
+  - private-subnet LAN scan command for Ollama/LM Studio with bounded host scan cap.
+- Remaining for this milestone:
+  - provider credential validation and model-list/test-connect calls per provider API.
+  - "Analyze with LLM" execution path using selected provider/model.
+  - secure secret storage integration (OS keychain/credential vault).
+
 ### Milestone 3 - LAN Discovery (Optional, Security-First)
 - Add a separate opt-in action: `Discover providers on LAN`.
 - Default behavior: LAN scanning disabled; localhost detection always allowed.
@@ -487,3 +498,13 @@ Expected notes to capture in Windows retest:
 - Whether pre-crash strict window returns rows for known crash windows.
 - Whether export save dialog path selection is intuitive for IT users.
 - Any dark-mode readability regressions still present in input/select/date controls.
+
+## Changelog - 2026-02-28 (Commit Pending)
+- Export UX fix:
+  - custom export `Log type` options on Windows now include configured ingest channels (including `Security`) even when current in-memory rows are zero for that channel.
+- UI consistency:
+  - standardized `From/To` date input alignment across Events, Export, and Data tabs.
+- Milestone 2 foundation start:
+  - added persisted LLM settings model and new Settings section for provider profile configuration.
+  - added backend commands + frontend integration for local provider detection and LAN provider scan.
+  - added provider placeholders/config for OpenAI, Gemini, Claude, Perplexity, and generic OpenAI-compatible endpoints.

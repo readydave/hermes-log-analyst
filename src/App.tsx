@@ -15,11 +15,20 @@ import {
   syncLocalEventsRange,
   getLocalEventsRange,
   getIngestProfile,
+  getLlmSettings,
   setIngestProfile,
+  setLlmSettings,
   getIngestWindowDays,
-  setIngestWindowDays
+  setIngestWindowDays,
+  detectLocalLlmProviders,
+  scanLanLlmProviders
 } from "./lib/backend";
-import type { IngestProfile, SyncOperationResult } from "./lib/backend";
+import type {
+  IngestProfile,
+  LlmEndpointCandidate,
+  LlmSettings,
+  SyncOperationResult
+} from "./lib/backend";
 import { exportAsCsv, exportAsJson, exportAsText } from "./lib/export";
 import { applyFilters, defaultFilters } from "./lib/filters";
 import { importSessionEvents } from "./lib/import";
@@ -44,6 +53,15 @@ const browserDefaultOs: SupportedOs = navigator.userAgent.includes("Windows")
     : "linux";
 
 const windowsChannelOptions = ["Application", "System", "Security"] as const;
+const llmProviderOptions = [
+  { id: "ollama", label: "Ollama (Local)" },
+  { id: "lmstudio", label: "LM Studio (Local)" },
+  { id: "openai", label: "OpenAI" },
+  { id: "gemini", label: "Gemini" },
+  { id: "claude", label: "Claude" },
+  { id: "perplexity", label: "Perplexity" },
+  { id: "openai_compatible", label: "OpenAI-Compatible (Generic)" }
+] as const;
 const MAX_LOCAL_EVENTS_IN_MEMORY = 10000;
 const MAX_IMPORTED_EVENTS_IN_MEMORY = 5000;
 const LOCAL_FETCH_LIMIT = MAX_LOCAL_EVENTS_IN_MEMORY + 1;
@@ -54,6 +72,57 @@ function createDefaultFilters(): EventFilters {
   return {
     ...defaultFilters,
     severities: { ...defaultFilters.severities }
+  };
+}
+
+function createDefaultLlmSettings(): LlmSettings {
+  return {
+    preferredProvider: "ollama",
+    allowLanDiscovery: false,
+    neverSendRawEventToUntrusted: true,
+    trustedHosts: [],
+    ollama: {
+      enabled: true,
+      baseUrl: "http://127.0.0.1:11434",
+      apiKey: "",
+      model: ""
+    },
+    lmstudio: {
+      enabled: false,
+      baseUrl: "http://127.0.0.1:1234",
+      apiKey: "",
+      model: ""
+    },
+    openai: {
+      enabled: false,
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "",
+      model: ""
+    },
+    gemini: {
+      enabled: false,
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      apiKey: "",
+      model: ""
+    },
+    claude: {
+      enabled: false,
+      baseUrl: "https://api.anthropic.com/v1",
+      apiKey: "",
+      model: ""
+    },
+    perplexity: {
+      enabled: false,
+      baseUrl: "https://api.perplexity.ai",
+      apiKey: "",
+      model: ""
+    },
+    openaiCompatible: {
+      enabled: false,
+      baseUrl: "",
+      apiKey: "",
+      model: ""
+    }
   };
 }
 
@@ -317,6 +386,9 @@ export default function App() {
     maxEventsPerSync: 2000,
     windowsChannels: ["Application", "System", "Security"]
   });
+  const [llmSettings, setLlmSettingsState] = useState<LlmSettings>(createDefaultLlmSettings);
+  const [llmCandidates, setLlmCandidates] = useState<LlmEndpointCandidate[]>([]);
+  const [isScanningLan, setIsScanningLan] = useState(false);
   const [backfillFrom, setBackfillFrom] = useState("");
   const [backfillTo, setBackfillTo] = useState("");
   const [rangeViewActive, setRangeViewActive] = useState(false);
@@ -867,6 +939,8 @@ export default function App() {
       setIngestWindowDaysState(await getIngestWindowDays());
       const profile = await getIngestProfile();
       setIngestProfileState(profile);
+      const llm = await getLlmSettings();
+      setLlmSettingsState(llm);
       if (profile.autoSyncOnStartup) {
         const syncResult = await refreshLocalEvents();
         applyCollectorWarnings("Startup sync warning", syncResult);
@@ -1141,6 +1215,77 @@ export default function App() {
       }
       return { ...current, windowsChannels: current.windowsChannels.filter((entry) => entry !== channel) };
     });
+  }
+
+  function updateLlmProvider(
+    provider:
+      | "ollama"
+      | "lmstudio"
+      | "openai"
+      | "gemini"
+      | "claude"
+      | "perplexity"
+      | "openaiCompatible",
+    field: "enabled" | "baseUrl" | "apiKey" | "model",
+    value: string | boolean
+  ): void {
+    setLlmSettingsState((current) => ({
+      ...current,
+      [provider]: {
+        ...current[provider],
+        [field]: value
+      }
+    }));
+  }
+
+  async function saveLlmSettingsNow(): Promise<void> {
+    setLastError("");
+    try {
+      const trustedHosts = llmSettings.trustedHosts
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0);
+      const saved = await setLlmSettings({ ...llmSettings, trustedHosts });
+      setLlmSettingsState(saved);
+      setExportStatus("LLM settings saved.");
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to save LLM settings.");
+    }
+  }
+
+  async function detectLocalProvidersNow(): Promise<void> {
+    setLastError("");
+    try {
+      const candidates = await detectLocalLlmProviders();
+      setLlmCandidates(candidates);
+      setExportStatus(
+        candidates.length > 0
+          ? `Detected ${candidates.length} local LLM endpoint${candidates.length === 1 ? "" : "s"}.`
+          : "No local Ollama/LM Studio endpoints detected."
+      );
+      window.setTimeout(() => setExportStatus(""), 3000);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to detect local LLM providers.");
+    }
+  }
+
+  async function scanLanProvidersNow(): Promise<void> {
+    setLastError("");
+    setIsScanningLan(true);
+    try {
+      const candidates = await scanLanLlmProviders(256);
+      setLlmCandidates(candidates);
+      setExportStatus(
+        candidates.length > 0
+          ? `Detected ${candidates.length} LAN LLM endpoint${candidates.length === 1 ? "" : "s"}.`
+          : "No LAN Ollama/LM Studio endpoints detected."
+      );
+      window.setTimeout(() => setExportStatus(""), 3000);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to scan LAN for LLM providers.");
+    } finally {
+      setIsScanningLan(false);
+    }
   }
 
   async function saveIngestCollectionSettings(): Promise<void> {
@@ -1823,6 +1968,245 @@ export default function App() {
                   Save Collection Settings
                 </Button>
               </div>
+            </div>
+            <div className="grid gap-3 border-t border-panel-border pt-4">
+              <div className="text-sm font-semibold">Research Assistant (LLM)</div>
+              <div className="grid gap-2 md:grid-cols-[220px_1fr]">
+                <label className="text-xs text-muted">Preferred provider</label>
+                <select
+                  className={selectClass}
+                  value={llmSettings.preferredProvider}
+                  onChange={(e) =>
+                    setLlmSettingsState((current) => ({ ...current, preferredProvider: e.target.value }))
+                  }
+                >
+                  {llmProviderOptions.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-muted">
+                <input
+                  type="checkbox"
+                  checked={llmSettings.allowLanDiscovery}
+                  onChange={(e) =>
+                    setLlmSettingsState((current) => ({
+                      ...current,
+                      allowLanDiscovery: e.target.checked
+                    }))
+                  }
+                />
+                Allow LAN provider discovery (use only on trusted networks)
+              </label>
+              <label className="flex items-center gap-2 text-xs text-muted">
+                <input
+                  type="checkbox"
+                  checked={llmSettings.neverSendRawEventToUntrusted}
+                  onChange={(e) =>
+                    setLlmSettingsState((current) => ({
+                      ...current,
+                      neverSendRawEventToUntrusted: e.target.checked
+                    }))
+                  }
+                />
+                Never send raw event message to untrusted hosts
+              </label>
+              <div className="grid gap-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">
+                  Local Providers
+                </div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  <label className="text-xs text-muted">
+                    Ollama endpoint
+                    <input
+                      className={inputClass}
+                      value={llmSettings.ollama.baseUrl}
+                      onChange={(e) => updateLlmProvider("ollama", "baseUrl", e.target.value)}
+                      placeholder="http://127.0.0.1:11434"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    LM Studio endpoint
+                    <input
+                      className={inputClass}
+                      value={llmSettings.lmstudio.baseUrl}
+                      onChange={(e) => updateLlmProvider("lmstudio", "baseUrl", e.target.value)}
+                      placeholder="http://127.0.0.1:1234"
+                    />
+                  </label>
+                </div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  <label className="text-xs text-muted">
+                    Ollama model
+                    <input
+                      className={inputClass}
+                      value={llmSettings.ollama.model}
+                      onChange={(e) => updateLlmProvider("ollama", "model", e.target.value)}
+                      placeholder="example: llama3.2:3b"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    LM Studio model
+                    <input
+                      className={inputClass}
+                      value={llmSettings.lmstudio.model}
+                      onChange={(e) => updateLlmProvider("lmstudio", "model", e.target.value)}
+                      placeholder="example: qwen2.5"
+                    />
+                  </label>
+                </div>
+              </div>
+              <div className="grid gap-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">
+                  Cloud + Generic Providers
+                </div>
+                <div className="grid gap-2 md:grid-cols-2">
+                  <label className="text-xs text-muted">
+                    OpenAI API key
+                    <input
+                      className={inputClass}
+                      value={llmSettings.openai.apiKey}
+                      onChange={(e) => updateLlmProvider("openai", "apiKey", e.target.value)}
+                      placeholder="sk-..."
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    OpenAI model
+                    <input
+                      className={inputClass}
+                      value={llmSettings.openai.model}
+                      onChange={(e) => updateLlmProvider("openai", "model", e.target.value)}
+                      placeholder="gpt-4.1-mini"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Gemini API key
+                    <input
+                      className={inputClass}
+                      value={llmSettings.gemini.apiKey}
+                      onChange={(e) => updateLlmProvider("gemini", "apiKey", e.target.value)}
+                      placeholder="AIza..."
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Gemini model
+                    <input
+                      className={inputClass}
+                      value={llmSettings.gemini.model}
+                      onChange={(e) => updateLlmProvider("gemini", "model", e.target.value)}
+                      placeholder="gemini-2.0-flash"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Claude API key
+                    <input
+                      className={inputClass}
+                      value={llmSettings.claude.apiKey}
+                      onChange={(e) => updateLlmProvider("claude", "apiKey", e.target.value)}
+                      placeholder="sk-ant-..."
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Claude model
+                    <input
+                      className={inputClass}
+                      value={llmSettings.claude.model}
+                      onChange={(e) => updateLlmProvider("claude", "model", e.target.value)}
+                      placeholder="claude-sonnet-4-5"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Perplexity API key
+                    <input
+                      className={inputClass}
+                      value={llmSettings.perplexity.apiKey}
+                      onChange={(e) => updateLlmProvider("perplexity", "apiKey", e.target.value)}
+                      placeholder="pplx-..."
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Perplexity model
+                    <input
+                      className={inputClass}
+                      value={llmSettings.perplexity.model}
+                      onChange={(e) => updateLlmProvider("perplexity", "model", e.target.value)}
+                      placeholder="sonar-pro"
+                    />
+                  </label>
+                </div>
+                <div className="grid gap-2 md:grid-cols-3">
+                  <label className="text-xs text-muted">
+                    Generic endpoint
+                    <input
+                      className={inputClass}
+                      value={llmSettings.openaiCompatible.baseUrl}
+                      onChange={(e) => updateLlmProvider("openaiCompatible", "baseUrl", e.target.value)}
+                      placeholder="https://host/v1"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Generic API key
+                    <input
+                      className={inputClass}
+                      value={llmSettings.openaiCompatible.apiKey}
+                      onChange={(e) => updateLlmProvider("openaiCompatible", "apiKey", e.target.value)}
+                      placeholder="api key"
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Generic model
+                    <input
+                      className={inputClass}
+                      value={llmSettings.openaiCompatible.model}
+                      onChange={(e) => updateLlmProvider("openaiCompatible", "model", e.target.value)}
+                      placeholder="model id"
+                    />
+                  </label>
+                </div>
+              </div>
+              <label className="text-xs text-muted">
+                Trusted LAN hosts (comma-separated host/IP)
+                <input
+                  className={inputClass}
+                  value={llmSettings.trustedHosts.join(", ")}
+                  onChange={(e) =>
+                    setLlmSettingsState((current) => ({
+                      ...current,
+                      trustedHosts: e.target.value
+                        .split(",")
+                        .map((entry) => entry.trim())
+                        .filter((entry) => entry.length > 0)
+                    }))
+                  }
+                  placeholder="192.168.1.20, llm-node.local"
+                />
+              </label>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="primary" onClick={() => void saveLlmSettingsNow()}>
+                  Save LLM Settings
+                </Button>
+                <Button onClick={() => void detectLocalProvidersNow()}>
+                  Detect Local Providers
+                </Button>
+                <Button
+                  onClick={() => void scanLanProvidersNow()}
+                  disabled={!llmSettings.allowLanDiscovery || isScanningLan}
+                >
+                  {isScanningLan ? "Scanning LAN..." : "Scan LAN Providers"}
+                </Button>
+              </div>
+              {llmCandidates.length > 0 && (
+                <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3 text-xs text-muted">
+                  <div className="mb-1 font-semibold text-text">Detected endpoints</div>
+                  {llmCandidates.map((candidate) => (
+                    <div key={`${candidate.providerId}-${candidate.endpoint}`}>
+                      {candidate.providerId} ({candidate.scope}): {candidate.endpoint}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </section>
         )}

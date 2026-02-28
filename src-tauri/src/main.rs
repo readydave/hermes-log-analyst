@@ -1,6 +1,7 @@
 mod crash;
 mod db;
 mod diagnostics;
+mod llm;
 mod logs;
 mod settings;
 
@@ -17,8 +18,9 @@ use logs::{
 };
 use serde::Serialize;
 use settings::{
-    load_export_dir, load_ingest_profile, load_ingest_window_days, load_theme, save_export_dir,
-    save_ingest_profile, save_ingest_window_days, save_theme, IngestProfile,
+    load_export_dir, load_ingest_profile, load_ingest_window_days, load_llm_settings, load_theme,
+    save_export_dir, save_ingest_profile, save_ingest_window_days, save_llm_settings, save_theme,
+    IngestProfile, LlmSettings,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -281,6 +283,27 @@ fn get_ingest_profile() -> IngestProfile {
 fn set_ingest_profile(profile: IngestProfile) -> Result<IngestProfile, String> {
     save_ingest_profile(profile)
         .map_err(|error| command_error("settings", "Failed to save ingest profile", error))
+}
+
+#[tauri::command]
+fn get_llm_settings() -> LlmSettings {
+    load_llm_settings()
+}
+
+#[tauri::command]
+fn set_llm_settings(settings: LlmSettings) -> Result<LlmSettings, String> {
+    save_llm_settings(settings)
+        .map_err(|error| command_error("settings", "Failed to save LLM settings", error))
+}
+
+#[tauri::command]
+fn detect_local_llm_providers() -> Vec<llm::LlmEndpointCandidate> {
+    llm::detect_local_providers()
+}
+
+#[tauri::command]
+fn scan_lan_llm_providers(max_hosts: Option<u32>) -> Vec<llm::LlmEndpointCandidate> {
+    llm::scan_lan_providers(max_hosts.unwrap_or(256).clamp(16, 1024) as usize)
 }
 
 #[tauri::command]
@@ -816,6 +839,10 @@ fn main() {
             set_ingest_window_days,
             get_ingest_profile,
             set_ingest_profile,
+            get_llm_settings,
+            set_llm_settings,
+            detect_local_llm_providers,
+            scan_lan_llm_providers,
             backfill_local_events,
             sync_local_events_range,
             get_export_directory,

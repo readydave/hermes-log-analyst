@@ -13,6 +13,60 @@ export interface SyncOperationResult {
   warnings: string[];
 }
 
+export interface LlmProviderSettings {
+  enabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+export interface LlmSettings {
+  preferredProvider: string;
+  allowLanDiscovery: boolean;
+  neverSendRawEventToUntrusted: boolean;
+  trustedHosts: string[];
+  ollama: LlmProviderSettings;
+  lmstudio: LlmProviderSettings;
+  openai: LlmProviderSettings;
+  gemini: LlmProviderSettings;
+  claude: LlmProviderSettings;
+  perplexity: LlmProviderSettings;
+  openaiCompatible: LlmProviderSettings;
+}
+
+export interface LlmEndpointCandidate {
+  providerId: string;
+  endpoint: string;
+  scope: "localhost" | "lan" | string;
+  host: string;
+  port: number;
+}
+
+function createDefaultLlmProviderSettings(baseUrl = "", enabled = false): LlmProviderSettings {
+  return {
+    enabled,
+    baseUrl,
+    apiKey: "",
+    model: ""
+  };
+}
+
+function createDefaultLlmSettings(): LlmSettings {
+  return {
+    preferredProvider: "ollama",
+    allowLanDiscovery: false,
+    neverSendRawEventToUntrusted: true,
+    trustedHosts: [],
+    ollama: createDefaultLlmProviderSettings("http://127.0.0.1:11434", true),
+    lmstudio: createDefaultLlmProviderSettings("http://127.0.0.1:1234", false),
+    openai: createDefaultLlmProviderSettings("https://api.openai.com/v1", false),
+    gemini: createDefaultLlmProviderSettings("https://generativelanguage.googleapis.com/v1beta", false),
+    claude: createDefaultLlmProviderSettings("https://api.anthropic.com/v1", false),
+    perplexity: createDefaultLlmProviderSettings("https://api.perplexity.ai", false),
+    openaiCompatible: createDefaultLlmProviderSettings("", false)
+  };
+}
+
 function detectBrowserOs(): SupportedOs {
   if (navigator.userAgent.includes("Windows")) return "windows";
   if (navigator.userAgent.includes("Mac")) return "macos";
@@ -72,6 +126,34 @@ export async function setIngestWindowDays(days: number): Promise<number> {
 
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<number>("set_ingest_window_days", { days });
+}
+
+export async function getLlmSettings(): Promise<LlmSettings> {
+  if (!isTauriRuntime()) return createDefaultLlmSettings();
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmSettings>("get_llm_settings");
+}
+
+export async function setLlmSettings(settings: LlmSettings): Promise<LlmSettings> {
+  if (!isTauriRuntime()) return settings;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmSettings>("set_llm_settings", { settings });
+}
+
+export async function detectLocalLlmProviders(): Promise<LlmEndpointCandidate[]> {
+  if (!isTauriRuntime()) return [];
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmEndpointCandidate[]>("detect_local_llm_providers");
+}
+
+export async function scanLanLlmProviders(maxHosts = 256): Promise<LlmEndpointCandidate[]> {
+  if (!isTauriRuntime()) return [];
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmEndpointCandidate[]>("scan_lan_llm_providers", { maxHosts });
 }
 
 export async function backfillLocalEvents(from: string, to: string): Promise<SyncOperationResult> {

@@ -7,11 +7,73 @@ const THEME_FILE: &str = "theme.txt";
 const EXPORT_DIR_FILE: &str = "export_dir.txt";
 const INGEST_DAYS_FILE: &str = "ingest_window_days.txt";
 const INGEST_PROFILE_FILE: &str = "ingest_profile.json";
+const LLM_SETTINGS_FILE: &str = "llm_settings.json";
 const DEFAULT_INGEST_DAYS: u32 = 7;
 const DEFAULT_MAX_EVENTS_PER_SYNC: u32 = 2000;
 const MIN_MAX_EVENTS_PER_SYNC: u32 = 100;
 const MAX_MAX_EVENTS_PER_SYNC: u32 = 20000;
 const DEFAULT_WINDOWS_CHANNELS: [&str; 3] = ["Application", "System", "Security"];
+const DEFAULT_LLM_PROVIDER: &str = "ollama";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmProviderSettings {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl LlmProviderSettings {
+    fn with_base_url(base_url: &str, enabled: bool) -> Self {
+        Self {
+            enabled,
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSettings {
+    pub preferred_provider: String,
+    pub allow_lan_discovery: bool,
+    pub never_send_raw_event_to_untrusted: bool,
+    pub trusted_hosts: Vec<String>,
+    pub ollama: LlmProviderSettings,
+    pub lmstudio: LlmProviderSettings,
+    pub openai: LlmProviderSettings,
+    pub gemini: LlmProviderSettings,
+    pub claude: LlmProviderSettings,
+    pub perplexity: LlmProviderSettings,
+    pub openai_compatible: LlmProviderSettings,
+}
+
+impl Default for LlmSettings {
+    fn default() -> Self {
+        Self {
+            preferred_provider: DEFAULT_LLM_PROVIDER.to_string(),
+            allow_lan_discovery: false,
+            never_send_raw_event_to_untrusted: true,
+            trusted_hosts: Vec::new(),
+            ollama: LlmProviderSettings::with_base_url("http://127.0.0.1:11434", true),
+            lmstudio: LlmProviderSettings::with_base_url("http://127.0.0.1:1234", false),
+            openai: LlmProviderSettings::with_base_url("https://api.openai.com/v1", false),
+            gemini: LlmProviderSettings::with_base_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                false,
+            ),
+            claude: LlmProviderSettings::with_base_url("https://api.anthropic.com/v1", false),
+            perplexity: LlmProviderSettings::with_base_url(
+                "https://api.perplexity.ai",
+                false,
+            ),
+            openai_compatible: LlmProviderSettings::with_base_url("", false),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +121,12 @@ fn ingest_days_path() -> Result<PathBuf, String> {
 fn ingest_profile_path() -> Result<PathBuf, String> {
     let mut dir = settings_dir()?;
     dir.push(INGEST_PROFILE_FILE);
+    Ok(dir)
+}
+
+fn llm_settings_path() -> Result<PathBuf, String> {
+    let mut dir = settings_dir()?;
+    dir.push(LLM_SETTINGS_FILE);
     Ok(dir)
 }
 
@@ -200,5 +268,97 @@ pub fn save_ingest_profile(profile: IngestProfile) -> Result<IngestProfile, Stri
     let payload =
         serde_json::to_string_pretty(&sanitized).map_err(|error| format!("Failed to serialize ingest profile: {error}"))?;
     fs::write(path, payload.as_bytes()).map_err(|error| format!("Failed to save ingest profile: {error}"))?;
+    Ok(sanitized)
+}
+
+fn sanitize_provider(provider: LlmProviderSettings) -> LlmProviderSettings {
+    LlmProviderSettings {
+        enabled: provider.enabled,
+        base_url: provider.base_url.trim().to_string(),
+        api_key: provider.api_key.trim().to_string(),
+        model: provider.model.trim().to_string(),
+    }
+}
+
+fn sanitize_preferred_provider(value: &str) -> String {
+    let key = value.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "ollama" | "lmstudio" | "openai" | "gemini" | "claude" | "perplexity"
+        | "openai_compatible" => key,
+        _ => DEFAULT_LLM_PROVIDER.to_string(),
+    }
+}
+
+fn sanitize_trusted_hosts(values: Vec<String>) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !hosts.iter().any(|entry: &String| entry.eq_ignore_ascii_case(trimmed)) {
+            hosts.push(trimmed.to_string());
+        }
+    }
+    hosts
+}
+
+fn sanitize_llm_settings(settings: LlmSettings) -> LlmSettings {
+    let defaults = LlmSettings::default();
+    let mut sanitized = LlmSettings {
+        preferred_provider: sanitize_preferred_provider(settings.preferred_provider.as_str()),
+        allow_lan_discovery: settings.allow_lan_discovery,
+        never_send_raw_event_to_untrusted: settings.never_send_raw_event_to_untrusted,
+        trusted_hosts: sanitize_trusted_hosts(settings.trusted_hosts),
+        ollama: sanitize_provider(settings.ollama),
+        lmstudio: sanitize_provider(settings.lmstudio),
+        openai: sanitize_provider(settings.openai),
+        gemini: sanitize_provider(settings.gemini),
+        claude: sanitize_provider(settings.claude),
+        perplexity: sanitize_provider(settings.perplexity),
+        openai_compatible: sanitize_provider(settings.openai_compatible),
+    };
+
+    if sanitized.ollama.base_url.is_empty() {
+        sanitized.ollama.base_url = defaults.ollama.base_url;
+    }
+    if sanitized.lmstudio.base_url.is_empty() {
+        sanitized.lmstudio.base_url = defaults.lmstudio.base_url;
+    }
+    if sanitized.openai.base_url.is_empty() {
+        sanitized.openai.base_url = defaults.openai.base_url;
+    }
+    if sanitized.gemini.base_url.is_empty() {
+        sanitized.gemini.base_url = defaults.gemini.base_url;
+    }
+    if sanitized.claude.base_url.is_empty() {
+        sanitized.claude.base_url = defaults.claude.base_url;
+    }
+    if sanitized.perplexity.base_url.is_empty() {
+        sanitized.perplexity.base_url = defaults.perplexity.base_url;
+    }
+
+    sanitized
+}
+
+pub fn load_llm_settings() -> LlmSettings {
+    let Ok(path) = llm_settings_path() else {
+        return LlmSettings::default();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return LlmSettings::default();
+    };
+    let Ok(parsed) = serde_json::from_str::<LlmSettings>(raw.as_str()) else {
+        return LlmSettings::default();
+    };
+    sanitize_llm_settings(parsed)
+}
+
+pub fn save_llm_settings(settings: LlmSettings) -> Result<LlmSettings, String> {
+    let sanitized = sanitize_llm_settings(settings);
+    let path = llm_settings_path()?;
+    let payload =
+        serde_json::to_string_pretty(&sanitized).map_err(|error| format!("Failed to serialize LLM settings: {error}"))?;
+    fs::write(path, payload.as_bytes()).map_err(|error| format!("Failed to save LLM settings: {error}"))?;
     Ok(sanitized)
 }

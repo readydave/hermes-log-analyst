@@ -28,6 +28,11 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - Auto-sync on startup.
   - Max events per sync.
   - Windows channel selection.
+- LLM settings and discovery (foundation):
+  - Provider profiles for `ollama`, `lmstudio`, `openai`, `gemini`, `claude`, `perplexity`, and generic `openai-compatible`.
+  - Local provider detection for Ollama/LM Studio endpoints.
+  - Optional LAN scan for Ollama/LM Studio endpoints on detected private subnets.
+  - Preferred provider, trusted-host list, and untrusted-payload guardrail controls.
 - Diagnostics logging:
   - JSONL app diagnostics written to `logs` under the app data directory.
   - Captures collector failures, access denied conditions, startup/runtime exceptions, and storage/settings read-write failures.
