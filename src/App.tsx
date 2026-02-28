@@ -416,8 +416,16 @@ export default function App() {
     for (const event of hostOsEventPool) {
       if (event.logName.trim()) values.add(event.logName);
     }
+    // On Windows, include configured channels even when no rows are currently loaded
+    // so custom export can explicitly target them and surface clear zero-match diagnostics.
+    if (hostOs === "windows") {
+      for (const channel of ingestProfile.windowsChannels) {
+        const trimmed = channel.trim();
+        if (trimmed) values.add(trimmed);
+      }
+    }
     return Array.from(values).sort((left, right) => left.localeCompare(right));
-  }, [hostOsEventPool]);
+  }, [hostOs, hostOsEventPool, ingestProfile.windowsChannels]);
   const customExportEvents = useMemo(() => {
     let start = parseLocalDateStart(exportFilters.dateFrom);
     let end = parseLocalDateEnd(exportFilters.dateTo);
