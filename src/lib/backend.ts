@@ -13,25 +13,25 @@ export interface SyncOperationResult {
   warnings: string[];
 }
 
-export interface LlmProviderSettings {
-  enabled: boolean;
+export interface LlmConnectionProfile {
+  id: string;
+  name: string;
+  provider: string;
+  scope: "local" | "lan" | "cloud" | "generic" | string;
   baseUrl: string;
-  apiKey: string;
   model: string;
+  enabled: boolean;
+  apiKeyConfigured: boolean;
 }
 
 export interface LlmSettings {
-  preferredProvider: string;
   allowLanDiscovery: boolean;
   neverSendRawEventToUntrusted: boolean;
   trustedHosts: string[];
-  ollama: LlmProviderSettings;
-  lmstudio: LlmProviderSettings;
-  openai: LlmProviderSettings;
-  gemini: LlmProviderSettings;
-  claude: LlmProviderSettings;
-  perplexity: LlmProviderSettings;
-  openaiCompatible: LlmProviderSettings;
+  profiles: LlmConnectionProfile[];
+  defaultProfileId: string;
+  backupProfileId: string;
+  preferredLanInterfaceId: string;
 }
 
 export interface LlmEndpointCandidate {
@@ -40,30 +40,65 @@ export interface LlmEndpointCandidate {
   scope: "localhost" | "lan" | string;
   host: string;
   port: number;
+  interfaceId: string;
+  interfaceName: string;
+  networkCidr: string;
 }
 
-function createDefaultLlmProviderSettings(baseUrl = "", enabled = false): LlmProviderSettings {
+export interface LlmNetworkInterface {
+  id: string;
+  name: string;
+  ip: string;
+  cidr: string;
+  isPrivate: boolean;
+  isLoopback: boolean;
+  isLinkLocal: boolean;
+  isDefaultCandidate: boolean;
+}
+
+export interface LlmConnectionTestResult {
+  ok: boolean;
+  provider: string;
+  baseUrl: string;
+  statusCode: number | null;
+  message: string;
+  detectedModels: string[];
+}
+
+export interface LlmAnalysisResult {
+  ok: boolean;
+  profileId: string;
+  profileName: string;
+  provider: string;
+  baseUrl: string;
+  model: string;
+  response: string;
+  fallbackUsed: boolean;
+  warning: string | null;
+}
+
+function createDefaultLlmProfile(): LlmConnectionProfile {
   return {
-    enabled,
-    baseUrl,
-    apiKey: "",
-    model: ""
+    id: "profile-ollama-local",
+    name: "Ollama Local",
+    provider: "ollama",
+    scope: "local",
+    baseUrl: "http://127.0.0.1:11434",
+    model: "",
+    enabled: true,
+    apiKeyConfigured: false
   };
 }
 
 function createDefaultLlmSettings(): LlmSettings {
   return {
-    preferredProvider: "ollama",
     allowLanDiscovery: false,
     neverSendRawEventToUntrusted: true,
     trustedHosts: [],
-    ollama: createDefaultLlmProviderSettings("http://127.0.0.1:11434", true),
-    lmstudio: createDefaultLlmProviderSettings("http://127.0.0.1:1234", false),
-    openai: createDefaultLlmProviderSettings("https://api.openai.com/v1", false),
-    gemini: createDefaultLlmProviderSettings("https://generativelanguage.googleapis.com/v1beta", false),
-    claude: createDefaultLlmProviderSettings("https://api.anthropic.com/v1", false),
-    perplexity: createDefaultLlmProviderSettings("https://api.perplexity.ai", false),
-    openaiCompatible: createDefaultLlmProviderSettings("", false)
+    profiles: [createDefaultLlmProfile()],
+    defaultProfileId: "profile-ollama-local",
+    backupProfileId: "",
+    preferredLanInterfaceId: ""
   };
 }
 
@@ -142,6 +177,20 @@ export async function setLlmSettings(settings: LlmSettings): Promise<LlmSettings
   return invoke<LlmSettings>("set_llm_settings", { settings });
 }
 
+export async function setLlmProfileApiKey(profileId: string, apiKey: string): Promise<LlmSettings> {
+  if (!isTauriRuntime()) return createDefaultLlmSettings();
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmSettings>("set_llm_profile_api_key", { profileId, apiKey });
+}
+
+export async function clearLlmProfileApiKey(profileId: string): Promise<LlmSettings> {
+  if (!isTauriRuntime()) return createDefaultLlmSettings();
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmSettings>("clear_llm_profile_api_key", { profileId });
+}
+
 export async function detectLocalLlmProviders(): Promise<LlmEndpointCandidate[]> {
   if (!isTauriRuntime()) return [];
 
@@ -149,11 +198,57 @@ export async function detectLocalLlmProviders(): Promise<LlmEndpointCandidate[]>
   return invoke<LlmEndpointCandidate[]>("detect_local_llm_providers");
 }
 
-export async function scanLanLlmProviders(maxHosts = 256): Promise<LlmEndpointCandidate[]> {
+export async function listLlmNetworkInterfaces(
+  includeNonPrivate = false,
+  includeLoopback = false
+): Promise<LlmNetworkInterface[]> {
   if (!isTauriRuntime()) return [];
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<LlmEndpointCandidate[]>("scan_lan_llm_providers", { maxHosts });
+  return invoke<LlmNetworkInterface[]>("list_llm_network_interfaces", {
+    includeNonPrivate,
+    includeLoopback
+  });
+}
+
+export async function scanLanLlmProviders(
+  interfaceId?: string,
+  maxHosts = 256
+): Promise<LlmEndpointCandidate[]> {
+  if (!isTauriRuntime()) return [];
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmEndpointCandidate[]>("scan_lan_llm_providers", { interfaceId, maxHosts });
+}
+
+export async function testLlmProfileConnection(
+  profile: LlmConnectionProfile
+): Promise<LlmConnectionTestResult> {
+  if (!isTauriRuntime()) {
+    return {
+      ok: false,
+      provider: profile.provider,
+      baseUrl: profile.baseUrl,
+      statusCode: null,
+      message: "Connection test requires desktop runtime.",
+      detectedModels: []
+    };
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmConnectionTestResult>("test_llm_profile_connection", { profile });
+}
+
+export async function analyzeWithLocalLlm(
+  prompt: string,
+  profileId?: string
+): Promise<LlmAnalysisResult> {
+  if (!isTauriRuntime()) {
+    throw new Error("Local LLM analysis requires desktop runtime.");
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LlmAnalysisResult>("analyze_with_local_llm", { prompt, profileId });
 }
 
 export async function backfillLocalEvents(from: string, to: string): Promise<SyncOperationResult> {
@@ -291,6 +386,31 @@ export async function exportEventsWithDialog(
     format,
     suggestedFilename,
     events
+  });
+}
+
+export async function saveTextWithDialog(
+  suggestedFilename: string,
+  text: string
+): Promise<string | null> {
+  if (!isTauriRuntime()) {
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = suggestedFilename;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+    return suggestedFilename;
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string | null>("save_text_with_dialog", {
+    suggestedFilename,
+    text
   });
 }
 

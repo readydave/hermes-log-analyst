@@ -1,15 +1,19 @@
 import type { NormalizedEvent } from "../types/events";
 
-const REDACTION = "<info redacted for privacy>";
+const REDACTION = "<sensitive info redacted>";
 
 const SENSITIVE_PATTERNS: RegExp[] = [
   /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
   /\b(?:\d{1,3}\.){3}\d{1,3}\b/g,
   /\b(?:[a-f0-9]{1,4}:){2,}[a-f0-9:]{1,4}\b/gi,
+  /\b(?:S-\d-\d+-(?:\d+-){1,}\d+)\b/gi,
   /https?:\/\/[^\s]+/gi,
   /\b[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi,
+  /\\\\[A-Za-z0-9_.-]+\\[^\s]+/g,
   /\b[A-Za-z]:\\(?:[^\\\r\n\t ]+\\)*[^\\\r\n\t ]*/g,
   /(?:^|[\s(])\/(?:[^\s/]+\/)+[^\s/]+/g,
+  /\b[A-Za-z0-9_.-]+\\[A-Za-z0-9_.-]+\b/g,
+  /\b(?:user(?:name)?|account|device|host(?:name)?|computer(?:name)?|machine(?:name)?)\s*[:=]\s*[^\s,;]+/gi,
   /\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b/g,
   /\b(?:token|apikey|api_key|secret|password|passwd|sessionid|auth)\s*[:=]\s*[^\s,;]+/gi,
   /\b[A-Za-z0-9_-]{24,}\b/g
@@ -41,8 +45,32 @@ function getOsVersionHint(event: NormalizedEvent, hostOsVersion?: string): strin
   return typeof value === "string" && value.trim() ? redactSensitiveText(value) : "Unknown (not provided by event source)";
 }
 
+function osLabel(event: NormalizedEvent, hostOsVersion?: string): string {
+  const version = getOsVersionHint(event, hostOsVersion).toLowerCase();
+  if (event.os === "windows") {
+    if (version.includes("11")) return "Windows 11";
+    if (version.includes("10")) return "Windows 10";
+    return "Windows";
+  }
+  if (event.os === "linux") return "Linux";
+  if (event.os === "macos") return "macOS";
+  return redactSensitiveText(event.os);
+}
+
+function categoryLabel(event: NormalizedEvent): string {
+  const logName = redactSensitiveText(event.logName);
+  const category = redactSensitiveText(event.category);
+  return `${logName} / ${category}`;
+}
+
+function analystRolePrompt(event: NormalizedEvent, hostOsVersion?: string): string {
+  const os = osLabel(event, hostOsVersion);
+  const focus = categoryLabel(event);
+  return `Act as an expert in ${os} ${focus} log analysis for incident triage and remediation.`;
+}
+
 export function buildLlmPrompt(event: NormalizedEvent, hostOsVersion?: string): string {
-  const osName = redactSensitiveText(event.os);
+  const osName = osLabel(event, hostOsVersion);
   const osVersion = getOsVersionHint(event, hostOsVersion);
   const timestamp = redactSensitiveText(event.timestamp);
   const logName = redactSensitiveText(event.logName);
@@ -52,6 +80,7 @@ export function buildLlmPrompt(event: NormalizedEvent, hostOsVersion?: string): 
   const message = redactSensitiveText(event.message);
 
   return [
+    analystRolePrompt(event, hostOsVersion),
     `You are a senior incident response and reliability engineer specializing in ${osName} (version: ${osVersion}).`,
     "Analyze the event below and provide concise, practical triage guidance for a sysadmin team.",
     "",
@@ -89,11 +118,11 @@ export function buildLlmPrompt(event: NormalizedEvent, hostOsVersion?: string): 
 
 export function buildGoogleQuery(event: NormalizedEvent): string {
   const tokens = [
-    event.os,
-    event.logName,
+    redactSensitiveText(event.os),
+    redactSensitiveText(event.logName),
     `event id ${event.eventId ?? ""}`,
-    event.provider,
-    event.message.slice(0, 120)
+    redactSensitiveText(event.provider),
+    redactSensitiveText(event.message.slice(0, 120))
   ];
 
   return encodeURIComponent(tokens.join(" ").trim());

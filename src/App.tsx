@@ -18,21 +18,31 @@ import {
   getLlmSettings,
   setIngestProfile,
   setLlmSettings,
+  setLlmProfileApiKey,
+  clearLlmProfileApiKey,
+  testLlmProfileConnection,
+  analyzeWithLocalLlm,
+  saveTextWithDialog,
   getIngestWindowDays,
   setIngestWindowDays,
   detectLocalLlmProviders,
-  scanLanLlmProviders
+  scanLanLlmProviders,
+  listLlmNetworkInterfaces
 } from "./lib/backend";
 import type {
   IngestProfile,
+  LlmAnalysisResult,
+  LlmConnectionProfile,
+  LlmConnectionTestResult,
   LlmEndpointCandidate,
+  LlmNetworkInterface,
   LlmSettings,
   SyncOperationResult
 } from "./lib/backend";
 import { exportAsCsv, exportAsJson, exportAsText } from "./lib/export";
 import { applyFilters, defaultFilters } from "./lib/filters";
 import { importSessionEvents } from "./lib/import";
-import { buildGoogleQuery, buildLlmPrompt } from "./lib/llmPrompt";
+import { buildGoogleQuery, buildLlmPrompt, redactSensitiveText } from "./lib/llmPrompt";
 import { cn } from "./lib/cn";
 import { Button } from "./components/Button";
 import type {
@@ -62,6 +72,12 @@ const llmProviderOptions = [
   { id: "perplexity", label: "Perplexity" },
   { id: "openai_compatible", label: "OpenAI-Compatible (Generic)" }
 ] as const;
+const llmScopeOptions = [
+  { id: "local", label: "Local host" },
+  { id: "lan", label: "LAN host" },
+  { id: "cloud", label: "Cloud" },
+  { id: "generic", label: "Generic" }
+] as const;
 const MAX_LOCAL_EVENTS_IN_MEMORY = 10000;
 const MAX_IMPORTED_EVENTS_IN_MEMORY = 5000;
 const LOCAL_FETCH_LIMIT = MAX_LOCAL_EVENTS_IN_MEMORY + 1;
@@ -77,53 +93,63 @@ function createDefaultFilters(): EventFilters {
 
 function createDefaultLlmSettings(): LlmSettings {
   return {
-    preferredProvider: "ollama",
     allowLanDiscovery: false,
     neverSendRawEventToUntrusted: true,
     trustedHosts: [],
-    ollama: {
-      enabled: true,
-      baseUrl: "http://127.0.0.1:11434",
-      apiKey: "",
-      model: ""
-    },
-    lmstudio: {
-      enabled: false,
-      baseUrl: "http://127.0.0.1:1234",
-      apiKey: "",
-      model: ""
-    },
-    openai: {
-      enabled: false,
-      baseUrl: "https://api.openai.com/v1",
-      apiKey: "",
-      model: ""
-    },
-    gemini: {
-      enabled: false,
-      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-      apiKey: "",
-      model: ""
-    },
-    claude: {
-      enabled: false,
-      baseUrl: "https://api.anthropic.com/v1",
-      apiKey: "",
-      model: ""
-    },
-    perplexity: {
-      enabled: false,
-      baseUrl: "https://api.perplexity.ai",
-      apiKey: "",
-      model: ""
-    },
-    openaiCompatible: {
-      enabled: false,
-      baseUrl: "",
-      apiKey: "",
-      model: ""
-    }
+    profiles: [
+      {
+        id: "profile-ollama-local",
+        name: "Ollama Local",
+        provider: "ollama",
+        scope: "local",
+        baseUrl: "http://127.0.0.1:11434",
+        model: "",
+        enabled: true,
+        apiKeyConfigured: false
+      }
+    ],
+    defaultProfileId: "profile-ollama-local",
+    backupProfileId: "",
+    preferredLanInterfaceId: ""
   };
+}
+
+function defaultBaseUrlForProvider(provider: string): string {
+  switch (provider) {
+    case "ollama":
+      return "http://127.0.0.1:11434";
+    case "lmstudio":
+      return "http://127.0.0.1:1234";
+    case "openai":
+      return "https://api.openai.com/v1";
+    case "gemini":
+      return "https://generativelanguage.googleapis.com/v1beta";
+    case "claude":
+      return "https://api.anthropic.com/v1";
+    case "perplexity":
+      return "https://api.perplexity.ai";
+    default:
+      return "";
+  }
+}
+
+function defaultScopeForProvider(provider: string): "local" | "cloud" | "generic" {
+  if (provider === "ollama" || provider === "lmstudio") return "local";
+  if (provider === "openai_compatible") return "generic";
+  return "cloud";
+}
+
+function providerLabel(providerId: string): string {
+  const found = llmProviderOptions.find((option) => option.id === providerId);
+  return found ? found.label : providerId;
+}
+
+function newProfileId(): string {
+  const suffix =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID().slice(0, 8)
+      : Math.random().toString(36).slice(2, 10);
+  return `profile-${suffix}`;
 }
 
 type SortDirection = "asc" | "desc";
@@ -136,6 +162,7 @@ interface SortState {
 
 type WorkspaceTab = "home" | "events" | "crashes" | "data" | "import" | "export" | "settings" | "help";
 type ExportScope = "loaded" | "custom";
+type LlmResponseViewMode = "formatted" | "markdown";
 type HelpSectionId =
   | "quick-start"
   | "filters"
@@ -144,6 +171,34 @@ type HelpSectionId =
   | "crash-flow"
   | "export-prompt"
   | "settings-collection";
+
+type HelpTopicId =
+  | "getting-started"
+  | "navigation"
+  | "home"
+  | "events"
+  | "crashes"
+  | "data"
+  | "import"
+  | "export"
+  | "settings-llm"
+  | "security"
+  | "troubleshooting";
+
+interface HelpTopicSection {
+  id: string;
+  title: string;
+  paragraphs: string[];
+  steps?: string[];
+  tips?: string[];
+}
+
+interface HelpTopic {
+  id: HelpTopicId;
+  label: string;
+  summary: string;
+  sections: HelpTopicSection[];
+}
 
 interface WorkspaceTabDescriptor {
   id: Exclude<WorkspaceTab, "help">;
@@ -358,14 +413,207 @@ function capEvents(events: NormalizedEvent[], max: number): { kept: NormalizedEv
   };
 }
 
+function buildEventContextText(
+  event: NormalizedEvent,
+  hostOsVersion: string,
+  redact = true
+): string {
+  const safe = (value: string) => (redact ? redactSensitiveText(value) : value);
+  return [
+    `OS: ${safe(event.os)}`,
+    `OS Version: ${safe(hostOsVersion || "Unknown")}`,
+    `Timestamp: ${safe(event.timestamp)}`,
+    `Type: ${safe(event.logName)} / ${safe(event.category)}`,
+    `Provider: ${safe(event.provider)}`,
+    `Event ID: ${event.eventId ?? "N/A"}`,
+    `Severity: ${safe(event.severity)}`,
+    `Message: ${safe(event.message)}`
+  ].join("\n");
+}
+
+function renderInlineMarkdown(value: string, keyPrefix: string) {
+  const segments = value.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean);
+  return segments.map((segment, index) => {
+    if (segment.startsWith("**") && segment.endsWith("**")) {
+      return (
+        <strong key={`${keyPrefix}-b-${index}`} className="font-semibold text-text">
+          {segment.slice(2, -2)}
+        </strong>
+      );
+    }
+    if (segment.startsWith("`") && segment.endsWith("`")) {
+      return (
+        <code
+          key={`${keyPrefix}-c-${index}`}
+          className="rounded bg-black/10 px-1 py-0.5 font-mono text-[0.95em] text-text"
+        >
+          {segment.slice(1, -1)}
+        </code>
+      );
+    }
+    return <span key={`${keyPrefix}-t-${index}`}>{segment}</span>;
+  });
+}
+
+function isMarkdownBlockBoundary(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  return (
+    /^#{1,6}\s+/.test(trimmed) ||
+    /^\d+\.\s+/.test(trimmed) ||
+    /^[-*]\s+/.test(trimmed) ||
+    /^>\s?/.test(trimmed) ||
+    trimmed.startsWith("```")
+  );
+}
+
+function renderMarkdownPreview(markdown: string) {
+  const lines = markdown.replace(/\r/g, "").split("\n");
+  const blocks: JSX.Element[] = [];
+  let index = 0;
+  let key = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+
+    if (trimmed.startsWith("```")) {
+      const codeLines: string[] = [];
+      index += 1;
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push(
+        <pre
+          key={`md-block-${key++}`}
+          className="overflow-x-auto rounded-md border border-panel-border bg-[var(--field-bg)] px-3 py-2 font-mono text-xs text-text"
+        >
+          {codeLines.join("\n")}
+        </pre>
+      );
+      continue;
+    }
+
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^\d+\.\s+/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <ol key={`md-block-${key++}`} className="ml-5 list-decimal space-y-1">
+          {items.map((item, itemIndex) => (
+            <li key={`md-li-${itemIndex}`} className="text-sm leading-6 text-text">
+              {renderInlineMarkdown(item, `md-ol-${key}-${itemIndex}`)}
+            </li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (index < lines.length && /^[-*]\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^[-*]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <ul key={`md-block-${key++}`} className="ml-5 list-disc space-y-1">
+          {items.map((item, itemIndex) => (
+            <li key={`md-li-${itemIndex}`} className="text-sm leading-6 text-text">
+              {renderInlineMarkdown(item, `md-ul-${key}-${itemIndex}`)}
+            </li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)/);
+    if (heading) {
+      const level = heading[1].length;
+      const content = heading[2].trim();
+      const headingClass =
+        level <= 2
+          ? "text-base font-semibold text-text"
+          : level === 3
+            ? "text-sm font-semibold text-text"
+            : "text-sm font-semibold text-muted";
+      blocks.push(
+        <div key={`md-block-${key++}`} className={headingClass}>
+          {renderInlineMarkdown(content, `md-head-${key}`)}
+        </div>
+      );
+      index += 1;
+      continue;
+    }
+
+    if (/^>\s?/.test(trimmed)) {
+      blocks.push(
+        <blockquote
+          key={`md-block-${key++}`}
+          className="border-l-2 border-panel-border pl-3 text-sm italic leading-6 text-muted"
+        >
+          {renderInlineMarkdown(trimmed.replace(/^>\s?/, ""), `md-quote-${key}`)}
+        </blockquote>
+      );
+      index += 1;
+      continue;
+    }
+
+    const paragraphLines = [trimmed];
+    index += 1;
+    while (index < lines.length && !isMarkdownBlockBoundary(lines[index])) {
+      paragraphLines.push(lines[index].trim());
+      index += 1;
+    }
+    blocks.push(
+      <p key={`md-block-${key++}`} className="text-sm leading-6 text-text">
+        {renderInlineMarkdown(paragraphLines.join(" "), `md-p-${key}`)}
+      </p>
+    );
+  }
+
+  if (blocks.length === 0) {
+    return <p className="text-sm text-muted">No response yet.</p>;
+  }
+  return <div className="space-y-2">{blocks}</div>;
+}
+
+function buildLlmShareBundle(
+  eventContextRedacted: string,
+  promptRedacted: string,
+  result: LlmAnalysisResult
+): string {
+  return [
+    "Hermes LLM Analysis Share",
+    `Generated: ${new Date().toLocaleString()}`,
+    "",
+    "Event Context (redacted):",
+    eventContextRedacted.trim() || "(no context)",
+    "",
+    "Prompt Used:",
+    promptRedacted.trim() || "(no prompt)",
+    "",
+    `Analysis Response (${result.profileName} | ${result.model}):`,
+    result.response.trim() || "(no response)"
+  ].join("\n");
+}
+
 export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("system");
   const [hostOs, setHostOs] = useState<SupportedOs>(browserDefaultOs);
   const [hostOsVersion, setHostOsVersion] = useState<string>("Unknown");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("home");
   const [helpTabOpen, setHelpTabOpen] = useState(false);
-  const [pendingHelpSection, setPendingHelpSection] = useState<HelpSectionId | null>(null);
-  const [highlightedHelpSection, setHighlightedHelpSection] = useState<HelpSectionId | null>(null);
+  const [activeHelpTopic, setActiveHelpTopic] = useState<HelpTopicId>("getting-started");
   const [filterDraft, setFilterDraft] = useState<EventFilters>(createDefaultFilters);
   const [activeFilters, setActiveFilters] = useState<EventFilters>(createDefaultFilters);
   const [localEvents, setLocalEvents] = useState<NormalizedEvent[]>([]);
@@ -387,8 +635,17 @@ export default function App() {
     windowsChannels: ["Application", "System", "Security"]
   });
   const [llmSettings, setLlmSettingsState] = useState<LlmSettings>(createDefaultLlmSettings);
+  const [llmSelectedProfileId, setLlmSelectedProfileId] = useState<string>("");
+  const [llmApiKeyDraft, setLlmApiKeyDraft] = useState<string>("");
   const [llmCandidates, setLlmCandidates] = useState<LlmEndpointCandidate[]>([]);
+  const [llmNetworks, setLlmNetworks] = useState<LlmNetworkInterface[]>([]);
+  const [llmSelectedNetworkId, setLlmSelectedNetworkId] = useState<string>("");
+  const [llmIncludeNonPrivateInterfaces, setLlmIncludeNonPrivateInterfaces] = useState(false);
+  const [llmIncludeLoopbackInterfaces, setLlmIncludeLoopbackInterfaces] = useState(false);
+  const [isDetectingNetworks, setIsDetectingNetworks] = useState(false);
   const [isScanningLan, setIsScanningLan] = useState(false);
+  const [isTestingLlmProfile, setIsTestingLlmProfile] = useState(false);
+  const [llmTestResult, setLlmTestResult] = useState<LlmConnectionTestResult | null>(null);
   const [backfillFrom, setBackfillFrom] = useState("");
   const [backfillTo, setBackfillTo] = useState("");
   const [rangeViewActive, setRangeViewActive] = useState(false);
@@ -400,6 +657,13 @@ export default function App() {
   const [memoryNotice, setMemoryNotice] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
   const [copyEventTextStatus, setCopyEventTextStatus] = useState<"idle" | "copied">("idle");
+  const [llmWindowOpen, setLlmWindowOpen] = useState(false);
+  const [llmPromptDraft, setLlmPromptDraft] = useState("");
+  const [llmAutoRedactBeforeSend, setLlmAutoRedactBeforeSend] = useState(true);
+  const [llmRunProfileId, setLlmRunProfileId] = useState("");
+  const [llmRunResult, setLlmRunResult] = useState<LlmAnalysisResult | null>(null);
+  const [llmResponseViewMode, setLlmResponseViewMode] = useState<LlmResponseViewMode>("formatted");
+  const [isRunningLlmAnalysis, setIsRunningLlmAnalysis] = useState(false);
   const [exportStatus, setExportStatus] = useState<string>("");
   const tableContainerRef = useRef<HTMLElement | null>(null);
   const [tableScrollTop, setTableScrollTop] = useState(0);
@@ -472,6 +736,33 @@ export default function App() {
   const hostOsEventPool = useMemo(
     () => allEvents.filter((event) => event.os === hostOs),
     [allEvents, hostOs]
+  );
+  const llmSelectedProfile = useMemo(() => {
+    if (llmSettings.profiles.length === 0) return null;
+    const found = llmSettings.profiles.find((profile) => profile.id === llmSelectedProfileId);
+    return found ?? llmSettings.profiles[0];
+  }, [llmSelectedProfileId, llmSettings.profiles]);
+  const llmLocalProfiles = useMemo(
+    () =>
+      llmSettings.profiles.filter((profile) =>
+        profile.enabled &&
+        (profile.provider === "ollama" ||
+          profile.provider === "lmstudio" ||
+          profile.provider === "openai_compatible")
+      ),
+    [llmSettings.profiles]
+  );
+  const selectedHelpTopic = useMemo(
+    () => helpTopics.find((topic) => topic.id === activeHelpTopic) ?? helpTopics[0],
+    [activeHelpTopic]
+  );
+  const selectedEventOriginalContext = useMemo(
+    () => (selected ? buildEventContextText(selected, hostOsVersion, false) : ""),
+    [hostOsVersion, selected]
+  );
+  const selectedEventRedactedContext = useMemo(
+    () => redactSensitiveText(selectedEventOriginalContext),
+    [selectedEventOriginalContext]
   );
   const exportCategoryOptions = useMemo(() => {
     const values = new Set<EventCategory>();
@@ -824,22 +1115,38 @@ export default function App() {
       }
       openHelpTab("quick-start");
     };
+    const onOpenHelpDom = (event: Event) => {
+      const custom = event as CustomEvent<string | null | undefined>;
+      onOpenHelp(custom.detail);
+    };
+
+    window.addEventListener("hermes:open-help", onOpenHelpDom as EventListener);
 
     void (async () => {
-      try {
-        if (isTauriRuntime()) {
+      if (isTauriRuntime()) {
+        try {
           const { getCurrentWindow } = await import("@tauri-apps/api/window");
           const offWindow = await getCurrentWindow().listen<string>("hla://theme-changed", (event) => {
             onTheme(event.payload);
           });
           unlisteners.push(offWindow);
+        } catch {
+          // Continue; app-level listeners below still provide theme/help events.
         }
+      }
 
+      try {
         const { listen } = await import("@tauri-apps/api/event");
         const offApp = await listen<string>("hla://theme-changed", (event) => {
           onTheme(event.payload);
         });
         unlisteners.push(offApp);
+      } catch {
+        // Ignore when Tauri event bridge is unavailable.
+      }
+
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
         const offHelp = await listen<string | null>("hla://open-help", (event) => {
           onOpenHelp(event.payload);
         });
@@ -850,6 +1157,7 @@ export default function App() {
     })();
 
     return () => {
+      window.removeEventListener("hermes:open-help", onOpenHelpDom as EventListener);
       for (const unlisten of unlisteners) {
         unlisten();
       }
@@ -903,28 +1211,63 @@ export default function App() {
   }, [activeTab, tableEvents.length, sortState, activeFilters.dateFrom, activeFilters.dateTo, activeFilters.logType]);
 
   useEffect(() => {
-    if (activeTab !== "help" || !pendingHelpSection) return;
-    const targetId = `help-${pendingHelpSection}`;
-    window.requestAnimationFrame(() => {
-      const node = document.getElementById(targetId);
-      if (node) {
-        node.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
-    });
-    setPendingHelpSection(null);
-  }, [activeTab, pendingHelpSection]);
-
-  useEffect(() => {
-    if (!highlightedHelpSection) return;
-    const timeoutId = window.setTimeout(() => {
-      setHighlightedHelpSection((current) => (current === highlightedHelpSection ? null : current));
-    }, 1800);
-    return () => window.clearTimeout(timeoutId);
-  }, [highlightedHelpSection]);
-
-  useEffect(() => {
     setCopyEventTextStatus("idle");
   }, [selected?.id]);
+
+  useEffect(() => {
+    if (llmSettings.profiles.length === 0) {
+      if (llmSelectedProfileId !== "") setLlmSelectedProfileId("");
+      return;
+    }
+    const currentExists = llmSettings.profiles.some((profile) => profile.id === llmSelectedProfileId);
+    if (currentExists) return;
+    const fallback =
+      llmSettings.profiles.find((profile) => profile.id === llmSettings.defaultProfileId)?.id ??
+      llmSettings.profiles[0].id;
+    setLlmSelectedProfileId(fallback);
+  }, [llmSelectedProfileId, llmSettings.defaultProfileId, llmSettings.profiles]);
+
+  useEffect(() => {
+    setLlmApiKeyDraft("");
+    setLlmTestResult(null);
+  }, [llmSelectedProfile?.id]);
+
+  useEffect(() => {
+    if (!llmWindowOpen) return;
+    if (llmLocalProfiles.length === 0) {
+      if (llmRunProfileId !== "") setLlmRunProfileId("");
+      return;
+    }
+    if (llmLocalProfiles.some((profile) => profile.id === llmRunProfileId)) return;
+    const preferred =
+      llmLocalProfiles.find((profile) => profile.id === llmSettings.defaultProfileId)?.id ??
+      llmLocalProfiles[0].id;
+    setLlmRunProfileId(preferred);
+  }, [llmLocalProfiles, llmRunProfileId, llmSettings.defaultProfileId, llmWindowOpen]);
+
+  async function refreshLlmNetworkInterfaces(
+    includeNonPrivate = llmIncludeNonPrivateInterfaces,
+    includeLoopback = llmIncludeLoopbackInterfaces
+  ): Promise<boolean> {
+    setIsDetectingNetworks(true);
+    try {
+      const interfaces = await listLlmNetworkInterfaces(includeNonPrivate, includeLoopback);
+      setLlmNetworks(interfaces);
+
+      const preferredId = llmSettings.preferredLanInterfaceId.trim();
+      const saved = interfaces.find((entry) => entry.id === preferredId);
+      const defaultCandidate = interfaces.find((entry) => entry.isDefaultCandidate);
+      const fallback = interfaces[0];
+      const next = saved?.id ?? defaultCandidate?.id ?? fallback?.id ?? "";
+      setLlmSelectedNetworkId(next);
+      return true;
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to detect LAN interfaces.");
+      return false;
+    } finally {
+      setIsDetectingNetworks(false);
+    }
+  }
 
   async function initialize(): Promise<void> {
     setIsLoading(true);
@@ -941,6 +1284,19 @@ export default function App() {
       setIngestProfileState(profile);
       const llm = await getLlmSettings();
       setLlmSettingsState(llm);
+      const nextProfileId =
+        llm.profiles.find((entry) => entry.id === llm.defaultProfileId)?.id ??
+        llm.profiles[0]?.id ??
+        "";
+      setLlmSelectedProfileId(nextProfileId);
+      const interfaces = await listLlmNetworkInterfaces(false, false);
+      setLlmNetworks(interfaces);
+      const networkId =
+        interfaces.find((entry) => entry.id === llm.preferredLanInterfaceId)?.id ??
+        interfaces.find((entry) => entry.isDefaultCandidate)?.id ??
+        interfaces[0]?.id ??
+        "";
+      setLlmSelectedNetworkId(networkId);
       if (profile.autoSyncOnStartup) {
         const syncResult = await refreshLocalEvents();
         applyCollectorWarnings("Startup sync warning", syncResult);
@@ -1162,6 +1518,116 @@ export default function App() {
     }
   }
 
+  function openLlmAnalysisWindow(): void {
+    if (!selected) return;
+    const prompt = buildLlmPrompt(selected, hostOsVersion);
+    const preferredProfileId =
+      llmLocalProfiles.find((profile) => profile.id === llmSettings.defaultProfileId)?.id ??
+      llmLocalProfiles[0]?.id ??
+      "";
+
+    setLlmPromptDraft(prompt);
+    setLlmAutoRedactBeforeSend(true);
+    setLlmRunProfileId(preferredProfileId);
+    setLlmRunResult(null);
+    setLlmResponseViewMode("formatted");
+    setLlmWindowOpen(true);
+  }
+
+  function rebuildRedactedPrompt(): void {
+    if (!selected) return;
+    setLlmPromptDraft(buildLlmPrompt(selected, hostOsVersion));
+    setExportStatus("Prompt reset using redacted event context.");
+    window.setTimeout(() => setExportStatus(""), 2000);
+  }
+
+  function redactPromptNow(): void {
+    setLlmPromptDraft((current) => redactSensitiveText(current));
+    setExportStatus("Prompt redaction applied.");
+    window.setTimeout(() => setExportStatus(""), 2000);
+  }
+
+  async function runLlmAnalysisNow(): Promise<void> {
+    if (!selected) return;
+    if (!llmRunProfileId) {
+      setLastError("No local LLM profile is selected.");
+      return;
+    }
+    const outboundPrompt = (
+      llmAutoRedactBeforeSend ? redactSensitiveText(llmPromptDraft) : llmPromptDraft
+    ).trim();
+    if (!outboundPrompt) {
+      setLastError("LLM prompt is empty.");
+      return;
+    }
+    if (llmAutoRedactBeforeSend && outboundPrompt !== llmPromptDraft) {
+      setLlmPromptDraft(outboundPrompt);
+    }
+
+    setLastError("");
+    setIsRunningLlmAnalysis(true);
+    try {
+      const result = await analyzeWithLocalLlm(outboundPrompt, llmRunProfileId);
+      setLlmRunResult(result);
+      setExportStatus(
+        result.fallbackUsed
+          ? `LLM analysis complete via fallback profile (${result.profileName}).`
+          : `LLM analysis complete (${result.profileName}).`
+      );
+      window.setTimeout(() => setExportStatus(""), 3500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to run local LLM analysis.");
+    } finally {
+      setIsRunningLlmAnalysis(false);
+    }
+  }
+
+  async function copyLlmResponseNow(): Promise<void> {
+    if (!llmRunResult?.response.trim()) return;
+    setLastError("");
+    try {
+      await copyText(llmRunResult.response);
+      setExportStatus("Analysis response copied.");
+      window.setTimeout(() => setExportStatus(""), 2000);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to copy analysis response.");
+    }
+  }
+
+  async function copyLlmContextAndResponseNow(): Promise<void> {
+    if (!llmRunResult) return;
+    setLastError("");
+    try {
+      const promptForShare = redactSensitiveText(llmPromptDraft);
+      const bundle = buildLlmShareBundle(selectedEventRedactedContext, promptForShare, llmRunResult);
+      await copyText(bundle);
+      setExportStatus("Redacted context + response copied.");
+      window.setTimeout(() => setExportStatus(""), 2200);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to copy context and response.");
+    }
+  }
+
+  async function saveLlmContextAndResponseNow(): Promise<void> {
+    if (!llmRunResult) return;
+    setLastError("");
+    try {
+      const promptForShare = redactSensitiveText(llmPromptDraft);
+      const bundle = buildLlmShareBundle(selectedEventRedactedContext, promptForShare, llmRunResult);
+      const filename = `llm-analysis-${formatExportTimestamp()}.txt`;
+      const location = await saveTextWithDialog(filename, bundle);
+      if (!location) {
+        setExportStatus("Save canceled.");
+        window.setTimeout(() => setExportStatus(""), 2000);
+        return;
+      }
+      setExportStatus(`Saved context + response to ${location}`);
+      window.setTimeout(() => setExportStatus(""), 2600);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to save context and response.");
+    }
+  }
+
   async function copySelectedEventText(): Promise<void> {
     if (!selected) return;
     setLastError("");
@@ -1217,25 +1683,141 @@ export default function App() {
     });
   }
 
-  function updateLlmProvider(
-    provider:
-      | "ollama"
-      | "lmstudio"
-      | "openai"
-      | "gemini"
-      | "claude"
-      | "perplexity"
-      | "openaiCompatible",
-    field: "enabled" | "baseUrl" | "apiKey" | "model",
-    value: string | boolean
-  ): void {
+  function updateLlmProfile(profileId: string, patch: Partial<LlmConnectionProfile>): void {
     setLlmSettingsState((current) => ({
       ...current,
-      [provider]: {
-        ...current[provider],
-        [field]: value
-      }
+      profiles: current.profiles.map((profile) =>
+        profile.id === profileId
+          ? {
+              ...profile,
+              ...patch
+            }
+          : profile
+      )
     }));
+  }
+
+  function updateSelectedLlmProfile(
+    field: "name" | "provider" | "scope" | "baseUrl" | "model" | "enabled",
+    value: string | boolean
+  ): void {
+    if (!llmSelectedProfile) return;
+
+    if (field === "provider" && typeof value === "string") {
+      const nextProvider = value;
+      const defaultScope = defaultScopeForProvider(nextProvider);
+      const currentUrl = llmSelectedProfile.baseUrl.trim();
+      const currentDefault = defaultBaseUrlForProvider(llmSelectedProfile.provider);
+      const nextDefault = defaultBaseUrlForProvider(nextProvider);
+      updateLlmProfile(llmSelectedProfile.id, {
+        provider: nextProvider,
+        scope: defaultScope,
+        baseUrl: !currentUrl || currentUrl === currentDefault ? nextDefault : currentUrl
+      });
+      return;
+    }
+
+    updateLlmProfile(llmSelectedProfile.id, { [field]: value } as Partial<LlmConnectionProfile>);
+  }
+
+  function addLlmProfile(): void {
+    const provider = llmSelectedProfile?.provider ?? "ollama";
+    const scope = defaultScopeForProvider(provider);
+    const profile: LlmConnectionProfile = {
+      id: newProfileId(),
+      name: `${providerLabel(provider)} ${scope === "local" ? "Local" : scope === "cloud" ? "Cloud" : "Generic"}`,
+      provider,
+      scope,
+      baseUrl: defaultBaseUrlForProvider(provider),
+      model: "",
+      enabled: true,
+      apiKeyConfigured: false
+    };
+    setLlmSettingsState((current) => ({
+      ...current,
+      profiles: [...current.profiles, profile]
+    }));
+    setLlmSelectedProfileId(profile.id);
+    setLlmApiKeyDraft("");
+  }
+
+  function deleteSelectedLlmProfile(): void {
+    if (!llmSelectedProfile) return;
+    setLlmSettingsState((current) => {
+      if (current.profiles.length <= 1) return current;
+      const remaining = current.profiles.filter((profile) => profile.id !== llmSelectedProfile.id);
+      const fallbackId = remaining[0]?.id ?? "";
+      const defaultProfileId = current.defaultProfileId === llmSelectedProfile.id ? fallbackId : current.defaultProfileId;
+      const backupProfileId =
+        current.backupProfileId === llmSelectedProfile.id || current.backupProfileId === defaultProfileId
+          ? ""
+          : current.backupProfileId;
+      setLlmSelectedProfileId(defaultProfileId);
+      return {
+        ...current,
+        profiles: remaining,
+        defaultProfileId,
+        backupProfileId
+      };
+    });
+    setLlmApiKeyDraft("");
+  }
+
+  function applyCandidateToSelectedProfile(candidate: LlmEndpointCandidate): void {
+    if (!llmSelectedProfile) return;
+    const mappedScope = candidate.scope === "localhost" ? "local" : "lan";
+    const nextProvider = candidate.providerId;
+    const nextProfile: LlmConnectionProfile = {
+      ...llmSelectedProfile,
+      provider: nextProvider,
+      scope: mappedScope,
+      baseUrl: candidate.endpoint,
+      enabled: true
+    };
+    updateLlmProfile(llmSelectedProfile.id, {
+      provider: nextProvider,
+      scope: mappedScope,
+      baseUrl: candidate.endpoint,
+      enabled: true
+    });
+    if (candidate.interfaceId.trim()) {
+      setLlmSelectedNetworkId(candidate.interfaceId);
+    }
+    setLlmTestResult(null);
+    void runLlmConnectionTest(nextProfile);
+  }
+
+  function applyDetectedModel(model: string): void {
+    if (!llmSelectedProfile) return;
+    const trimmed = model.trim();
+    if (!trimmed) return;
+    updateLlmProfile(llmSelectedProfile.id, { model: trimmed });
+    setExportStatus(`Model set to ${trimmed}.`);
+    window.setTimeout(() => setExportStatus(""), 2000);
+  }
+
+  async function runLlmConnectionTest(profileOverride?: LlmConnectionProfile): Promise<void> {
+    const profile = profileOverride ?? llmSelectedProfile;
+    if (!profile) return;
+
+    setLastError("");
+    setIsTestingLlmProfile(true);
+    try {
+      const result = await testLlmProfileConnection(profile);
+      setLlmTestResult(result);
+      if (result.ok && result.detectedModels.length > 0 && !profile.model.trim()) {
+        const autoModel = result.detectedModels[0];
+        updateLlmProfile(profile.id, { model: autoModel });
+        setExportStatus(`${result.message} Auto-selected model: ${autoModel}.`);
+      } else {
+        setExportStatus(result.message);
+      }
+      window.setTimeout(() => setExportStatus(""), 3500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to test LLM connection.");
+    } finally {
+      setIsTestingLlmProfile(false);
+    }
   }
 
   async function saveLlmSettingsNow(): Promise<void> {
@@ -1244,12 +1826,34 @@ export default function App() {
       const trustedHosts = llmSettings.trustedHosts
         .map((entry) => entry.trim())
         .filter((entry) => entry.length > 0);
-      const saved = await setLlmSettings({ ...llmSettings, trustedHosts });
+      let saved = await setLlmSettings({
+        ...llmSettings,
+        trustedHosts,
+        preferredLanInterfaceId: llmSelectedNetworkId
+      });
+      if (llmSelectedProfile && llmApiKeyDraft.trim()) {
+        saved = await setLlmProfileApiKey(llmSelectedProfile.id, llmApiKeyDraft.trim());
+        setLlmApiKeyDraft("");
+      }
       setLlmSettingsState(saved);
       setExportStatus("LLM settings saved.");
       window.setTimeout(() => setExportStatus(""), 2500);
     } catch (error) {
       setLastError(error instanceof Error ? error.message : "Failed to save LLM settings.");
+    }
+  }
+
+  async function clearLlmApiKeyNow(): Promise<void> {
+    if (!llmSelectedProfile) return;
+    setLastError("");
+    try {
+      const saved = await clearLlmProfileApiKey(llmSelectedProfile.id);
+      setLlmSettingsState(saved);
+      setLlmApiKeyDraft("");
+      setExportStatus("API key removed from OS keychain.");
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to clear API key.");
     }
   }
 
@@ -1263,9 +1867,25 @@ export default function App() {
           ? `Detected ${candidates.length} local LLM endpoint${candidates.length === 1 ? "" : "s"}.`
           : "No local Ollama/LM Studio endpoints detected."
       );
+      if (
+        candidates.length > 0 &&
+        llmSelectedProfile &&
+        (llmSelectedProfile.provider === "ollama" || llmSelectedProfile.provider === "lmstudio")
+      ) {
+        void runLlmConnectionTest();
+      }
       window.setTimeout(() => setExportStatus(""), 3000);
     } catch (error) {
       setLastError(error instanceof Error ? error.message : "Failed to detect local LLM providers.");
+    }
+  }
+
+  async function detectNetworksNow(): Promise<void> {
+    setLastError("");
+    const success = await refreshLlmNetworkInterfaces();
+    if (success) {
+      setExportStatus("Network interfaces refreshed.");
+      window.setTimeout(() => setExportStatus(""), 2000);
     }
   }
 
@@ -1273,7 +1893,7 @@ export default function App() {
     setLastError("");
     setIsScanningLan(true);
     try {
-      const candidates = await scanLanLlmProviders(256);
+      const candidates = await scanLanLlmProviders(llmSelectedNetworkId || undefined, 256);
       setLlmCandidates(candidates);
       setExportStatus(
         candidates.length > 0
@@ -1467,15 +2087,12 @@ export default function App() {
 
   function openHelpTab(section: HelpSectionId = "quick-start"): void {
     setHelpTabOpen(true);
-    setPendingHelpSection(section);
-    setHighlightedHelpSection(section);
+    setActiveHelpTopic(helpSectionToTopicMap[section]);
     setActiveTab("help");
   }
 
   function closeHelpTab(): void {
     setHelpTabOpen(false);
-    setPendingHelpSection(null);
-    setHighlightedHelpSection(null);
     if (activeTab === "help") {
       setActiveTab("home");
     }
@@ -1566,109 +2183,66 @@ export default function App() {
               <div className="text-sm font-semibold">Help</div>
               <Button size="sm" onClick={closeHelpTab}>Close Help Tab</Button>
             </div>
-            <div className="grid gap-3 text-sm">
-              <div
-                id="help-quick-start"
-                className={cn(
-                  "rounded-lg border border-panel-border bg-[var(--field-bg)] p-3",
-                  highlightedHelpSection === "quick-start" && "ring-2 ring-accent"
-                )}
-              >
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Quick Start</div>
-                <p className="mt-2 text-xs text-muted">
-                  1) Click Refresh Logs. 2) Open Data to confirm local coverage dates. 3) Go to Events and apply filters.
-                </p>
-              </div>
-              <div
-                id="help-filters"
-                className={cn(
-                  "rounded-lg border border-panel-border bg-[var(--field-bg)] p-3",
-                  highlightedHelpSection === "filters" && "ring-2 ring-accent"
-                )}
-              >
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Events Filters</div>
-                <p className="mt-2 text-xs text-muted">
-                  Filters are applied only when you click Apply Filters. They narrow the currently loaded local/imported events.
-                </p>
-                <p className="mt-2 text-xs text-muted">
-                  Example: Set From 2026-02-22 and To 2026-02-27, check Error + Critical, enter provider "krusader", then click Apply Filters.
-                </p>
-              </div>
-              <div
-                id="help-ingest-vs-backfill"
-                className={cn(
-                  "rounded-lg border border-panel-border bg-[var(--field-bg)] p-3",
-                  highlightedHelpSection === "ingest-vs-backfill" && "ring-2 ring-accent"
-                )}
-              >
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Ingest Window vs Backfill Range</div>
-                <p className="mt-2 text-xs text-muted">
-                  Ingest Window is your rolling default sync (for example, 7 = now minus 7 days through now when you Save & Sync).
-                  Backfill Range is a one-time exact date span for investigations (Load Events fetches only that range).
-                </p>
-                <p className="mt-2 text-xs text-muted">
-                  Example: Set ingest to 7 for daily operations. For an incident on 2026-01-15, set backfill 2026-01-14 to 2026-01-16 and click Load Events.
-                </p>
-              </div>
-              <div
-                id="help-coverage-warning"
-                className={cn(
-                  "rounded-lg border border-panel-border bg-[var(--field-bg)] p-3",
-                  highlightedHelpSection === "coverage-warning" && "ring-2 ring-accent"
-                )}
-              >
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Why You See Date Coverage Warnings</div>
-                <p className="mt-2 text-xs text-muted">
-                  Filters only run against logs currently in local cache. If your filter dates are older/newer than local coverage, the warning appears.
-                </p>
-                <p className="mt-2 text-xs text-muted">
-                  Example: Coverage is 2/27/2026 only, but Filters From is 2/08/2026. Load that older range in Data first, then re-apply filters.
-                </p>
-              </div>
-              <div
-                id="help-crash-flow"
-                className={cn(
-                  "rounded-lg border border-panel-border bg-[var(--field-bg)] p-3",
-                  highlightedHelpSection === "crash-flow" && "ring-2 ring-accent"
-                )}
-              >
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Crash Correlation Flow</div>
-                <p className="mt-2 text-xs text-muted">
-                  In Crashes, import host crashes, select one, then Investigate Pre-Crash to narrow events to the minutes before the crash.
-                </p>
-                <p className="mt-2 text-xs text-muted">
-                  Use correlated event chips to jump to suspicious events, then use the bottom action bar in Crashes to search/export/copy prompts.
-                </p>
-              </div>
-              <div
-                id="help-export-prompt"
-                className={cn(
-                  "rounded-lg border border-panel-border bg-[var(--field-bg)] p-3",
-                  highlightedHelpSection === "export-prompt" && "ring-2 ring-accent"
-                )}
-              >
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Export & Prompt</div>
-                <p className="mt-2 text-xs text-muted">
-                  In Events or Crashes, select an event row and use the bottom action bar to copy an LLM prompt, open a Google search, or export the selected event.
-                </p>
-                <p className="mt-2 text-xs text-muted">
-                  Use the Export tab for guided exports (loaded list or custom range/severity/category/source), then choose JSON/CSV/TXT and save location.
-                </p>
-              </div>
-              <div
-                id="help-settings-collection"
-                className={cn(
-                  "rounded-lg border border-panel-border bg-[var(--field-bg)] p-3",
-                  highlightedHelpSection === "settings-collection" && "ring-2 ring-accent"
-                )}
-              >
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Settings & Collection</div>
-                <p className="mt-2 text-xs text-muted">
-                  Collection settings control startup sync behavior and max events per sync.
-                </p>
-                <p className="mt-2 text-xs text-muted">
-                  Example: Enable Auto-sync on startup, set Max events per sync to 5000, and save. Use Data for older ranges and Export for save-dialog exports.
-                </p>
+            <div className="grid gap-3 lg:grid-cols-[260px_1fr]">
+              <aside className="space-y-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">Help Topics</div>
+                {helpTopics.map((topic) => (
+                  <button
+                    key={topic.id}
+                    type="button"
+                    className={cn(
+                      "w-full rounded-lg border px-3 py-2 text-left text-xs transition",
+                      activeHelpTopic === topic.id
+                        ? "border-transparent bg-accent text-white"
+                        : "border-panel-border bg-transparent text-text hover:border-accent"
+                    )}
+                    onClick={() => setActiveHelpTopic(topic.id)}
+                  >
+                    <div className="font-semibold">{topic.label}</div>
+                    <div className={cn("mt-1", activeHelpTopic === topic.id ? "text-white/90" : "text-muted")}>
+                      {topic.summary}
+                    </div>
+                  </button>
+                ))}
+              </aside>
+
+              <div className="space-y-3">
+                <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted">
+                    {selectedHelpTopic.label}
+                  </div>
+                  <p className="mt-2 text-xs text-muted">{selectedHelpTopic.summary}</p>
+                </div>
+
+                {selectedHelpTopic.sections.map((section) => (
+                  <article
+                    key={`${selectedHelpTopic.id}-${section.id}`}
+                    className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3"
+                  >
+                    <div className="text-xs font-semibold uppercase tracking-wide text-muted">
+                      {section.title}
+                    </div>
+                    {section.paragraphs.map((paragraph, index) => (
+                      <p key={`${section.id}-p-${index}`} className="mt-2 text-xs text-muted">
+                        {paragraph}
+                      </p>
+                    ))}
+                    {section.steps && section.steps.length > 0 && (
+                      <ol className="mt-2 list-decimal space-y-1 pl-5 text-xs text-muted">
+                        {section.steps.map((step, index) => (
+                          <li key={`${section.id}-s-${index}`}>{step}</li>
+                        ))}
+                      </ol>
+                    )}
+                    {section.tips && section.tips.length > 0 && (
+                      <div className="mt-2 space-y-1 text-xs text-muted">
+                        {section.tips.map((tip, index) => (
+                          <div key={`${section.id}-t-${index}`}>Tip: {tip}</div>
+                        ))}
+                      </div>
+                    )}
+                  </article>
+                ))}
               </div>
             </div>
           </section>
@@ -1695,14 +2269,6 @@ export default function App() {
                   {preCrashFocusEnabled ? `Pre-crash focus active: ${crashVisibleEvents.length.toLocaleString()} events in range.` : "No pre-crash focus active."}
                 </div>
               </div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" variant="primary" onClick={() => setActiveTab("events")}>Open Events</Button>
-              <Button size="sm" onClick={() => setActiveTab("crashes")}>Open Crashes</Button>
-              <Button size="sm" onClick={() => setActiveTab("data")}>Open Data</Button>
-              <Button size="sm" onClick={() => setActiveTab("import")}>Open Import</Button>
-              <Button size="sm" onClick={() => setActiveTab("export")}>Open Export</Button>
-              <Button size="sm" onClick={() => openHelpTab("quick-start")}>Open Help</Button>
             </div>
             <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
               <div className="text-xs font-semibold uppercase tracking-wide text-muted">Recent Events</div>
@@ -1971,21 +2537,50 @@ export default function App() {
             </div>
             <div className="grid gap-3 border-t border-panel-border pt-4">
               <div className="text-sm font-semibold">Research Assistant (LLM)</div>
-              <div className="grid gap-2 md:grid-cols-[220px_1fr]">
-                <label className="text-xs text-muted">Preferred provider</label>
-                <select
-                  className={selectClass}
-                  value={llmSettings.preferredProvider}
-                  onChange={(e) =>
-                    setLlmSettingsState((current) => ({ ...current, preferredProvider: e.target.value }))
-                  }
-                >
-                  {llmProviderOptions.map((provider) => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.label}
-                    </option>
-                  ))}
-                </select>
+              <div className="grid gap-2 md:grid-cols-2">
+                <label className="text-xs text-muted">
+                  Default profile
+                  <select
+                    className={selectClass}
+                    value={llmSettings.defaultProfileId}
+                    onChange={(e) =>
+                      setLlmSettingsState((current) => ({
+                        ...current,
+                        defaultProfileId: e.target.value,
+                        backupProfileId:
+                          current.backupProfileId === e.target.value ? "" : current.backupProfileId
+                      }))
+                    }
+                  >
+                    {llmSettings.profiles.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-xs text-muted">
+                  Backup profile (global fallback)
+                  <select
+                    className={selectClass}
+                    value={llmSettings.backupProfileId}
+                    onChange={(e) =>
+                      setLlmSettingsState((current) => ({
+                        ...current,
+                        backupProfileId: e.target.value
+                      }))
+                    }
+                  >
+                    <option value="">None</option>
+                    {llmSettings.profiles
+                      .filter((profile) => profile.id !== llmSettings.defaultProfileId)
+                      .map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name}
+                        </option>
+                      ))}
+                  </select>
+                </label>
               </div>
               <label className="flex items-center gap-2 text-xs text-muted">
                 <input
@@ -2015,156 +2610,211 @@ export default function App() {
               </label>
               <div className="grid gap-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
                 <div className="text-xs font-semibold uppercase tracking-wide text-muted">
-                  Local Providers
+                  Profiles
                 </div>
-                <div className="grid gap-2 md:grid-cols-2">
-                  <label className="text-xs text-muted">
-                    Ollama endpoint
-                    <input
-                      className={inputClass}
-                      value={llmSettings.ollama.baseUrl}
-                      onChange={(e) => updateLlmProvider("ollama", "baseUrl", e.target.value)}
-                      placeholder="http://127.0.0.1:11434"
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    LM Studio endpoint
-                    <input
-                      className={inputClass}
-                      value={llmSettings.lmstudio.baseUrl}
-                      onChange={(e) => updateLlmProvider("lmstudio", "baseUrl", e.target.value)}
-                      placeholder="http://127.0.0.1:1234"
-                    />
-                  </label>
-                </div>
-                <div className="grid gap-2 md:grid-cols-2">
-                  <label className="text-xs text-muted">
-                    Ollama model
-                    <input
-                      className={inputClass}
-                      value={llmSettings.ollama.model}
-                      onChange={(e) => updateLlmProvider("ollama", "model", e.target.value)}
-                      placeholder="example: llama3.2:3b"
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    LM Studio model
-                    <input
-                      className={inputClass}
-                      value={llmSettings.lmstudio.model}
-                      onChange={(e) => updateLlmProvider("lmstudio", "model", e.target.value)}
-                      placeholder="example: qwen2.5"
-                    />
-                  </label>
+                <div className="grid gap-3 md:grid-cols-[280px_1fr]">
+                  <div className="space-y-2">
+                    <label className="text-xs text-muted">
+                      Saved profiles
+                      <select
+                        className={cn(selectClass, "h-[220px]")}
+                        size={8}
+                        value={llmSelectedProfile?.id ?? ""}
+                        onChange={(e) => setLlmSelectedProfileId(e.target.value)}
+                      >
+                        {llmSettings.profiles.map((profile) => (
+                          <option key={profile.id} value={profile.id}>
+                            {profile.name} ({profile.provider}, {profile.scope})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" onClick={addLlmProfile}>Add Profile</Button>
+                      <Button
+                        size="sm"
+                        onClick={deleteSelectedLlmProfile}
+                        disabled={!llmSelectedProfile || llmSettings.profiles.length <= 1}
+                      >
+                        Delete Profile
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    {!llmSelectedProfile && (
+                      <div className="text-xs text-muted">No profile selected.</div>
+                    )}
+                    {llmSelectedProfile && (
+                      <>
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <label className="text-xs text-muted">
+                            Name
+                            <input
+                              className={inputClass}
+                              value={llmSelectedProfile.name}
+                              onChange={(e) => updateSelectedLlmProfile("name", e.target.value)}
+                            />
+                          </label>
+                          <label className="text-xs text-muted">
+                            Provider
+                            <select
+                              className={selectClass}
+                              value={llmSelectedProfile.provider}
+                              onChange={(e) => updateSelectedLlmProfile("provider", e.target.value)}
+                            >
+                              {llmProviderOptions.map((provider) => (
+                                <option key={provider.id} value={provider.id}>
+                                  {provider.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="text-xs text-muted">
+                            Scope
+                            <select
+                              className={selectClass}
+                              value={llmSelectedProfile.scope}
+                              onChange={(e) => updateSelectedLlmProfile("scope", e.target.value)}
+                            >
+                              {llmScopeOptions.map((scope) => (
+                                <option key={scope.id} value={scope.id}>
+                                  {scope.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="text-xs text-muted">
+                            Default model
+                            <input
+                              className={inputClass}
+                              value={llmSelectedProfile.model}
+                              onChange={(e) => updateSelectedLlmProfile("model", e.target.value)}
+                              placeholder="model id"
+                            />
+                          </label>
+                        </div>
+                        <label className="text-xs text-muted">
+                          Base URL
+                          <input
+                            className={inputClass}
+                            value={llmSelectedProfile.baseUrl}
+                            onChange={(e) => updateSelectedLlmProfile("baseUrl", e.target.value)}
+                            placeholder="https://host/v1"
+                          />
+                        </label>
+                        <div className="grid gap-2 md:grid-cols-[1fr_auto_auto] md:items-end">
+                          <label className="text-xs text-muted">
+                            API key (stored in OS keychain)
+                            <input
+                              className={inputClass}
+                              type="password"
+                              autoComplete="off"
+                              value={llmApiKeyDraft}
+                              onChange={(e) => setLlmApiKeyDraft(e.target.value)}
+                              placeholder={
+                                llmSelectedProfile.apiKeyConfigured
+                                  ? "Configured in keychain (enter to replace)"
+                                  : "Enter API key"
+                              }
+                            />
+                          </label>
+                          <Button
+                            size="sm"
+                            onClick={() => void clearLlmApiKeyNow()}
+                            disabled={!llmSelectedProfile.apiKeyConfigured}
+                          >
+                            Clear API Key
+                          </Button>
+                          <label className="flex items-center gap-2 text-xs text-muted">
+                            <input
+                              type="checkbox"
+                              checked={llmSelectedProfile.enabled}
+                              onChange={(e) => updateSelectedLlmProfile("enabled", e.target.checked)}
+                            />
+                            Profile enabled
+                          </label>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            onClick={() => void runLlmConnectionTest()}
+                            disabled={isTestingLlmProfile}
+                          >
+                            {isTestingLlmProfile ? "Testing..." : "Test Connection"}
+                          </Button>
+                          {llmTestResult && (
+                            <span
+                              className={cn(
+                                "text-xs",
+                                llmTestResult.ok ? "text-ok" : "text-[var(--sev-error)]"
+                              )}
+                            >
+                              {llmTestResult.message}
+                            </span>
+                          )}
+                        </div>
+                        {llmTestResult && llmTestResult.detectedModels.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-panel-border px-2 py-2 text-xs text-muted">
+                            <span>Detected models:</span>
+                            {llmTestResult.detectedModels.map((model) => (
+                              <button
+                                key={model}
+                                type="button"
+                                className="rounded-full border border-panel-border px-2 py-1 text-xs text-text hover:bg-white/30"
+                                onClick={() => applyDetectedModel(model)}
+                              >
+                                {model}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
               <div className="grid gap-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
                 <div className="text-xs font-semibold uppercase tracking-wide text-muted">
-                  Cloud + Generic Providers
+                  Local + LAN Discovery
                 </div>
-                <div className="grid gap-2 md:grid-cols-2">
-                  <label className="text-xs text-muted">
-                    OpenAI API key
+                <div className="flex flex-wrap items-center gap-4">
+                  <label className="flex items-center gap-2 text-xs text-muted">
                     <input
-                      className={inputClass}
-                      value={llmSettings.openai.apiKey}
-                      onChange={(e) => updateLlmProvider("openai", "apiKey", e.target.value)}
-                      placeholder="sk-..."
+                      type="checkbox"
+                      checked={llmIncludeNonPrivateInterfaces}
+                      onChange={(e) => setLlmIncludeNonPrivateInterfaces(e.target.checked)}
                     />
+                    Include non-private/VPN interfaces
                   </label>
-                  <label className="text-xs text-muted">
-                    OpenAI model
+                  <label className="flex items-center gap-2 text-xs text-muted">
                     <input
-                      className={inputClass}
-                      value={llmSettings.openai.model}
-                      onChange={(e) => updateLlmProvider("openai", "model", e.target.value)}
-                      placeholder="gpt-4.1-mini"
+                      type="checkbox"
+                      checked={llmIncludeLoopbackInterfaces}
+                      onChange={(e) => setLlmIncludeLoopbackInterfaces(e.target.checked)}
                     />
+                    Include loopback interfaces
                   </label>
-                  <label className="text-xs text-muted">
-                    Gemini API key
-                    <input
-                      className={inputClass}
-                      value={llmSettings.gemini.apiKey}
-                      onChange={(e) => updateLlmProvider("gemini", "apiKey", e.target.value)}
-                      placeholder="AIza..."
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Gemini model
-                    <input
-                      className={inputClass}
-                      value={llmSettings.gemini.model}
-                      onChange={(e) => updateLlmProvider("gemini", "model", e.target.value)}
-                      placeholder="gemini-2.0-flash"
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Claude API key
-                    <input
-                      className={inputClass}
-                      value={llmSettings.claude.apiKey}
-                      onChange={(e) => updateLlmProvider("claude", "apiKey", e.target.value)}
-                      placeholder="sk-ant-..."
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Claude model
-                    <input
-                      className={inputClass}
-                      value={llmSettings.claude.model}
-                      onChange={(e) => updateLlmProvider("claude", "model", e.target.value)}
-                      placeholder="claude-sonnet-4-5"
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Perplexity API key
-                    <input
-                      className={inputClass}
-                      value={llmSettings.perplexity.apiKey}
-                      onChange={(e) => updateLlmProvider("perplexity", "apiKey", e.target.value)}
-                      placeholder="pplx-..."
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Perplexity model
-                    <input
-                      className={inputClass}
-                      value={llmSettings.perplexity.model}
-                      onChange={(e) => updateLlmProvider("perplexity", "model", e.target.value)}
-                      placeholder="sonar-pro"
-                    />
-                  </label>
+                  <Button size="sm" onClick={() => void detectNetworksNow()}>
+                    {isDetectingNetworks ? "Detecting..." : "Detect Networks"}
+                  </Button>
                 </div>
-                <div className="grid gap-2 md:grid-cols-3">
-                  <label className="text-xs text-muted">
-                    Generic endpoint
-                    <input
-                      className={inputClass}
-                      value={llmSettings.openaiCompatible.baseUrl}
-                      onChange={(e) => updateLlmProvider("openaiCompatible", "baseUrl", e.target.value)}
-                      placeholder="https://host/v1"
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Generic API key
-                    <input
-                      className={inputClass}
-                      value={llmSettings.openaiCompatible.apiKey}
-                      onChange={(e) => updateLlmProvider("openaiCompatible", "apiKey", e.target.value)}
-                      placeholder="api key"
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Generic model
-                    <input
-                      className={inputClass}
-                      value={llmSettings.openaiCompatible.model}
-                      onChange={(e) => updateLlmProvider("openaiCompatible", "model", e.target.value)}
-                      placeholder="model id"
-                    />
-                  </label>
-                </div>
+                <label className="text-xs text-muted">
+                  Scan interface
+                  <select
+                    className={selectClass}
+                    value={llmSelectedNetworkId}
+                    onChange={(e) => setLlmSelectedNetworkId(e.target.value)}
+                  >
+                    {llmNetworks.length === 0 && <option value="">No interfaces detected</option>}
+                    {llmNetworks.map((network) => (
+                      <option key={network.id} value={network.id}>
+                        {network.name}: {network.ip} ({network.cidr})
+                        {network.isDefaultCandidate ? " [default]" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </div>
               <label className="text-xs text-muted">
                 Trusted LAN hosts (comma-separated host/IP)
@@ -2192,7 +2842,7 @@ export default function App() {
                 </Button>
                 <Button
                   onClick={() => void scanLanProvidersNow()}
-                  disabled={!llmSettings.allowLanDiscovery || isScanningLan}
+                  disabled={!llmSettings.allowLanDiscovery || isScanningLan || !llmSelectedNetworkId}
                 >
                   {isScanningLan ? "Scanning LAN..." : "Scan LAN Providers"}
                 </Button>
@@ -2201,8 +2851,21 @@ export default function App() {
                 <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3 text-xs text-muted">
                   <div className="mb-1 font-semibold text-text">Detected endpoints</div>
                   {llmCandidates.map((candidate) => (
-                    <div key={`${candidate.providerId}-${candidate.endpoint}`}>
-                      {candidate.providerId} ({candidate.scope}): {candidate.endpoint}
+                    <div
+                      key={`${candidate.providerId}-${candidate.endpoint}`}
+                      className="mb-1 flex flex-wrap items-center justify-between gap-2"
+                    >
+                      <span>
+                        {candidate.providerId} ({candidate.scope}): {candidate.endpoint}
+                        {candidate.networkCidr ? ` | ${candidate.networkCidr}` : ""}
+                      </span>
+                      <Button
+                        size="sm"
+                        onClick={() => applyCandidateToSelectedProfile(candidate)}
+                        disabled={!llmSelectedProfile}
+                      >
+                        Apply to Selected Profile
+                      </Button>
                     </div>
                   ))}
                 </div>
@@ -2628,6 +3291,14 @@ export default function App() {
             </Button>
             <Button
               size="sm"
+              variant="primary"
+              onClick={openLlmAnalysisWindow}
+              disabled={!selected}
+            >
+              Send To LLM
+            </Button>
+            <Button
+              size="sm"
               onClick={() => selected && void exportEvents("json", [selected], `event-${selected.id}.json`)}
               disabled={!selected}
             >
@@ -2646,7 +3317,571 @@ export default function App() {
           </div>
           </footer>
         )}
+
+        {llmWindowOpen && selected && (
+          <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/35 px-4 py-6">
+            <div className="w-full max-w-5xl rounded-xl border border-panel-border bg-[var(--panel-solid)] shadow-xl">
+              <div className="flex items-center justify-between border-b border-panel-border px-4 py-3">
+                <div>
+                  <div className="text-sm font-semibold">LLM Analysis</div>
+                  <div className="text-xs text-muted">
+                    Review original vs redacted context side-by-side, then edit prompt before send. `Copy Event Text` remains unredacted.
+                  </div>
+                </div>
+                <Button size="sm" onClick={() => setLlmWindowOpen(false)}>
+                  Close
+                </Button>
+              </div>
+              <div className="grid gap-3 p-4">
+                <div className="grid gap-2 md:grid-cols-2">
+                  <label className="text-xs text-muted">
+                    Original Event Context (local only, unredacted)
+                    <textarea
+                      className={cn(inputClass, "min-h-40 resize-y font-mono text-xs")}
+                      value={selectedEventOriginalContext}
+                      readOnly
+                    />
+                  </label>
+                  <label className="text-xs text-muted">
+                    Redacted Event Context Preview
+                    <textarea
+                      className={cn(inputClass, "min-h-40 resize-y font-mono text-xs")}
+                      value={selectedEventRedactedContext}
+                      readOnly
+                    />
+                  </label>
+                </div>
+
+                <div className="grid gap-2 md:grid-cols-[1fr_auto] md:items-end">
+                  <label className="text-xs text-muted">
+                    Target local profile
+                    <select
+                      className={selectClass}
+                      value={llmRunProfileId}
+                      onChange={(e) => setLlmRunProfileId(e.target.value)}
+                    >
+                      {llmLocalProfiles.length === 0 && <option value="">No local profiles configured</option>}
+                      {llmLocalProfiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name} ({profile.provider}, {profile.scope})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    <Button size="sm" onClick={rebuildRedactedPrompt}>
+                      Reset Prompt
+                    </Button>
+                    <Button size="sm" onClick={redactPromptNow}>
+                      Redact Now
+                    </Button>
+                    <label className="inline-flex items-center gap-2 whitespace-nowrap text-xs text-muted">
+                      <input
+                        type="checkbox"
+                        checked={llmAutoRedactBeforeSend}
+                        onChange={(e) => setLlmAutoRedactBeforeSend(e.target.checked)}
+                      />
+                      Auto-redact prompt before send (recommended)
+                    </label>
+                    <Button
+                      size="sm"
+                      onClick={() => void copyText(llmPromptDraft)}
+                      disabled={!llmPromptDraft.trim()}
+                    >
+                      Copy Prompt
+                    </Button>
+                  </div>
+                </div>
+
+                <label className="text-xs text-muted">
+                  Outbound Prompt (editable before send)
+                  <textarea
+                    className={cn(inputClass, "min-h-52 resize-y font-mono text-xs")}
+                    value={llmPromptDraft}
+                    onChange={(e) => setLlmPromptDraft(e.target.value)}
+                  />
+                </label>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={() => void runLlmAnalysisNow()}
+                    disabled={isRunningLlmAnalysis || !llmRunProfileId || !llmPromptDraft.trim()}
+                  >
+                    {isRunningLlmAnalysis ? "Running..." : "Run Analysis"}
+                  </Button>
+                  {!llmAutoRedactBeforeSend && (
+                    <span className="rounded-md border border-panel-border bg-[var(--sev-warning)] px-2 py-1 text-xs font-semibold text-text">
+                      Auto-redaction is off. Prompt will be sent exactly as written.
+                    </span>
+                  )}
+                </div>
+
+                {llmRunResult && (
+                  <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] px-3 py-2 text-xs text-muted">
+                    <div className="font-semibold text-text">
+                      Response from {llmRunResult.profileName} ({llmRunResult.model})
+                    </div>
+                    {llmRunResult.warning && (
+                      <div className="mt-1 rounded-md border border-panel-border bg-[var(--sev-warning)] px-2 py-1 text-xs font-semibold text-text">
+                        {llmRunResult.warning}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="grid gap-2 text-xs text-muted">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span>Analysis Response</span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="inline-flex rounded-md border border-panel-border bg-[var(--field-bg)] p-0.5">
+                        <button
+                          type="button"
+                          className={cn(
+                            "rounded px-2 py-1 text-xs transition",
+                            llmResponseViewMode === "formatted"
+                              ? "bg-accent text-white"
+                              : "text-text hover:bg-accent/10"
+                          )}
+                          onClick={() => setLlmResponseViewMode("formatted")}
+                        >
+                          Formatted
+                        </button>
+                        <button
+                          type="button"
+                          className={cn(
+                            "rounded px-2 py-1 text-xs transition",
+                            llmResponseViewMode === "markdown"
+                              ? "bg-accent text-white"
+                              : "text-text hover:bg-accent/10"
+                          )}
+                          onClick={() => setLlmResponseViewMode("markdown")}
+                        >
+                          Markdown
+                        </button>
+                      </div>
+                      <Button
+                        size="sm"
+                        onClick={() => void copyLlmResponseNow()}
+                        disabled={!llmRunResult?.response.trim()}
+                      >
+                        Copy Response
+                      </Button>
+                      <Button
+                        size="sm"
+                        onClick={() => void copyLlmContextAndResponseNow()}
+                        disabled={!llmRunResult}
+                      >
+                        Copy Context + Response
+                      </Button>
+                      <Button
+                        size="sm"
+                        onClick={() => void saveLlmContextAndResponseNow()}
+                        disabled={!llmRunResult}
+                      >
+                        Save Context + Response
+                      </Button>
+                    </div>
+                  </div>
+                  {llmResponseViewMode === "markdown" ? (
+                    <textarea
+                      className={cn(inputClass, "min-h-52 resize-y font-mono text-xs")}
+                      value={llmRunResult?.response ?? ""}
+                      readOnly
+                    />
+                  ) : (
+                    <div className="min-h-52 overflow-auto rounded-lg border border-panel-border bg-[var(--field-bg)] px-3 py-2">
+                      {renderMarkdownPreview(llmRunResult?.response ?? "")}
+                    </div>
+                  )}
+                  <span className="text-[11px]">
+                    Context + response copy/save uses redacted event context and redacted prompt for safer sharing.
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
+
+const helpSectionToTopicMap: Record<HelpSectionId, HelpTopicId> = {
+  "quick-start": "getting-started",
+  "filters": "events",
+  "ingest-vs-backfill": "data",
+  "coverage-warning": "data",
+  "crash-flow": "crashes",
+  "export-prompt": "export",
+  "settings-collection": "settings-llm"
+};
+
+const helpTopics: HelpTopic[] = [
+  {
+    id: "getting-started",
+    label: "Getting Started",
+    summary: "First-time workflow to move from app launch to useful findings quickly.",
+    sections: [
+      {
+        id: "first-ten-minutes",
+        title: "First 10 Minutes",
+        paragraphs: [
+          "Hermes works best when you treat it as a workflow: collect logs, confirm coverage, narrow with filters, then investigate details.",
+          "The top row tabs are your main navigation. Most analysis starts in Data and Events, then moves to Crashes or Export as needed."
+        ],
+        steps: [
+          "Click Refresh Logs to collect live host logs into local cache.",
+          "Open Data and verify the current cache date range covers the incident window you care about.",
+          "Open Events and apply filters (date range, severity, provider, log type).",
+          "Select an event row and use bottom actions (search, prompt, export, send to LLM).",
+          "Use Export for shareable reports or filtered subsets."
+        ]
+      },
+      {
+        id: "what-this-tool-is",
+        title: "What Hermes Is and Is Not",
+        paragraphs: [
+          "Hermes is a host-centric investigation workspace. It is optimized for live log triage, crash correlation, and actionable exports.",
+          "It is not a SIEM replacement and does not perform remote endpoint management in this release."
+        ]
+      }
+    ]
+  },
+  {
+    id: "navigation",
+    label: "Navigation & Layout",
+    summary: "How to move through screens and interpret shared UI patterns.",
+    sections: [
+      {
+        id: "top-bar",
+        title: "Top Actions",
+        paragraphs: [
+          "Refresh Logs runs host collection and updates local cache.",
+          "Help opens this guide. Exit closes the app."
+        ]
+      },
+      {
+        id: "tab-row",
+        title: "Main Tabs",
+        paragraphs: [
+          "Home: high-level cache/health snapshot and recent events.",
+          "Events: detailed log table and filter workflow.",
+          "Crashes: crash records plus pre-crash/correlated event analysis.",
+          "Data: ingest window and explicit range-load controls.",
+          "Import/Export: file-based ingest and guided output.",
+          "Settings: collection and LLM provider configuration."
+        ]
+      },
+      {
+        id: "status-banners",
+        title: "Status Banners",
+        paragraphs: [
+          "Error banners indicate failures that need action.",
+          "Warning banners indicate partial success (for example, collector warnings).",
+          "Green status banners indicate successful operations."
+        ]
+      }
+    ]
+  },
+  {
+    id: "home",
+    label: "Home Dashboard",
+    summary: "Understand current cache health and jump into analysis with context.",
+    sections: [
+      {
+        id: "cards",
+        title: "Dashboard Cards",
+        paragraphs: [
+          "Local Cache card shows number of collected events and date coverage in local memory.",
+          "Imported Session Data card shows additional imported records merged into current session views.",
+          "Crash Records card summarizes crash count and pre-crash focus status."
+        ]
+      },
+      {
+        id: "recent-events",
+        title: "Recent Events List",
+        paragraphs: [
+          "Recent events provide a quick anomaly scan immediately after refresh.",
+          "Clicking a recent event opens it in Events with that row selected for deeper analysis."
+        ]
+      }
+    ]
+  },
+  {
+    id: "events",
+    label: "Events",
+    summary: "Primary event triage workspace with filters, sorting, selection, and actions.",
+    sections: [
+      {
+        id: "filters-usage",
+        title: "Filters and Apply Model",
+        paragraphs: [
+          "Filter inputs are draft values until Apply Filters is clicked.",
+          "Reset Inputs clears draft filter controls. Apply Filters updates the active event table."
+        ],
+        tips: [
+          "Use date filters first to keep result sets focused.",
+          "Provider/source and Event ID are high-signal narrowing controls on noisy systems."
+        ]
+      },
+      {
+        id: "table-usage",
+        title: "Event Table and Selection",
+        paragraphs: [
+          "Click column headers to sort; click rows to select/deselect.",
+          "Selected row details appear in the bottom panel with quick investigation/export actions."
+        ]
+      },
+      {
+        id: "event-actions",
+        title: "Bottom Action Bar",
+        paragraphs: [
+          "Copy Event Text copies original event message (unredacted).",
+          "Search Google and Copy LLM Prompt use redaction rules.",
+          "Send To LLM opens an analysis window with side-by-side original context and redacted outbound prompt editing."
+        ]
+      }
+    ]
+  },
+  {
+    id: "crashes",
+    label: "Crashes",
+    summary: "Crash-to-log correlation to identify probable lead-up conditions.",
+    sections: [
+      {
+        id: "import-crashes",
+        title: "Crash Import and Selection",
+        paragraphs: [
+          "Import Host Crashes loads crash records from host sources and stores them locally.",
+          "Select a crash to inspect metadata and load related events."
+        ]
+      },
+      {
+        id: "pre-crash",
+        title: "Pre-Crash Investigation",
+        paragraphs: [
+          "Investigate Pre-Crash narrows results to events in the selected pre-crash time window.",
+          "If strict window results are empty, Hermes can show correlated fallback events from a wider crash window."
+        ]
+      },
+      {
+        id: "triage-pattern",
+        title: "Recommended Crash Triage Pattern",
+        steps: [
+          "Import crashes and select one crash entry.",
+          "Run pre-crash investigation with a short window first (5-15 minutes).",
+          "Inspect warning/error spikes and repeated providers.",
+          "Use row actions to build external searches or LLM-assisted analysis.",
+          "Export selected evidence for handoff."
+        ],
+        paragraphs: []
+      }
+    ]
+  },
+  {
+    id: "data",
+    label: "Data Collection",
+    summary: "Control what period is collected by default and when to perform explicit historical loads.",
+    sections: [
+      {
+        id: "ingest-window",
+        title: "Ingest Window (Rolling)",
+        paragraphs: [
+          "Ingest Window (days) defines the rolling default range used by Save & Sync and Refresh flows.",
+          "Use this for normal daily operation where recent events are most important."
+        ]
+      },
+      {
+        id: "backfill-range",
+        title: "Backfill / Explicit Range Load",
+        paragraphs: [
+          "Backfill Range is a one-time exact period loader for investigations outside current coverage.",
+          "Load Events fetches that exact span and updates local cache view for analysis."
+        ],
+        tips: [
+          "Use backfill when a date warning appears in Events.",
+          "Prefer narrow date ranges first for faster turnaround."
+        ]
+      }
+    ]
+  },
+  {
+    id: "import",
+    label: "Import",
+    summary: "Merge external JSON/CSV event files into the current session.",
+    sections: [
+      {
+        id: "supported",
+        title: "Supported Import Use",
+        paragraphs: [
+          "Import accepts JSON/CSV event files and merges them into in-memory session data.",
+          "Imported data appears together with local data in analysis views."
+        ]
+      },
+      {
+        id: "import-notes",
+        title: "Operational Notes",
+        paragraphs: [
+          "Imported memory is capped for stability; large imports may be truncated in active memory view.",
+          "Use exports to persist analysis subsets after combining imported and local records."
+        ]
+      }
+    ]
+  },
+  {
+    id: "export",
+    label: "Export",
+    summary: "Create reproducible evidence packages from loaded or custom-filtered event sets.",
+    sections: [
+      {
+        id: "export-scope",
+        title: "Export Scopes",
+        paragraphs: [
+          "Loaded scope exports exactly what is currently in session.",
+          "Custom scope exports records matching wizard criteria (date, severity, type, category, source)."
+        ]
+      },
+      {
+        id: "formats",
+        title: "Formats and Usage",
+        paragraphs: [
+          "JSON is best for machine processing and re-import.",
+          "CSV is best for spreadsheets and quick sorting.",
+          "TXT is best for narrative or ticket attachments."
+        ]
+      },
+      {
+        id: "export-workflow",
+        title: "Export Workflow",
+        steps: [
+          "Pick scope and format.",
+          "Review preview counts and explanatory text.",
+          "Run export and choose save location in dialog.",
+          "Attach output to incident/ticket or team handoff."
+        ],
+        paragraphs: []
+      }
+    ]
+  },
+  {
+    id: "settings-llm",
+    label: "Settings & LLM",
+    summary: "Configure collection behavior, local/cloud profiles, testing, and safe analysis routing.",
+    sections: [
+      {
+        id: "collection-settings",
+        title: "Collection Settings",
+        paragraphs: [
+          "Auto-sync on startup controls whether log collection runs automatically at launch.",
+          "Max events per sync limits per-run collector volume.",
+          "On Windows, selectable channels define which event logs are collected."
+        ]
+      },
+      {
+        id: "profiles",
+        title: "LLM Profiles and Priority",
+        paragraphs: [
+          "Profiles let you store provider-specific endpoints/models and enabled state.",
+          "Default profile is primary. Global backup profile is used as fallback when primary is unavailable."
+        ],
+        tips: [
+          "Use Test Connection before running analysis.",
+          "For local providers, apply detected endpoint results directly into a selected profile."
+        ]
+      },
+      {
+        id: "network-discovery",
+        title: "Network Discovery",
+        paragraphs: [
+          "Detect Local Providers probes localhost defaults for Ollama and LM Studio.",
+          "LAN scan can search selected interface subnet for provider endpoints when enabled."
+        ]
+      },
+      {
+        id: "key-security",
+        title: "API Keys and Secret Storage",
+        paragraphs: [
+          "API keys are stored in OS keychain rather than plain settings files.",
+          "Profile key status shows whether a key is configured; clear/remove is supported per profile."
+        ]
+      }
+    ]
+  },
+  {
+    id: "security",
+    label: "Privacy & Security",
+    summary: "Understand redaction rules, trusted-host controls, and safe operational boundaries.",
+    sections: [
+      {
+        id: "redaction-model",
+        title: "Redaction Model",
+        paragraphs: [
+          "Google search and LLM prompt paths redact sensitive values with `<sensitive info redacted>`.",
+          "Send To LLM window shows original local context and redacted outbound prompt so users can review before send."
+        ]
+      },
+      {
+        id: "trusted-hosts",
+        title: "Trusted Host Policy",
+        paragraphs: [
+          "Trusted LAN hosts list identifies allowed internal endpoints for safer analysis routing.",
+          "When strict setting is enabled, Hermes warns when outbound target host is not trusted."
+        ]
+      },
+      {
+        id: "safety-practices",
+        title: "Recommended Safety Practices",
+        steps: [
+          "Keep auto-redact enabled unless you have a controlled exception process.",
+          "Use local profiles for sensitive incidents whenever possible.",
+          "Review prompt text before send and remove anything unnecessary.",
+          "Export minimal evidence needed for the receiving audience."
+        ],
+        paragraphs: []
+      }
+    ]
+  },
+  {
+    id: "troubleshooting",
+    label: "Troubleshooting",
+    summary: "Common issues, likely causes, and fastest next actions.",
+    sections: [
+      {
+        id: "no-events",
+        title: "No Events After Refresh",
+        paragraphs: [
+          "Check OS permissions and collector access to log sources.",
+          "Increase ingest window, then refresh again.",
+          "Review warning banners for partial-collection errors."
+        ]
+      },
+      {
+        id: "date-warning",
+        title: "Date Coverage Warning in Events",
+        paragraphs: [
+          "Your active filters request dates outside loaded cache.",
+          "Use Data tab to load explicit range, then re-apply filters."
+        ]
+      },
+      {
+        id: "llm-fail",
+        title: "LLM Connection or Analysis Fails",
+        paragraphs: [
+          "Run Test Connection first to validate endpoint and model discovery.",
+          "Confirm selected profile is enabled and API key is set when required.",
+          "Verify local service is running and base URL/port is reachable."
+        ]
+      },
+      {
+        id: "help-not-opening",
+        title: "Help Menu Item Does Not Open",
+        paragraphs: [
+          "Use header Help button as immediate fallback.",
+          "If Tools > Help fails after update, relaunch app to ensure latest build is loaded."
+        ]
+      }
+    ]
+  }
+];

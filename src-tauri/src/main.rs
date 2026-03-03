@@ -16,16 +16,20 @@ use logs::{
     collect_host_events_range_with_windows_channels, detect_host_os, CollectionResult,
     NormalizedEvent,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use settings::{
-    load_export_dir, load_ingest_profile, load_ingest_window_days, load_llm_settings, load_theme,
-    save_export_dir, save_ingest_profile, save_ingest_window_days, save_llm_settings, save_theme,
-    IngestProfile, LlmSettings,
+    load_export_dir, load_ingest_profile, load_ingest_window_days, load_llm_settings_with_migration,
+    load_theme, save_export_dir, save_ingest_profile, save_ingest_window_days, save_llm_settings,
+    save_theme, IngestProfile, LlmConnectionProfile, LlmSettings,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Manager};
+
+const LLM_KEYCHAIN_SERVICE: &str = "hermes-log-analyst.llm";
 
 #[tauri::command]
 fn host_os() -> String {
@@ -165,6 +169,804 @@ fn command_error(subsystem: &str, context: &str, error: impl AsRef<str>) -> Stri
     message
 }
 
+fn set_profile_keychain_secret(profile_id: &str, api_key: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(LLM_KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    entry
+        .set_password(api_key)
+        .map_err(|error| format!("Unable to save API key in OS keychain: {error}"))
+}
+
+fn clear_profile_keychain_secret(profile_id: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(LLM_KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    match entry.delete_credential() {
+        Ok(_) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Unable to clear API key from OS keychain: {error}")),
+    }
+}
+
+fn get_profile_keychain_secret(profile_id: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(LLM_KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    match entry.get_password() {
+        Ok(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Unable to read API key from OS keychain: {error}")),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmConnectionTestResult {
+    ok: bool,
+    provider: String,
+    base_url: String,
+    status_code: Option<u16>,
+    message: String,
+    detected_models: Vec<String>,
+}
+
+fn normalize_base_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn parse_model_ids(value: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+
+    if let Some(entries) = value.get("models").and_then(Value::as_array) {
+        for entry in entries {
+            if let Some(name) = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("model").and_then(Value::as_str))
+            {
+                let model = name.trim();
+                if !model.is_empty() && !models.iter().any(|item: &String| item == model) {
+                    models.push(model.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(entries) = value.get("data").and_then(Value::as_array) {
+        for entry in entries {
+            if let Some(name) = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("model").and_then(Value::as_str))
+            {
+                let model = name.trim();
+                if !model.is_empty() && !models.iter().any(|item: &String| item == model) {
+                    models.push(model.to_string());
+                }
+            }
+        }
+    }
+
+    models.sort();
+    models
+}
+
+fn default_test_result(profile: &LlmConnectionProfile) -> LlmConnectionTestResult {
+    LlmConnectionTestResult {
+        ok: false,
+        provider: profile.provider.clone(),
+        base_url: normalize_base_url(profile.base_url.as_str()),
+        status_code: None,
+        message: "Connection not tested.".to_string(),
+        detected_models: Vec::new(),
+    }
+}
+
+fn test_ollama_connection(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+) -> LlmConnectionTestResult {
+    let endpoint = join_url(base_url, "/api/tags");
+    match client.get(endpoint).send() {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().unwrap_or_default();
+            if !(200..300).contains(&status) {
+                return LlmConnectionTestResult {
+                    ok: false,
+                    provider: "ollama".to_string(),
+                    base_url: base_url.to_string(),
+                    status_code: Some(status),
+                    message: format!("Ollama endpoint responded with HTTP {status}."),
+                    detected_models: Vec::new(),
+                };
+            }
+            let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+            let models = parse_model_ids(&parsed);
+            LlmConnectionTestResult {
+                ok: true,
+                provider: "ollama".to_string(),
+                base_url: base_url.to_string(),
+                status_code: Some(status),
+                message: if models.is_empty() {
+                    "Connected to Ollama, but no local models were reported.".to_string()
+                } else {
+                    format!("Connected to Ollama. Found {} model(s).", models.len())
+                },
+                detected_models: models,
+            }
+        }
+        Err(error) => LlmConnectionTestResult {
+            ok: false,
+            provider: "ollama".to_string(),
+            base_url: base_url.to_string(),
+            status_code: None,
+            message: format!("Failed to connect to Ollama endpoint: {error}"),
+            detected_models: Vec::new(),
+        },
+    }
+}
+
+fn test_openai_compatible_connection(
+    provider: &str,
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> LlmConnectionTestResult {
+    let endpoint = join_url(base_url, "/models");
+    let mut request = client.get(endpoint);
+    if let Some(key) = api_key.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(key);
+    }
+
+    match request.send() {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().unwrap_or_default();
+            if !(200..300).contains(&status) {
+                let auth_hint = if status == 401 || status == 403 {
+                    " Check API key and permissions."
+                } else {
+                    ""
+                };
+                return LlmConnectionTestResult {
+                    ok: false,
+                    provider: provider.to_string(),
+                    base_url: base_url.to_string(),
+                    status_code: Some(status),
+                    message: format!(
+                        "{provider} endpoint responded with HTTP {status}.{auth_hint}",
+                        provider = provider
+                    ),
+                    detected_models: Vec::new(),
+                };
+            }
+            let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+            let models = parse_model_ids(&parsed);
+            LlmConnectionTestResult {
+                ok: true,
+                provider: provider.to_string(),
+                base_url: base_url.to_string(),
+                status_code: Some(status),
+                message: if models.is_empty() {
+                    format!("Connected to {provider}. No models were returned.", provider = provider)
+                } else {
+                    format!(
+                        "Connected to {provider}. Found {} model(s).",
+                        models.len(),
+                        provider = provider
+                    )
+                },
+                detected_models: models,
+            }
+        }
+        Err(error) => LlmConnectionTestResult {
+            ok: false,
+            provider: provider.to_string(),
+            base_url: base_url.to_string(),
+            status_code: None,
+            message: format!("Failed to connect to {provider} endpoint: {error}", provider = provider),
+            detected_models: Vec::new(),
+        },
+    }
+}
+
+fn test_gemini_connection(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> LlmConnectionTestResult {
+    let Some(key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        return LlmConnectionTestResult {
+            ok: false,
+            provider: "gemini".to_string(),
+            base_url: base_url.to_string(),
+            status_code: None,
+            message: "Gemini API key is not configured in keychain.".to_string(),
+            detected_models: Vec::new(),
+        };
+    };
+
+    let endpoint = join_url(base_url, "/models");
+    match client.get(endpoint).query(&[("key", key)]).send() {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().unwrap_or_default();
+            if !(200..300).contains(&status) {
+                return LlmConnectionTestResult {
+                    ok: false,
+                    provider: "gemini".to_string(),
+                    base_url: base_url.to_string(),
+                    status_code: Some(status),
+                    message: format!("Gemini endpoint responded with HTTP {status}."),
+                    detected_models: Vec::new(),
+                };
+            }
+            let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+            let models = parse_model_ids(&parsed);
+            LlmConnectionTestResult {
+                ok: true,
+                provider: "gemini".to_string(),
+                base_url: base_url.to_string(),
+                status_code: Some(status),
+                message: if models.is_empty() {
+                    "Connected to Gemini. No models were returned.".to_string()
+                } else {
+                    format!("Connected to Gemini. Found {} model(s).", models.len())
+                },
+                detected_models: models,
+            }
+        }
+        Err(error) => LlmConnectionTestResult {
+            ok: false,
+            provider: "gemini".to_string(),
+            base_url: base_url.to_string(),
+            status_code: None,
+            message: format!("Failed to connect to Gemini endpoint: {error}"),
+            detected_models: Vec::new(),
+        },
+    }
+}
+
+fn test_claude_connection(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> LlmConnectionTestResult {
+    let Some(key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        return LlmConnectionTestResult {
+            ok: false,
+            provider: "claude".to_string(),
+            base_url: base_url.to_string(),
+            status_code: None,
+            message: "Claude API key is not configured in keychain.".to_string(),
+            detected_models: Vec::new(),
+        };
+    };
+
+    let endpoint = join_url(base_url, "/models");
+    match client
+        .get(endpoint)
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+    {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().unwrap_or_default();
+            if !(200..300).contains(&status) {
+                return LlmConnectionTestResult {
+                    ok: false,
+                    provider: "claude".to_string(),
+                    base_url: base_url.to_string(),
+                    status_code: Some(status),
+                    message: format!("Claude endpoint responded with HTTP {status}."),
+                    detected_models: Vec::new(),
+                };
+            }
+            let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+            let models = parse_model_ids(&parsed);
+            LlmConnectionTestResult {
+                ok: true,
+                provider: "claude".to_string(),
+                base_url: base_url.to_string(),
+                status_code: Some(status),
+                message: if models.is_empty() {
+                    "Connected to Claude. No models were returned.".to_string()
+                } else {
+                    format!("Connected to Claude. Found {} model(s).", models.len())
+                },
+                detected_models: models,
+            }
+        }
+        Err(error) => LlmConnectionTestResult {
+            ok: false,
+            provider: "claude".to_string(),
+            base_url: base_url.to_string(),
+            status_code: None,
+            message: format!("Failed to connect to Claude endpoint: {error}"),
+            detected_models: Vec::new(),
+        },
+    }
+}
+
+fn test_llm_profile_connection_sync(
+    profile: LlmConnectionProfile,
+    api_key: Option<String>,
+) -> LlmConnectionTestResult {
+    let mut result = default_test_result(&profile);
+    let base_url = normalize_base_url(profile.base_url.as_str());
+    if base_url.is_empty() {
+        result.message = "Base URL is required.".to_string();
+        return result;
+    }
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            result.message = format!("Failed to initialize HTTP client: {error}");
+            return result;
+        }
+    };
+
+    let provider = profile.provider.trim().to_ascii_lowercase();
+    match provider.as_str() {
+        "ollama" => test_ollama_connection(&client, base_url.as_str()),
+        "lmstudio" => test_openai_compatible_connection(
+            "lmstudio",
+            &client,
+            base_url.as_str(),
+            api_key.as_deref(),
+        ),
+        "openai" => test_openai_compatible_connection(
+            "openai",
+            &client,
+            base_url.as_str(),
+            api_key.as_deref(),
+        ),
+        "perplexity" => test_openai_compatible_connection(
+            "perplexity",
+            &client,
+            base_url.as_str(),
+            api_key.as_deref(),
+        ),
+        "openai_compatible" => test_openai_compatible_connection(
+            "openai_compatible",
+            &client,
+            base_url.as_str(),
+            api_key.as_deref(),
+        ),
+        "gemini" => test_gemini_connection(&client, base_url.as_str(), api_key.as_deref()),
+        "claude" => test_claude_connection(&client, base_url.as_str(), api_key.as_deref()),
+        _ => LlmConnectionTestResult {
+            ok: false,
+            provider,
+            base_url,
+            status_code: None,
+            message: "Unsupported provider type.".to_string(),
+            detected_models: Vec::new(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmAnalysisResult {
+    ok: bool,
+    profile_id: String,
+    profile_name: String,
+    provider: String,
+    base_url: String,
+    model: String,
+    response: String,
+    fallback_used: bool,
+    warning: Option<String>,
+}
+
+fn provider_is_local_capable(provider: &str) -> bool {
+    matches!(provider, "ollama" | "lmstudio" | "openai_compatible")
+}
+
+fn openai_models_endpoint(base_url: &str) -> String {
+    let base = normalize_base_url(base_url);
+    if base.ends_with("/v1") || base.ends_with("/v1beta") {
+        join_url(base.as_str(), "/models")
+    } else {
+        join_url(base.as_str(), "/v1/models")
+    }
+}
+
+fn openai_chat_endpoint(base_url: &str) -> String {
+    let base = normalize_base_url(base_url);
+    if base.ends_with("/v1") || base.ends_with("/v1beta") {
+        join_url(base.as_str(), "/chat/completions")
+    } else {
+        join_url(base.as_str(), "/v1/chat/completions")
+    }
+}
+
+fn fetch_ollama_models(client: &reqwest::blocking::Client, base_url: &str) -> Result<Vec<String>, String> {
+    let endpoint = join_url(base_url, "/api/tags");
+    let response = client
+        .get(endpoint)
+        .send()
+        .map_err(|error| format!("Failed requesting Ollama model list: {error}"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Ollama model list request failed (HTTP {}).", status.as_u16()));
+    }
+    let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+    Ok(parse_model_ids(&parsed))
+}
+
+fn fetch_openai_compatible_models(
+    provider: &str,
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let endpoint = openai_models_endpoint(base_url);
+    let mut request = client.get(endpoint);
+    if let Some(key) = api_key.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request
+        .send()
+        .map_err(|error| format!("Failed requesting {provider} model list: {error}"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "{provider} model list request failed (HTTP {}).",
+            status.as_u16()
+        ));
+    }
+    let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+    Ok(parse_model_ids(&parsed))
+}
+
+fn resolve_model_for_profile(
+    profile: &LlmConnectionProfile,
+    client: &reqwest::blocking::Client,
+    api_key: Option<&str>,
+) -> Result<String, String> {
+    let configured = profile.model.trim();
+    if !configured.is_empty() {
+        return Ok(configured.to_string());
+    }
+
+    let provider = profile.provider.trim().to_ascii_lowercase();
+    let discovered = match provider.as_str() {
+        "ollama" => fetch_ollama_models(client, profile.base_url.as_str())?,
+        "lmstudio" | "openai_compatible" => fetch_openai_compatible_models(
+            provider.as_str(),
+            client,
+            profile.base_url.as_str(),
+            api_key,
+        )?,
+        _ => Vec::new(),
+    };
+
+    discovered
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No model is configured and none were discovered on the endpoint.".to_string())
+}
+
+fn parse_chat_completion_text(payload: &Value) -> Option<String> {
+    if let Some(content) = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+    {
+        let text = content.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    if let Some(parts) = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    {
+        let mut collected = Vec::new();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    collected.push(trimmed.to_string());
+                }
+            }
+        }
+        if !collected.is_empty() {
+            return Some(collected.join("\n"));
+        }
+    }
+
+    if let Some(text) = payload.get("response").and_then(Value::as_str) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn run_ollama_analysis(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let endpoint = join_url(base_url, "/api/generate");
+    let payload = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false
+    });
+    let response = client
+        .post(endpoint)
+        .json(&payload)
+        .send()
+        .map_err(|error| format!("Failed sending prompt to Ollama: {error}"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Ollama analysis request failed (HTTP {}).", status.as_u16()));
+    }
+    let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+    parse_chat_completion_text(&parsed)
+        .ok_or_else(|| "Ollama response did not include generated text.".to_string())
+}
+
+fn run_openai_compatible_analysis(
+    provider: &str,
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    api_key: Option<&str>,
+) -> Result<String, String> {
+    let endpoint = openai_chat_endpoint(base_url);
+    let payload = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "user", "content": prompt }
+        ],
+        "temperature": 0.2,
+        "stream": false
+    });
+    let mut request = client.post(endpoint).json(&payload);
+    if let Some(key) = api_key.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(key);
+    }
+
+    let response = request
+        .send()
+        .map_err(|error| format!("Failed sending prompt to {provider}: {error}"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "{provider} analysis request failed (HTTP {}).",
+            status.as_u16()
+        ));
+    }
+    let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+    parse_chat_completion_text(&parsed).ok_or_else(|| {
+        format!(
+            "{provider} response did not include assistant text.",
+            provider = provider
+        )
+    })
+}
+
+fn profile_warning_for_settings(profile: &LlmConnectionProfile, settings: &LlmSettings) -> Option<String> {
+    if !settings.never_send_raw_event_to_untrusted {
+        return None;
+    }
+    if profile.scope.trim().eq_ignore_ascii_case("local") {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(profile.base_url.as_str()).ok()?;
+    let host = parsed.host_str()?.trim();
+    if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
+        return None;
+    }
+    if settings
+        .trusted_hosts
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(host))
+    {
+        return None;
+    }
+
+    Some(format!(
+        "Target host '{host}' is not listed in trusted LAN hosts. Prompt content is still redacted.",
+        host = host
+    ))
+}
+
+fn run_profile_analysis(
+    profile: &LlmConnectionProfile,
+    prompt: &str,
+    api_key: Option<&str>,
+) -> Result<(String, String), String> {
+    let provider = profile.provider.trim().to_ascii_lowercase();
+    if !provider_is_local_capable(provider.as_str()) {
+        return Err("Selected profile is not configured as a local-compatible provider.".to_string());
+    }
+    let base_url = normalize_base_url(profile.base_url.as_str());
+    if base_url.is_empty() {
+        return Err("Base URL is required for local LLM analysis.".to_string());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(75))
+        .build()
+        .map_err(|error| format!("Failed to initialize HTTP client: {error}"))?;
+    let model = resolve_model_for_profile(profile, &client, api_key)?;
+    let response = match provider.as_str() {
+        "ollama" => run_ollama_analysis(&client, base_url.as_str(), model.as_str(), prompt)?,
+        "lmstudio" | "openai_compatible" => run_openai_compatible_analysis(
+            provider.as_str(),
+            &client,
+            base_url.as_str(),
+            model.as_str(),
+            prompt,
+            api_key,
+        )?,
+        _ => {
+            return Err("Selected profile is not configured as a local-compatible provider.".to_string());
+        }
+    };
+
+    Ok((model, response))
+}
+
+fn find_profile_by_id<'a>(settings: &'a LlmSettings, profile_id: &str) -> Option<&'a LlmConnectionProfile> {
+    settings
+        .profiles
+        .iter()
+        .find(|profile| profile.id.eq_ignore_ascii_case(profile_id))
+}
+
+fn push_unique_profile(candidates: &mut Vec<LlmConnectionProfile>, profile: &LlmConnectionProfile) {
+    if !candidates
+        .iter()
+        .any(|entry: &LlmConnectionProfile| entry.id == profile.id)
+    {
+        candidates.push(profile.clone());
+    }
+}
+
+fn candidate_profiles_for_analysis(
+    settings: &LlmSettings,
+    requested_profile_id: Option<&str>,
+) -> Result<Vec<LlmConnectionProfile>, String> {
+    let mut candidates = Vec::new();
+
+    if let Some(requested) = requested_profile_id {
+        let Some(profile) = find_profile_by_id(settings, requested) else {
+            return Err("Requested LLM profile was not found.".to_string());
+        };
+        push_unique_profile(&mut candidates, profile);
+    } else if !settings.default_profile_id.trim().is_empty() {
+        if let Some(default_profile) = find_profile_by_id(settings, settings.default_profile_id.as_str()) {
+            push_unique_profile(&mut candidates, default_profile);
+        }
+    }
+
+    if !settings.backup_profile_id.trim().is_empty() {
+        if let Some(backup_profile) = find_profile_by_id(settings, settings.backup_profile_id.as_str()) {
+            push_unique_profile(&mut candidates, backup_profile);
+        }
+    }
+
+    if candidates.is_empty() {
+        for profile in &settings.profiles {
+            if profile.enabled && provider_is_local_capable(profile.provider.as_str()) {
+                push_unique_profile(&mut candidates, profile);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("No local-capable LLM profiles are configured.".to_string());
+    }
+
+    Ok(candidates)
+}
+
+fn analyze_with_local_llm_sync(
+    settings: LlmSettings,
+    prompt: String,
+    requested_profile_id: Option<String>,
+) -> Result<LlmAnalysisResult, String> {
+    let trimmed_prompt = prompt.trim().to_string();
+    if trimmed_prompt.is_empty() {
+        return Err("Prompt is empty.".to_string());
+    }
+    if trimmed_prompt.len() > 80_000 {
+        return Err("Prompt is too large (max 80,000 characters).".to_string());
+    }
+
+    let candidates = candidate_profiles_for_analysis(
+        &settings,
+        requested_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )?;
+
+    let mut errors = Vec::new();
+    for (index, profile) in candidates.iter().enumerate() {
+        if !profile.enabled {
+            errors.push(format!("Profile '{}' is disabled.", profile.name));
+            continue;
+        }
+
+        let provider = profile.provider.trim().to_ascii_lowercase();
+        if !provider_is_local_capable(provider.as_str()) {
+            errors.push(format!(
+                "Profile '{}' provider '{}' is not local-capable.",
+                profile.name, profile.provider
+            ));
+            continue;
+        }
+
+        let api_key = get_profile_keychain_secret(profile.id.as_str())?;
+        match run_profile_analysis(profile, trimmed_prompt.as_str(), api_key.as_deref()) {
+            Ok((model, response)) => {
+                return Ok(LlmAnalysisResult {
+                    ok: true,
+                    profile_id: profile.id.clone(),
+                    profile_name: profile.name.clone(),
+                    provider,
+                    base_url: normalize_base_url(profile.base_url.as_str()),
+                    model,
+                    response,
+                    fallback_used: index > 0,
+                    warning: profile_warning_for_settings(profile, &settings),
+                });
+            }
+            Err(error) => {
+                errors.push(format!("{}: {error}", profile.name));
+            }
+        }
+    }
+
+    Err(format!(
+        "Local LLM analysis failed for all candidate profiles. {}",
+        errors.join(" | ")
+    ))
+}
+
 #[tauri::command]
 async fn refresh_local_events() -> Result<SyncOperationResult, String> {
     let days = load_ingest_window_days();
@@ -287,7 +1089,31 @@ fn set_ingest_profile(profile: IngestProfile) -> Result<IngestProfile, String> {
 
 #[tauri::command]
 fn get_llm_settings() -> LlmSettings {
-    load_llm_settings()
+    let load_result = load_llm_settings_with_migration();
+    if !load_result.migrated_api_keys.is_empty() {
+        for secret in load_result.migrated_api_keys {
+            match set_profile_keychain_secret(secret.profile_id.as_str(), secret.api_key.as_str()) {
+                Ok(_) => {}
+                Err(error) => diagnostics::warn(
+                    "settings",
+                    format!(
+                        "Failed to migrate legacy API key for profile '{}': {error}",
+                        secret.profile_id
+                    ),
+                ),
+            }
+        }
+    }
+
+    if load_result.migrated_from_legacy {
+        if let Err(error) = save_llm_settings(load_result.settings.clone()) {
+            diagnostics::warn(
+                "settings",
+                format!("Failed to persist migrated LLM profile settings: {error}"),
+            );
+        }
+    }
+    load_result.settings
 }
 
 #[tauri::command]
@@ -297,13 +1123,106 @@ fn set_llm_settings(settings: LlmSettings) -> Result<LlmSettings, String> {
 }
 
 #[tauri::command]
+fn set_llm_profile_api_key(profile_id: String, api_key: String) -> Result<LlmSettings, String> {
+    let id = profile_id.trim().to_string();
+    if id.is_empty() {
+        return Err("Profile ID is required.".to_string());
+    }
+    let key = api_key.trim().to_string();
+    if key.is_empty() {
+        return Err("API key is empty. Use clear_llm_profile_api_key to remove keychain values.".to_string());
+    }
+
+    let mut settings = load_llm_settings_with_migration().settings;
+    let Some(profile) = settings.profiles.iter_mut().find(|profile| profile.id == id) else {
+        return Err("Unknown profile ID.".to_string());
+    };
+    set_profile_keychain_secret(id.as_str(), key.as_str())
+        .map_err(|error| command_error("settings", "Failed to save profile API key", error))?;
+    profile.api_key_configured = true;
+    save_llm_settings(settings)
+        .map_err(|error| command_error("settings", "Failed to persist profile key status", error))
+}
+
+#[tauri::command]
+fn clear_llm_profile_api_key(profile_id: String) -> Result<LlmSettings, String> {
+    let id = profile_id.trim().to_string();
+    if id.is_empty() {
+        return Err("Profile ID is required.".to_string());
+    }
+
+    let mut settings = load_llm_settings_with_migration().settings;
+    let Some(profile) = settings.profiles.iter_mut().find(|profile| profile.id == id) else {
+        return Err("Unknown profile ID.".to_string());
+    };
+    clear_profile_keychain_secret(id.as_str())
+        .map_err(|error| command_error("settings", "Failed to clear profile API key", error))?;
+    profile.api_key_configured = false;
+    save_llm_settings(settings)
+        .map_err(|error| command_error("settings", "Failed to persist profile key status", error))
+}
+
+#[tauri::command]
 fn detect_local_llm_providers() -> Vec<llm::LlmEndpointCandidate> {
     llm::detect_local_providers()
 }
 
 #[tauri::command]
-fn scan_lan_llm_providers(max_hosts: Option<u32>) -> Vec<llm::LlmEndpointCandidate> {
-    llm::scan_lan_providers(max_hosts.unwrap_or(256).clamp(16, 1024) as usize)
+fn list_llm_network_interfaces(
+    include_non_private: Option<bool>,
+    include_loopback: Option<bool>,
+) -> Vec<llm::LlmNetworkInterface> {
+    llm::list_network_interfaces(
+        include_non_private.unwrap_or(false),
+        include_loopback.unwrap_or(false),
+    )
+}
+
+#[tauri::command]
+fn scan_lan_llm_providers(
+    interface_id: Option<String>,
+    max_hosts: Option<u32>,
+) -> Vec<llm::LlmEndpointCandidate> {
+    llm::scan_lan_providers(
+        interface_id.as_deref(),
+        max_hosts.unwrap_or(256).clamp(16, 2048) as usize,
+    )
+}
+
+#[tauri::command]
+async fn test_llm_profile_connection(
+    profile: LlmConnectionProfile,
+) -> Result<LlmConnectionTestResult, String> {
+    let api_key = get_profile_keychain_secret(profile.id.as_str())
+        .map_err(|error| command_error("settings", "Failed to read profile API key", error))?;
+    tauri::async_runtime::spawn_blocking(move || test_llm_profile_connection_sync(profile, api_key))
+        .await
+        .map_err(|error| {
+            command_error(
+                "runtime",
+                "Failed to join LLM profile connection test task",
+                error.to_string(),
+            )
+        })
+}
+
+#[tauri::command]
+async fn analyze_with_local_llm(
+    prompt: String,
+    profile_id: Option<String>,
+) -> Result<LlmAnalysisResult, String> {
+    let settings = load_llm_settings_with_migration().settings;
+    tauri::async_runtime::spawn_blocking(move || {
+        analyze_with_local_llm_sync(settings, prompt, profile_id)
+    })
+    .await
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join local LLM analysis task",
+            error.to_string(),
+        )
+    })?
 }
 
 #[tauri::command]
@@ -515,6 +1434,42 @@ fn export_events_with_dialog(
     let payload = build_export_payload(extension, &events)?;
     std::fs::write(&output_path, payload).map_err(|error| {
         command_error("storage", "Failed to write export file", error.to_string())
+    })?;
+    Ok(Some(output_path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn save_text_with_dialog(suggested_filename: String, text: String) -> Result<Option<String>, String> {
+    let preferred_extension = if suggested_filename.to_ascii_lowercase().ends_with(".md") {
+        "md"
+    } else {
+        "txt"
+    };
+
+    let safe_name = sanitize_filename(suggested_filename.as_str(), preferred_extension);
+    let mut dialog = rfd::FileDialog::new()
+        .set_file_name(safe_name.as_str())
+        .add_filter("Text", &["txt"])
+        .add_filter("Markdown", &["md"]);
+
+    if let Some(base_dir) = load_export_dir()
+        .map(PathBuf::from)
+        .or_else(dirs::download_dir)
+        .filter(|path| path.exists() && path.is_dir())
+    {
+        dialog = dialog.set_directory(base_dir);
+    }
+
+    let Some(output_path) = dialog.save_file() else {
+        return Ok(None);
+    };
+
+    std::fs::write(&output_path, text).map_err(|error| {
+        command_error(
+            "storage",
+            "Failed to write text export file",
+            error.to_string(),
+        )
     })?;
     Ok(Some(output_path.to_string_lossy().to_string()))
 }
@@ -810,20 +1765,37 @@ fn main() {
 
     let builder = tauri::Builder::default()
         .setup(setup_menu)
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "theme_system" => apply_theme(app, "system"),
-            "theme_light" => apply_theme(app, "light"),
-            "theme_dark" => apply_theme(app, "dark"),
-            "tools_help" => {
+        .on_menu_event(|app, event| {
+            let menu_id = event.id().as_ref().to_string();
+            diagnostics::info("runtime", format!("Menu event received: id='{menu_id}'"));
+            match menu_id.as_str() {
+                "theme_system" => apply_theme(app, "system"),
+                "theme_light" => apply_theme(app, "light"),
+                "theme_dark" => apply_theme(app, "dark"),
+                "tools_help" | "help" => {
                 if let Err(error) = app.emit("hla://open-help", "quick-start") {
-                    diagnostics::warn(
-                        "runtime",
-                        format!("Failed to emit help-open event: {error}"),
-                    );
+                    diagnostics::warn("runtime", format!("Failed to emit app help-open event: {error}"));
                 }
+                for window in app.webview_windows().values() {
+                    if let Err(error) = window.emit("hla://open-help", "quick-start") {
+                        diagnostics::warn(
+                            "runtime",
+                            format!("Failed to emit help-open event to window: {error}"),
+                        );
+                    }
+                    if let Err(error) = window.eval(
+                        "window.dispatchEvent(new CustomEvent('hermes:open-help', { detail: 'quick-start' }));",
+                    ) {
+                        diagnostics::warn(
+                            "runtime",
+                            format!("Failed to dispatch DOM help-open event to window: {error}"),
+                        );
+                    }
+                }
+                }
+                "app_exit" => app.exit(0),
+                _ => {}
             }
-            "app_exit" => app.exit(0),
-            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             host_os,
@@ -841,8 +1813,13 @@ fn main() {
             set_ingest_profile,
             get_llm_settings,
             set_llm_settings,
+            set_llm_profile_api_key,
+            clear_llm_profile_api_key,
             detect_local_llm_providers,
+            list_llm_network_interfaces,
             scan_lan_llm_providers,
+            test_llm_profile_connection,
+            analyze_with_local_llm,
             backfill_local_events,
             sync_local_events_range,
             get_export_directory,
@@ -850,6 +1827,7 @@ fn main() {
             set_export_directory,
             export_events,
             export_events_with_dialog,
+            save_text_with_dialog,
             quit_app,
             set_app_theme,
             get_saved_theme

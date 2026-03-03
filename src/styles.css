@@ -6,6 +6,7 @@
   :root {
     --bg: #edf2ff;
     --panel: rgba(255, 255, 255, 0.72);
+    --panel-solid: #f8fbff;
     --panel-border: rgba(148, 163, 184, 0.4);
     --field-bg: rgba(255, 255, 255, 0.92);
     --field-bg-disabled: rgba(148, 163, 184, 0.2);
@@ -28,6 +29,7 @@
   :root[data-theme="dark"] {
     --bg: #0b1222;
     --panel: rgba(15, 23, 42, 0.72);
+    --panel-solid: #111a2f;
     --panel-border: rgba(148, 163, 184, 0.18);
     --field-bg: rgba(8, 14, 30, 0.96);
     --field-bg-disabled: rgba(148, 163, 184, 0.14);
@@ -51,6 +53,7 @@
     :root[data-theme="system"] {
       --bg: #0b1222;
       --panel: rgba(15, 23, 42, 0.72);
+      --panel-solid: #111a2f;
       --panel-border: rgba(148, 163, 184, 0.18);
       --field-bg: rgba(8, 14, 30, 0.96);
       --field-bg-disabled: rgba(148, 163, 184, 0.14);
