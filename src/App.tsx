@@ -2147,6 +2147,26 @@ export default function App() {
       return;
     }
 
+    const profile = llmSettings.profiles.find((p) => p.id === llmRunProfileId);
+    if (profile && llmSettings.neverSendRawEventToUntrusted && profile.scope !== "local") {
+      try {
+        const url = new URL(profile.baseUrl);
+        const host = url.hostname.toLowerCase();
+        const isLocalhost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+        const isTrusted = llmSettings.trustedHosts.some((trusted: string) => trusted.toLowerCase() === host);
+        if (!isLocalhost && !isTrusted) {
+          const isRaw = redactSensitiveText(outboundPrompt) !== outboundPrompt;
+          if (isRaw) {
+            setLastError(`Guardrail block: Target host '${host}' is untrusted, and prompt contains sensitive raw data. Please apply redaction or add to trusted hosts.`);
+            return;
+          }
+        }
+      } catch {
+        setLastError("Guardrail block: Profile base URL is invalid.");
+        return;
+      }
+    }
+
     setLastError("");
     setIsRunningLlmAnalysis(true);
     try {

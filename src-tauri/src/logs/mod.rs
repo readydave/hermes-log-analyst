@@ -95,12 +95,13 @@ pub fn collect_host_events_range_with_windows_channels(
     end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
     windows_channels: Option<&[String]>,
+    request_elevation: bool,
 ) -> CollectionResult {
     match detect_host_os() {
         SupportedOs::Windows => {
             windows::collect_events_range_with_channels(start, end, max_events, windows_channels)
         }
-        SupportedOs::Linux => linux::collect_events_range(start, end, max_events),
-        SupportedOs::Macos => macos::collect_events_range(start, end, max_events),
+        SupportedOs::Linux => linux::collect_events_range(start, end, max_events, request_elevation),
+        SupportedOs::Macos => macos::collect_events_range(start, end, max_events, request_elevation),
     }
 }

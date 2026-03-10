@@ -4,10 +4,15 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 pub fn collect_events_range(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
+    request_elevation: bool,
 ) -> CollectionResult {
     let max = max_events.unwrap_or(2000).min(10000) as usize;
     if max == 0 {
@@ -28,9 +33,22 @@ pub fn collect_events_range(
         args.push(format_log_time(value));
     }
 
-    let mut command = Command::new("log");
+    let mut command = if request_elevation {
+        let mut cmd = Command::new("osascript");
+        let shell_args: Vec<String> = args.iter().map(|s| shell_quote(s)).collect();
+        let script = format!(
+            "do shell script \"log {}\" with administrator privileges",
+            shell_args.join(" ")
+        );
+        cmd.arg("-e").arg(script);
+        cmd
+    } else {
+        let mut cmd = Command::new("log");
+        cmd.args(args);
+        cmd
+    };
+
     command
-        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 

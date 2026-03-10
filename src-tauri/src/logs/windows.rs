@@ -74,10 +74,8 @@ fn collect_with_wevtapi(
     let mut result = CollectionResult::default();
 
     for channel in channels {
-        if result.events.len() >= max {
-            break;
-        }
-        match collect_channel_events(*channel, query.as_deref(), max - result.events.len()) {
+        let remaining = max.saturating_sub(result.events.len());
+        match collect_channel_events(*channel, query.as_deref(), remaining) {
             Ok(mut channel_events) => {
                 result.events.append(&mut channel_events);
             }
@@ -123,6 +121,11 @@ fn collect_channel_events(
 
     let _query_handle = EvtHandle(handle);
     let mut events = Vec::new();
+    
+    if max == 0 {
+        return Ok(events);
+    }
+
     let mut handles = vec![0 as EVT_HANDLE; 16];
 
     loop {

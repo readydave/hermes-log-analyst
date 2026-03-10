@@ -8,6 +8,7 @@ pub fn collect_events_range(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
+    request_elevation: bool,
 ) -> CollectionResult {
     let max = max_events.unwrap_or(2000).min(10000) as usize;
     if max == 0 {
@@ -30,9 +31,17 @@ pub fn collect_events_range(
     args.push("-n".to_string());
     args.push(max.to_string());
 
-    let mut command = Command::new("journalctl");
+    let mut command = if request_elevation {
+        let mut cmd = Command::new("pkexec");
+        cmd.arg("journalctl").args(args);
+        cmd
+    } else {
+        let mut cmd = Command::new("journalctl");
+        cmd.args(args);
+        cmd
+    };
+
     command
-        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 

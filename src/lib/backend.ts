@@ -6,6 +6,7 @@ export interface IngestProfile {
   autoSyncOnStartup: boolean;
   maxEventsPerSync: number;
   windowsChannels: string[];
+  requestElevation: boolean;
 }
 
 export interface SyncOperationResult {
@@ -101,52 +102,6 @@ function createDefaultLlmSettings(): LlmSettings {
     preferredLanInterfaceId: ""
   };
 }
-
-function detectBrowserOs(): SupportedOs {
-  if (navigator.userAgent.includes("Windows")) return "windows";
-  if (navigator.userAgent.includes("Mac")) return "macos";
-  return "linux";
-}
-
-export function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
-}
-
-export async function getHostOs(): Promise<SupportedOs> {
-  if (!isTauriRuntime()) return detectBrowserOs();
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  const value = await invoke<string>("host_os");
-  if (value === "windows" || value === "linux" || value === "macos") return value;
-  return detectBrowserOs();
-}
-
-export async function getHostOsVersion(): Promise<string> {
-  if (!isTauriRuntime()) return "Unknown (browser mode)";
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  const value = await invoke<string>("host_os_version");
-  return value?.trim() ? value.trim() : "Unknown (not provided by host)";
-}
-
-export async function getIngestWindowDays(): Promise<number> {
-  if (!isTauriRuntime()) return 7;
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("get_ingest_window_days");
-}
-
-export async function getIngestProfile(): Promise<IngestProfile> {
-  if (!isTauriRuntime()) {
-    return {
-      autoSyncOnStartup: false,
-      maxEventsPerSync: 2000,
-      windowsChannels: ["Application", "System", "Security"]
-    };
-  }
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<IngestProfile>("get_ingest_profile");
 }
 
 export async function setIngestProfile(profile: IngestProfile): Promise<IngestProfile> {
@@ -431,6 +386,23 @@ export async function setAppTheme(theme: ThemeMode): Promise<void> {
   await invoke("set_app_theme", { theme });
 }
 
+export async function quitApp(): Promise<void> {
+  if (!isTauriRuntime()) {
+    window.close();
+    return;
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("quit_app");
+}
+
+export async function setAppTheme(theme: ThemeMode): Promise<void> {
+  if (!isTauriRuntime()) return;
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("set_app_theme", { theme });
+}
+
 export async function getSavedTheme(): Promise<ThemeMode | null> {
   if (!isTauriRuntime()) return null;
 
@@ -439,3 +411,4 @@ export async function getSavedTheme(): Promise<ThemeMode | null> {
   if (theme === "system" || theme === "light" || theme === "dark") return theme;
   return null;
 }
+

@@ -79,6 +79,8 @@ pub struct IngestProfile {
     pub auto_sync_on_startup: bool,
     pub max_events_per_sync: u32,
     pub windows_channels: Vec<String>,
+    #[serde(default)]
+    pub request_elevation: bool,
 }
 
 impl Default for IngestProfile {
@@ -87,6 +89,7 @@ impl Default for IngestProfile {
             auto_sync_on_startup: false,
             max_events_per_sync: DEFAULT_MAX_EVENTS_PER_SYNC,
             windows_channels: DEFAULT_WINDOWS_CHANNELS.iter().map(|value| value.to_string()).collect(),
+            request_elevation: false,
         }
     }
 }
@@ -233,22 +236,6 @@ fn sanitize_ingest_profile(profile: IngestProfile) -> IngestProfile {
                 channels.push(normalized.to_string());
             }
         }
-    }
-    if channels.is_empty() {
-        channels = DEFAULT_WINDOWS_CHANNELS.iter().map(|value| value.to_string()).collect();
-    }
-
-    IngestProfile {
-        auto_sync_on_startup: profile.auto_sync_on_startup,
-        max_events_per_sync: profile
-            .max_events_per_sync
-            .clamp(MIN_MAX_EVENTS_PER_SYNC, MAX_MAX_EVENTS_PER_SYNC),
-        windows_channels: channels,
-    }
-}
-
-pub fn load_ingest_profile() -> IngestProfile {
-    let Ok(path) = ingest_profile_path() else {
         return IngestProfile::default();
     };
     let Ok(raw) = fs::read_to_string(path) else {

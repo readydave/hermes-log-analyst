@@ -326,7 +326,7 @@ fn test_openai_compatible_connection(
     base_url: &str,
     api_key: Option<&str>,
 ) -> LlmConnectionTestResult {
-    let endpoint = join_url(base_url, "/models");
+    let endpoint = openai_models_endpoint(base_url);
     let mut request = client.get(endpoint);
     if let Some(key) = api_key.filter(|value| !value.trim().is_empty()) {
         request = request.bearer_auth(key);
@@ -579,8 +579,8 @@ struct LlmAnalysisResult {
     warning: Option<String>,
 }
 
-fn provider_is_local_capable(provider: &str) -> bool {
-    matches!(provider, "ollama" | "lmstudio" | "openai_compatible")
+fn provider_is_valid(provider: &str) -> bool {
+    matches!(provider, "ollama" | "lmstudio" | "openai_compatible" | "openai" | "gemini" | "claude" | "perplexity")
 }
 
 fn openai_models_endpoint(base_url: &str) -> String {
@@ -786,6 +786,86 @@ fn run_openai_compatible_analysis(
     })
 }
 
+fn run_gemini_analysis(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    api_key: Option<&str>,
+) -> Result<String, String> {
+    let Some(key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        return Err("Gemini API key is required.".to_string());
+    };
+    let path = format!("/models/{model}:generateContent");
+    let endpoint = join_url(base_url, path.as_str());
+    let payload = serde_json::json!({
+        "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
+        "generationConfig": { "temperature": 0.2 }
+    });
+    
+    let response = client.post(endpoint).query(&[("key", key)]).json(&payload).send()
+        .map_err(|e| format!("Failed sending prompt to Gemini: {e}"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Gemini analysis request failed (HTTP {}).", status.as_u16()));
+    }
+    let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+    
+    parsed.get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(Value::as_array)
+        .and_then(|p| p.first())
+        .and_then(|p| p.get("text"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Gemini response did not include generated text.".to_string())
+}
+
+fn run_claude_analysis(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    api_key: Option<&str>,
+) -> Result<String, String> {
+    let Some(key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        return Err("Claude API key is required.".to_string());
+    };
+    let endpoint = join_url(base_url, "/messages");
+    let payload = serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "temperature": 0.2,
+        "messages": [{ "role": "user", "content": prompt }]
+    });
+    
+    let response = client.post(endpoint)
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&payload)
+        .send()
+        .map_err(|e| format!("Failed sending prompt to Claude: {e}"))?;
+    
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Claude analysis request failed (HTTP {}).", status.as_u16()));
+    }
+    let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+    
+    parsed.get("content")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("text"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Claude response did not include generated text.".to_string())
+}
+
 fn profile_warning_for_settings(profile: &LlmConnectionProfile, settings: &LlmSettings) -> Option<String> {
     if !settings.never_send_raw_event_to_untrusted {
         return None;
@@ -818,8 +898,8 @@ fn run_profile_analysis(
     api_key: Option<&str>,
 ) -> Result<(String, String), String> {
     let provider = profile.provider.trim().to_ascii_lowercase();
-    if !provider_is_local_capable(provider.as_str()) {
-        return Err("Selected profile is not configured as a local-compatible provider.".to_string());
+    if !provider_is_valid(provider.as_str()) {
+        return Err("Selected profile is not configured as a compatible provider.".to_string());
     }
     let base_url = normalize_base_url(profile.base_url.as_str());
     if base_url.is_empty() {
@@ -833,7 +913,7 @@ fn run_profile_analysis(
     let model = resolve_model_for_profile(profile, &client, api_key)?;
     let response = match provider.as_str() {
         "ollama" => run_ollama_analysis(&client, base_url.as_str(), model.as_str(), prompt)?,
-        "lmstudio" | "openai_compatible" => run_openai_compatible_analysis(
+        "lmstudio" | "openai_compatible" | "openai" | "perplexity" => run_openai_compatible_analysis(
             provider.as_str(),
             &client,
             base_url.as_str(),
@@ -841,8 +921,10 @@ fn run_profile_analysis(
             prompt,
             api_key,
         )?,
+        "gemini" => run_gemini_analysis(&client, base_url.as_str(), model.as_str(), prompt, api_key)?,
+        "claude" => run_claude_analysis(&client, base_url.as_str(), model.as_str(), prompt, api_key)?,
         _ => {
-            return Err("Selected profile is not configured as a local-compatible provider.".to_string());
+            return Err("Selected profile is not configured as a compatible provider.".to_string());
         }
     };
 
@@ -890,14 +972,14 @@ fn candidate_profiles_for_analysis(
 
     if candidates.is_empty() {
         for profile in &settings.profiles {
-            if profile.enabled && provider_is_local_capable(profile.provider.as_str()) {
+            if profile.enabled && provider_is_valid(profile.provider.as_str()) {
                 push_unique_profile(&mut candidates, profile);
             }
         }
     }
 
     if candidates.is_empty() {
-        return Err("No local-capable LLM profiles are configured.".to_string());
+        return Err("No compatible LLM profiles are configured.".to_string());
     }
 
     Ok(candidates)
@@ -932,9 +1014,9 @@ fn analyze_with_local_llm_sync(
         }
 
         let provider = profile.provider.trim().to_ascii_lowercase();
-        if !provider_is_local_capable(provider.as_str()) {
+        if !provider_is_valid(provider.as_str()) {
             errors.push(format!(
-                "Profile '{}' provider '{}' is not local-capable.",
+                "Profile '{}' provider '{}' is not compatible.",
                 profile.name, profile.provider
             ));
             continue;
@@ -981,6 +1063,7 @@ async fn refresh_local_events() -> Result<SyncOperationResult, String> {
             Some(now),
             Some(profile.max_events_per_sync),
             Some(profile.windows_channels.as_slice()),
+            profile.request_elevation,
         );
         let report = report_collection_outcome("Refresh collection", &outcome)?;
         save_local_events(outcome.events.as_slice())
@@ -1237,6 +1320,7 @@ async fn backfill_local_events(from: String, to: String) -> Result<SyncOperation
             Some(end),
             Some(profile.max_events_per_sync),
             Some(profile.windows_channels.as_slice()),
+            profile.request_elevation,
         );
         let report = report_collection_outcome("Range backfill collection", &outcome)?;
         save_local_events(outcome.events.as_slice())
@@ -1272,6 +1356,7 @@ async fn sync_local_events_range(
             Some(end),
             Some(profile.max_events_per_sync),
             Some(profile.windows_channels.as_slice()),
+            profile.request_elevation,
         );
         let report = report_collection_outcome("Range sync collection", &outcome)?;
         save_local_events(outcome.events.as_slice()).map_err(|error| {
@@ -1622,6 +1707,52 @@ fn configure_linux_runtime_defaults() {
 #[cfg(not(target_os = "linux"))]
 fn configure_linux_runtime_defaults() {}
 
+#[tauri::command]
+fn restart_elevated() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        std::process::Command::new("powershell")
+            .arg("-Command")
+            .arg("Start-Process")
+            .arg("-FilePath")
+            .arg(format!("'{}'", exe_path.display()))
+            .arg("-Verb")
+            .arg("RunAs")
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        std::process::exit(0);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Elevation restart is only supported on Windows.".to_string())
+    }
+}
+
+#[tauri::command]
+fn restart_elevated() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        std::process::Command::new("powershell")
+            .arg("-Command")
+            .arg("Start-Process")
+            .arg("-FilePath")
+            .arg(format!("'{}'", exe_path.display()))
+            .arg("-Verb")
+            .arg("RunAs")
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        std::process::exit(0);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Elevation restart is only supported on Windows.".to_string())
+    }
+}
+
 fn sanitize_filename(filename: &str, extension: &str) -> String {
     let raw_name = Path::new(filename)
         .file_name()
@@ -1802,15 +1933,9 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            host_os,
-            host_os_version,
-            refresh_local_events,
-            get_local_events,
-            get_local_events_range,
-            import_host_crashes,
-            get_crashes,
-            get_crash_related_events,
             open_external_url,
+            restart_elevated,
+            restart_elevated,
             get_ingest_window_days,
             set_ingest_window_days,
             get_ingest_profile,
