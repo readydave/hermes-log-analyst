@@ -162,7 +162,7 @@ interface SortState {
 
 type WorkspaceTab = "home" | "events" | "crashes" | "data" | "import" | "export" | "settings" | "help";
 type ExportScope = "loaded" | "custom";
-type LlmResponseViewMode = "formatted" | "markdown";
+type LlmResponseViewMode = "guide" | "raw";
 type HelpSectionId =
   | "quick-start"
   | "filters"
@@ -431,6 +431,212 @@ function buildEventContextText(
   ].join("\n");
 }
 
+interface LlmAnalysisGuide {
+  summary: string;
+  likelyCauses: string[];
+  riskLevel: string;
+  securityImpact: string;
+  verifyFirst: string[];
+  remediationOptions: string[];
+  escalateIf: string[];
+  confidence: string;
+  missingData: string[];
+  cleanedRaw: string;
+}
+
+const llmGuideSectionMatchers: Array<{
+  key:
+    | "summary"
+    | "likelyCauses"
+    | "riskLevel"
+    | "securityImpact"
+    | "verifyFirst"
+    | "remediationOptions"
+    | "escalateIf"
+    | "confidence"
+    | "missingData";
+  regex: RegExp;
+}> = [
+  { key: "summary", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?summary\b[:\-]*/i },
+  { key: "likelyCauses", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?likely causes?\b[:\-]*/i },
+  { key: "riskLevel", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?risk level\b[:\-]*/i },
+  { key: "securityImpact", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?security impact\b[:\-]*/i },
+  { key: "verifyFirst", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?verify first\b[:\-]*/i },
+  { key: "remediationOptions", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?remediation options?\b[:\-]*/i },
+  { key: "escalateIf", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?escalate if\b[:\-]*/i },
+  { key: "confidence", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?confidence\b[:\-]*/i },
+  { key: "missingData", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?missing data\b[:\-]*/i }
+];
+
+function stripLlmScratchpadNoise(raw: string): string {
+  const noisyPrefix = /^(?:\*+\s*)?(?:wait|let'?s|lets|okay\b|i need to|i will|self-correction|rule \d+|date anomaly|security flag)\b/i;
+  return raw
+    .replace(/\r/g, "")
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      const normalized = trimmed.replace(/^[>\-*•\s]+/, "");
+      return !noisyPrefix.test(normalized);
+    })
+    .join("\n")
+    .trim();
+}
+
+function extractGuideItem(line: string): string {
+  return line
+    .trim()
+    .replace(/^[-*•]\s+/, "")
+    .replace(/^\d+[.)]\s+/, "")
+    .trim();
+}
+
+function parseLlmGuide(raw: string): LlmAnalysisGuide {
+  const cleanedRaw = stripLlmScratchpadNoise(raw);
+  const buckets = {
+    summary: [] as string[],
+    likelyCauses: [] as string[],
+    riskLevel: [] as string[],
+    securityImpact: [] as string[],
+    verifyFirst: [] as string[],
+    remediationOptions: [] as string[],
+    escalateIf: [] as string[],
+    confidence: [] as string[],
+    missingData: [] as string[]
+  };
+  const preface: string[] = [];
+  let currentKey: keyof typeof buckets | null = null;
+
+  for (const sourceLine of cleanedRaw.split("\n")) {
+    const line = sourceLine.trim();
+    if (!line) continue;
+
+    const matchedSection = llmGuideSectionMatchers.find((entry) => entry.regex.test(line));
+    if (matchedSection) {
+      currentKey = matchedSection.key;
+      const remainder = extractGuideItem(line.replace(matchedSection.regex, "").trim());
+      if (remainder) buckets[currentKey].push(remainder);
+      continue;
+    }
+
+    const item = extractGuideItem(line);
+    if (!item) continue;
+    if (currentKey) {
+      buckets[currentKey].push(item);
+    } else {
+      preface.push(item);
+    }
+  }
+
+  const summary = buckets.summary[0] ?? preface[0] ?? "No summary returned.";
+  const riskLevel = buckets.riskLevel[0] ?? "Not specified.";
+  const securityImpact = buckets.securityImpact[0] ?? "Not specified.";
+  const confidence = buckets.confidence[0] ?? "Not specified.";
+
+  const likelyCauses = buckets.likelyCauses.slice(0, 3);
+  const verifyFirst = buckets.verifyFirst.slice(0, 6);
+  const remediationOptions = buckets.remediationOptions.slice(0, 6);
+  const escalateIf = buckets.escalateIf.slice(0, 4);
+  const missingData = buckets.missingData.slice(0, 6);
+
+  return {
+    summary,
+    likelyCauses,
+    riskLevel,
+    securityImpact,
+    verifyFirst,
+    remediationOptions,
+    escalateIf,
+    confidence,
+    missingData,
+    cleanedRaw
+  };
+}
+
+function formatGuideList(items: string[]): string {
+  if (items.length === 0) return "- Not provided";
+  return items.map((item) => `- ${item}`).join("\n");
+}
+
+function buildGuidePlainText(
+  guide: LlmAnalysisGuide,
+  result: LlmAnalysisResult
+): string {
+  return [
+    "Hermes Troubleshooting Guide",
+    `Generated: ${new Date().toLocaleString()}`,
+    `Provider: ${result.profileName}`,
+    `Model: ${result.model}`,
+    "",
+    "1) Summary",
+    guide.summary,
+    "",
+    "2) Likely Causes",
+    formatGuideList(guide.likelyCauses),
+    "",
+    "3) Risk Level",
+    guide.riskLevel,
+    "",
+    "4) Security Impact",
+    guide.securityImpact,
+    "",
+    "5) Verify First",
+    formatGuideList(guide.verifyFirst),
+    "",
+    "6) Remediation Options",
+    formatGuideList(guide.remediationOptions),
+    "",
+    "7) Escalate If",
+    formatGuideList(guide.escalateIf),
+    "",
+    "8) Confidence",
+    guide.confidence,
+    "",
+    "9) Missing Data",
+    formatGuideList(guide.missingData)
+  ].join("\n");
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function buildGuideHtml(guide: LlmAnalysisGuide, result: LlmAnalysisResult): string {
+  const list = (items: string[]) =>
+    items.length === 0
+      ? "<li>Not provided</li>"
+      : items.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  return [
+    "<!doctype html>",
+    "<html><head><meta charset=\"utf-8\"/>",
+    "<title>Hermes Troubleshooting Guide</title>",
+    "<style>",
+    "body{font-family:Segoe UI,Arial,sans-serif;line-height:1.45;color:#111827;margin:32px;}",
+    "h1{margin:0 0 6px 0;font-size:24px;} h2{margin:18px 0 6px 0;font-size:16px;}",
+    ".meta{color:#4b5563;font-size:12px;margin-bottom:14px;} ul{margin:6px 0 0 20px;}",
+    ".card{border:1px solid #d1d5db;padding:12px 14px;border-radius:8px;margin-bottom:10px;}",
+    "</style></head><body>",
+    "<h1>Hermes Troubleshooting Guide</h1>",
+    `<div class="meta">Generated: ${escapeHtml(new Date().toLocaleString())}<br/>Provider: ${escapeHtml(
+      result.profileName
+    )}<br/>Model: ${escapeHtml(result.model)}</div>`,
+    `<div class="card"><h2>1) Summary</h2><div>${escapeHtml(guide.summary)}</div></div>`,
+    `<div class="card"><h2>2) Likely Causes</h2><ul>${list(guide.likelyCauses)}</ul></div>`,
+    `<div class="card"><h2>3) Risk Level</h2><div>${escapeHtml(guide.riskLevel)}</div></div>`,
+    `<div class="card"><h2>4) Security Impact</h2><div>${escapeHtml(guide.securityImpact)}</div></div>`,
+    `<div class="card"><h2>5) Verify First</h2><ul>${list(guide.verifyFirst)}</ul></div>`,
+    `<div class="card"><h2>6) Remediation Options</h2><ul>${list(guide.remediationOptions)}</ul></div>`,
+    `<div class="card"><h2>7) Escalate If</h2><ul>${list(guide.escalateIf)}</ul></div>`,
+    `<div class="card"><h2>8) Confidence</h2><div>${escapeHtml(guide.confidence)}</div></div>`,
+    `<div class="card"><h2>9) Missing Data</h2><ul>${list(guide.missingData)}</ul></div>`,
+    "</body></html>"
+  ].join("");
+}
+
 function renderInlineMarkdown(value: string, keyPrefix: string) {
   const segments = value.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean);
   return segments.map((segment, index) => {
@@ -659,10 +865,11 @@ export default function App() {
   const [copyEventTextStatus, setCopyEventTextStatus] = useState<"idle" | "copied">("idle");
   const [llmWindowOpen, setLlmWindowOpen] = useState(false);
   const [llmPromptDraft, setLlmPromptDraft] = useState("");
-  const [llmAutoRedactBeforeSend, setLlmAutoRedactBeforeSend] = useState(true);
+  const [llmPromptWasRedacted, setLlmPromptWasRedacted] = useState(false);
+  const [llmPromptPreRedactionDraft, setLlmPromptPreRedactionDraft] = useState("");
   const [llmRunProfileId, setLlmRunProfileId] = useState("");
   const [llmRunResult, setLlmRunResult] = useState<LlmAnalysisResult | null>(null);
-  const [llmResponseViewMode, setLlmResponseViewMode] = useState<LlmResponseViewMode>("formatted");
+  const [llmResponseViewMode, setLlmResponseViewMode] = useState<LlmResponseViewMode>("guide");
   const [isRunningLlmAnalysis, setIsRunningLlmAnalysis] = useState(false);
   const [exportStatus, setExportStatus] = useState<string>("");
   const tableContainerRef = useRef<HTMLElement | null>(null);
@@ -763,6 +970,10 @@ export default function App() {
   const selectedEventRedactedContext = useMemo(
     () => redactSensitiveText(selectedEventOriginalContext),
     [selectedEventOriginalContext]
+  );
+  const llmParsedGuide = useMemo(
+    () => parseLlmGuide(llmRunResult?.response ?? ""),
+    [llmRunResult?.response]
   );
   const exportCategoryOptions = useMemo(() => {
     const values = new Set<EventCategory>();
@@ -1520,31 +1731,69 @@ export default function App() {
 
   function openLlmAnalysisWindow(): void {
     if (!selected) return;
-    const prompt = buildLlmPrompt(selected, hostOsVersion);
+    const prompt = buildLlmPrompt(selected, hostOsVersion, false);
     const preferredProfileId =
       llmLocalProfiles.find((profile) => profile.id === llmSettings.defaultProfileId)?.id ??
       llmLocalProfiles[0]?.id ??
       "";
 
     setLlmPromptDraft(prompt);
-    setLlmAutoRedactBeforeSend(true);
+    setLlmPromptWasRedacted(false);
+    setLlmPromptPreRedactionDraft("");
     setLlmRunProfileId(preferredProfileId);
     setLlmRunResult(null);
-    setLlmResponseViewMode("formatted");
+    setLlmResponseViewMode("guide");
     setLlmWindowOpen(true);
   }
 
-  function rebuildRedactedPrompt(): void {
+  function rebuildPrompt(): void {
     if (!selected) return;
-    setLlmPromptDraft(buildLlmPrompt(selected, hostOsVersion));
-    setExportStatus("Prompt reset using redacted event context.");
+    setLlmPromptDraft(buildLlmPrompt(selected, hostOsVersion, false));
+    setLlmPromptWasRedacted(false);
+    setLlmPromptPreRedactionDraft("");
+    setExportStatus("Prompt reset (unredacted).");
     window.setTimeout(() => setExportStatus(""), 2000);
   }
 
-  function redactPromptNow(): void {
-    setLlmPromptDraft((current) => redactSensitiveText(current));
-    setExportStatus("Prompt redaction applied.");
-    window.setTimeout(() => setExportStatus(""), 2000);
+  function togglePromptRedaction(): void {
+    if (llmPromptWasRedacted) {
+      if (llmPromptPreRedactionDraft.trim()) {
+        setLlmPromptDraft(llmPromptPreRedactionDraft);
+      } else if (selected) {
+        setLlmPromptDraft(buildLlmPrompt(selected, hostOsVersion, false));
+      }
+      setLlmPromptWasRedacted(false);
+      setLlmPromptPreRedactionDraft("");
+      setExportStatus("Redaction removed from prompt.");
+      window.setTimeout(() => setExportStatus(""), 2000);
+      return;
+    }
+
+    setLlmPromptDraft((current) => {
+      const redacted = redactSensitiveText(current);
+      if (redacted !== current) {
+        setLlmPromptPreRedactionDraft(current);
+        setLlmPromptWasRedacted(true);
+        setExportStatus("Prompt redaction applied.");
+      } else {
+        setLlmPromptPreRedactionDraft("");
+        setLlmPromptWasRedacted(false);
+        setExportStatus("No sensitive values detected to redact.");
+      }
+      window.setTimeout(() => setExportStatus(""), 2000);
+      return redacted;
+    });
+  }
+
+  function onLlmPromptDraftChange(nextValue: string): void {
+    setLlmPromptDraft(nextValue);
+    if (llmPromptWasRedacted && llmPromptPreRedactionDraft.trim()) {
+      // User edited the redacted prompt; restoring original draft no longer maps cleanly.
+      setLlmPromptPreRedactionDraft("");
+    }
+    if (llmPromptWasRedacted && !nextValue.includes("<sensitive info redacted>")) {
+      setLlmPromptWasRedacted(false);
+    }
   }
 
   async function runLlmAnalysisNow(): Promise<void> {
@@ -1553,15 +1802,10 @@ export default function App() {
       setLastError("No local LLM profile is selected.");
       return;
     }
-    const outboundPrompt = (
-      llmAutoRedactBeforeSend ? redactSensitiveText(llmPromptDraft) : llmPromptDraft
-    ).trim();
+    const outboundPrompt = llmPromptDraft.trim();
     if (!outboundPrompt) {
       setLastError("LLM prompt is empty.");
       return;
-    }
-    if (llmAutoRedactBeforeSend && outboundPrompt !== llmPromptDraft) {
-      setLlmPromptDraft(outboundPrompt);
     }
 
     setLastError("");
@@ -1582,49 +1826,51 @@ export default function App() {
     }
   }
 
-  async function copyLlmResponseNow(): Promise<void> {
-    if (!llmRunResult?.response.trim()) return;
+  async function copyLlmGuideNow(): Promise<void> {
+    if (!llmRunResult) return;
     setLastError("");
     try {
-      await copyText(llmRunResult.response);
-      setExportStatus("Analysis response copied.");
+      await copyText(buildGuidePlainText(llmParsedGuide, llmRunResult));
+      setExportStatus("Troubleshooting guide copied.");
       window.setTimeout(() => setExportStatus(""), 2000);
     } catch (error) {
-      setLastError(error instanceof Error ? error.message : "Failed to copy analysis response.");
+      setLastError(error instanceof Error ? error.message : "Failed to copy troubleshooting guide.");
     }
   }
 
-  async function copyLlmContextAndResponseNow(): Promise<void> {
+  async function exportLlmGuideTextNow(): Promise<void> {
     if (!llmRunResult) return;
     setLastError("");
     try {
-      const promptForShare = redactSensitiveText(llmPromptDraft);
-      const bundle = buildLlmShareBundle(selectedEventRedactedContext, promptForShare, llmRunResult);
-      await copyText(bundle);
-      setExportStatus("Redacted context + response copied.");
-      window.setTimeout(() => setExportStatus(""), 2200);
-    } catch (error) {
-      setLastError(error instanceof Error ? error.message : "Failed to copy context and response.");
-    }
-  }
-
-  async function saveLlmContextAndResponseNow(): Promise<void> {
-    if (!llmRunResult) return;
-    setLastError("");
-    try {
-      const promptForShare = redactSensitiveText(llmPromptDraft);
-      const bundle = buildLlmShareBundle(selectedEventRedactedContext, promptForShare, llmRunResult);
-      const filename = `llm-analysis-${formatExportTimestamp()}.txt`;
-      const location = await saveTextWithDialog(filename, bundle);
+      const filename = `troubleshooting-guide-${formatExportTimestamp()}.txt`;
+      const location = await saveTextWithDialog(filename, buildGuidePlainText(llmParsedGuide, llmRunResult));
       if (!location) {
-        setExportStatus("Save canceled.");
+        setExportStatus("Export canceled.");
         window.setTimeout(() => setExportStatus(""), 2000);
         return;
       }
-      setExportStatus(`Saved context + response to ${location}`);
+      setExportStatus(`Guide exported: ${location}`);
       window.setTimeout(() => setExportStatus(""), 2600);
     } catch (error) {
-      setLastError(error instanceof Error ? error.message : "Failed to save context and response.");
+      setLastError(error instanceof Error ? error.message : "Failed to export guide.");
+    }
+  }
+
+  async function exportLlmGuideHtmlNow(): Promise<void> {
+    if (!llmRunResult) return;
+    setLastError("");
+    try {
+      const filename = `troubleshooting-guide-${formatExportTimestamp()}.html`;
+      const location = await saveTextWithDialog(filename, buildGuideHtml(llmParsedGuide, llmRunResult));
+      if (!location) {
+        setExportStatus("Export canceled.");
+        window.setTimeout(() => setExportStatus(""), 2000);
+        return;
+      }
+      setExportStatus(`PDF-ready guide exported: ${location}`);
+      window.setTimeout(() => setExportStatus(""), 2600);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to export PDF-ready guide.");
     }
   }
 
@@ -1772,12 +2018,14 @@ export default function App() {
       provider: nextProvider,
       scope: mappedScope,
       baseUrl: candidate.endpoint,
+      model: "",
       enabled: true
     };
     updateLlmProfile(llmSelectedProfile.id, {
       provider: nextProvider,
       scope: mappedScope,
       baseUrl: candidate.endpoint,
+      model: "",
       enabled: true
     });
     if (candidate.interfaceId.trim()) {
@@ -1805,10 +2053,20 @@ export default function App() {
     try {
       const result = await testLlmProfileConnection(profile);
       setLlmTestResult(result);
-      if (result.ok && result.detectedModels.length > 0 && !profile.model.trim()) {
+      if (result.ok && result.detectedModels.length > 0) {
+        const currentModel = profile.model.trim();
         const autoModel = result.detectedModels[0];
-        updateLlmProfile(profile.id, { model: autoModel });
-        setExportStatus(`${result.message} Auto-selected model: ${autoModel}.`);
+        if (!currentModel) {
+          updateLlmProfile(profile.id, { model: autoModel });
+          setExportStatus(`${result.message} Auto-selected model: ${autoModel}.`);
+        } else if (!result.detectedModels.includes(currentModel)) {
+          updateLlmProfile(profile.id, { model: autoModel });
+          setExportStatus(
+            `${result.message} Model '${currentModel}' was not found on this endpoint. Auto-selected: ${autoModel}.`
+          );
+        } else {
+          setExportStatus(result.message);
+        }
       } else {
         setExportStatus(result.message);
       }
@@ -2585,19 +2843,6 @@ export default function App() {
               <label className="flex items-center gap-2 text-xs text-muted">
                 <input
                   type="checkbox"
-                  checked={llmSettings.allowLanDiscovery}
-                  onChange={(e) =>
-                    setLlmSettingsState((current) => ({
-                      ...current,
-                      allowLanDiscovery: e.target.checked
-                    }))
-                  }
-                />
-                Allow LAN provider discovery (use only on trusted networks)
-              </label>
-              <label className="flex items-center gap-2 text-xs text-muted">
-                <input
-                  type="checkbox"
                   checked={llmSettings.neverSendRawEventToUntrusted}
                   onChange={(e) =>
                     setLlmSettingsState((current) => ({
@@ -2778,6 +3023,19 @@ export default function App() {
                 <div className="text-xs font-semibold uppercase tracking-wide text-muted">
                   Local + LAN Discovery
                 </div>
+                <label className="flex items-center gap-2 text-xs text-muted">
+                  <input
+                    type="checkbox"
+                    checked={llmSettings.allowLanDiscovery}
+                    onChange={(e) =>
+                      setLlmSettingsState((current) => ({
+                        ...current,
+                        allowLanDiscovery: e.target.checked
+                      }))
+                    }
+                  />
+                  Allow LAN provider discovery (use only on trusted networks)
+                </label>
                 <div className="flex flex-wrap items-center gap-4">
                   <label className="flex items-center gap-2 text-xs text-muted">
                     <input
@@ -3320,7 +3578,7 @@ export default function App() {
 
         {llmWindowOpen && selected && (
           <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/35 px-4 py-6">
-            <div className="w-full max-w-5xl rounded-xl border border-panel-border bg-[var(--panel-solid)] shadow-xl">
+            <div className="flex max-h-[calc(100vh-3rem)] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-panel-border bg-[var(--panel-solid)] shadow-xl">
               <div className="flex items-center justify-between border-b border-panel-border px-4 py-3">
                 <div>
                   <div className="text-sm font-semibold">LLM Analysis</div>
@@ -3332,7 +3590,7 @@ export default function App() {
                   Close
                 </Button>
               </div>
-              <div className="grid gap-3 p-4">
+              <div className="grid gap-3 overflow-y-auto p-4">
                 <div className="grid gap-2 md:grid-cols-2">
                   <label className="text-xs text-muted">
                     Original Event Context (local only, unredacted)
@@ -3369,20 +3627,12 @@ export default function App() {
                     </select>
                   </label>
                   <div className="flex flex-wrap items-center justify-end gap-2">
-                    <Button size="sm" onClick={rebuildRedactedPrompt}>
+                    <Button size="sm" onClick={rebuildPrompt}>
                       Reset Prompt
                     </Button>
-                    <Button size="sm" onClick={redactPromptNow}>
-                      Redact Now
+                    <Button size="sm" onClick={togglePromptRedaction}>
+                      {llmPromptWasRedacted ? "Remove Redaction" : "Redact Now"}
                     </Button>
-                    <label className="inline-flex items-center gap-2 whitespace-nowrap text-xs text-muted">
-                      <input
-                        type="checkbox"
-                        checked={llmAutoRedactBeforeSend}
-                        onChange={(e) => setLlmAutoRedactBeforeSend(e.target.checked)}
-                      />
-                      Auto-redact prompt before send (recommended)
-                    </label>
                     <Button
                       size="sm"
                       onClick={() => void copyText(llmPromptDraft)}
@@ -3398,7 +3648,7 @@ export default function App() {
                   <textarea
                     className={cn(inputClass, "min-h-52 resize-y font-mono text-xs")}
                     value={llmPromptDraft}
-                    onChange={(e) => setLlmPromptDraft(e.target.value)}
+                    onChange={(e) => onLlmPromptDraftChange(e.target.value)}
                   />
                 </label>
 
@@ -3411,11 +3661,11 @@ export default function App() {
                   >
                     {isRunningLlmAnalysis ? "Running..." : "Run Analysis"}
                   </Button>
-                  {!llmAutoRedactBeforeSend && (
-                    <span className="rounded-md border border-panel-border bg-[var(--sev-warning)] px-2 py-1 text-xs font-semibold text-text">
-                      Auto-redaction is off. Prompt will be sent exactly as written.
-                    </span>
-                  )}
+                  <span className="rounded-md border border-panel-border bg-[var(--field-bg)] px-2 py-1 text-xs font-semibold text-text">
+                    {llmPromptWasRedacted
+                      ? "Prompt is redacted. Run Analysis sends redacted text."
+                      : "Prompt is unredacted. Run Analysis sends it as shown."}
+                  </span>
                 </div>
 
                 {llmRunResult && (
@@ -3433,70 +3683,151 @@ export default function App() {
 
                 <div className="grid gap-2 text-xs text-muted">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span>Analysis Response</span>
+                    <span>Troubleshooting Guide</span>
                     <div className="flex flex-wrap items-center gap-2">
                       <div className="inline-flex rounded-md border border-panel-border bg-[var(--field-bg)] p-0.5">
                         <button
                           type="button"
                           className={cn(
                             "rounded px-2 py-1 text-xs transition",
-                            llmResponseViewMode === "formatted"
+                            llmResponseViewMode === "guide"
                               ? "bg-accent text-white"
                               : "text-text hover:bg-accent/10"
                           )}
-                          onClick={() => setLlmResponseViewMode("formatted")}
+                          onClick={() => setLlmResponseViewMode("guide")}
                         >
-                          Formatted
+                          Guide
                         </button>
                         <button
                           type="button"
                           className={cn(
                             "rounded px-2 py-1 text-xs transition",
-                            llmResponseViewMode === "markdown"
+                            llmResponseViewMode === "raw"
                               ? "bg-accent text-white"
                               : "text-text hover:bg-accent/10"
                           )}
-                          onClick={() => setLlmResponseViewMode("markdown")}
+                          onClick={() => setLlmResponseViewMode("raw")}
                         >
-                          Markdown
+                          Raw
                         </button>
                       </div>
                       <Button
                         size="sm"
-                        onClick={() => void copyLlmResponseNow()}
-                        disabled={!llmRunResult?.response.trim()}
+                        onClick={() => void copyLlmGuideNow()}
+                        disabled={!llmRunResult}
                       >
-                        Copy Response
+                        Copy Guide
                       </Button>
                       <Button
                         size="sm"
-                        onClick={() => void copyLlmContextAndResponseNow()}
+                        onClick={() => void exportLlmGuideTextNow()}
                         disabled={!llmRunResult}
                       >
-                        Copy Context + Response
+                        Export TXT
                       </Button>
                       <Button
                         size="sm"
-                        onClick={() => void saveLlmContextAndResponseNow()}
+                        onClick={() => void exportLlmGuideHtmlNow()}
                         disabled={!llmRunResult}
                       >
-                        Save Context + Response
+                        Export HTML (PDF-ready)
                       </Button>
                     </div>
                   </div>
-                  {llmResponseViewMode === "markdown" ? (
+                  {llmResponseViewMode === "raw" ? (
                     <textarea
-                      className={cn(inputClass, "min-h-52 resize-y font-mono text-xs")}
+                      className={cn(inputClass, "max-h-[45vh] min-h-52 resize-y font-mono text-xs")}
                       value={llmRunResult?.response ?? ""}
                       readOnly
                     />
                   ) : (
-                    <div className="min-h-52 overflow-auto rounded-lg border border-panel-border bg-[var(--field-bg)] px-3 py-2">
-                      {renderMarkdownPreview(llmRunResult?.response ?? "")}
+                    <div className="max-h-[45vh] min-h-52 overflow-y-auto rounded-lg border border-panel-border bg-[var(--field-bg)] px-3 py-2 text-sm text-text">
+                      {!llmRunResult ? (
+                        <p className="text-muted">No response yet. Run analysis to generate a guide.</p>
+                      ) : (
+                      <div className="space-y-3">
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">1) Summary</div>
+                          <p className="mt-1">{llmParsedGuide.summary}</p>
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">2) Likely Causes</div>
+                          {llmParsedGuide.likelyCauses.length > 0 ? (
+                            <ul className="mt-1 ml-5 list-disc space-y-1">
+                              {llmParsedGuide.likelyCauses.map((item, index) => (
+                                <li key={`guide-cause-${index}`}>{item}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="mt-1 text-muted">Not provided.</p>
+                          )}
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">3) Risk Level</div>
+                          <p className="mt-1">{llmParsedGuide.riskLevel}</p>
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">4) Security Impact</div>
+                          <p className="mt-1">{llmParsedGuide.securityImpact}</p>
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">5) Verify First</div>
+                          {llmParsedGuide.verifyFirst.length > 0 ? (
+                            <ul className="mt-1 ml-5 list-disc space-y-1">
+                              {llmParsedGuide.verifyFirst.map((item, index) => (
+                                <li key={`guide-verify-${index}`}>{item}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="mt-1 text-muted">Not provided.</p>
+                          )}
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">6) Remediation Options</div>
+                          {llmParsedGuide.remediationOptions.length > 0 ? (
+                            <ul className="mt-1 ml-5 list-disc space-y-1">
+                              {llmParsedGuide.remediationOptions.map((item, index) => (
+                                <li key={`guide-remediate-${index}`}>{item}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="mt-1 text-muted">Not provided.</p>
+                          )}
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">7) Escalate If</div>
+                          {llmParsedGuide.escalateIf.length > 0 ? (
+                            <ul className="mt-1 ml-5 list-disc space-y-1">
+                              {llmParsedGuide.escalateIf.map((item, index) => (
+                                <li key={`guide-escalate-${index}`}>{item}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="mt-1 text-muted">Not provided.</p>
+                          )}
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">8) Confidence</div>
+                          <p className="mt-1">{llmParsedGuide.confidence}</p>
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">9) Missing Data</div>
+                          {llmParsedGuide.missingData.length > 0 ? (
+                            <ul className="mt-1 ml-5 list-disc space-y-1">
+                              {llmParsedGuide.missingData.map((item, index) => (
+                                <li key={`guide-missing-${index}`}>{item}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="mt-1 text-muted">Not provided.</p>
+                          )}
+                        </section>
+                      </div>
+                      )}
                     </div>
                   )}
                   <span className="text-[11px]">
-                    Context + response copy/save uses redacted event context and redacted prompt for safer sharing.
+                    `Export HTML (PDF-ready)` creates a clean report file you can open in a browser and print to PDF.
                   </span>
                 </div>
               </div>

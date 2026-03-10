@@ -1440,8 +1440,11 @@ fn export_events_with_dialog(
 
 #[tauri::command]
 fn save_text_with_dialog(suggested_filename: String, text: String) -> Result<Option<String>, String> {
-    let preferred_extension = if suggested_filename.to_ascii_lowercase().ends_with(".md") {
+    let lower_name = suggested_filename.to_ascii_lowercase();
+    let preferred_extension = if lower_name.ends_with(".md") {
         "md"
+    } else if lower_name.ends_with(".html") || lower_name.ends_with(".htm") {
+        "html"
     } else {
         "txt"
     };
@@ -1450,7 +1453,8 @@ fn save_text_with_dialog(suggested_filename: String, text: String) -> Result<Opt
     let mut dialog = rfd::FileDialog::new()
         .set_file_name(safe_name.as_str())
         .add_filter("Text", &["txt"])
-        .add_filter("Markdown", &["md"]);
+        .add_filter("Markdown", &["md"])
+        .add_filter("HTML", &["html", "htm"]);
 
     if let Some(base_dir) = load_export_dir()
         .map(PathBuf::from)

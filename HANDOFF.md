@@ -435,6 +435,115 @@ Result:
   - Re-run GUI-only checks in an interactive desktop session (manual operator pass) after display/backend stabilization.
 - Owner: dave
 
+## Platform Validation Result - Windows 11 (Live Data Only)
+
+### Validation Record
+- Date: 2026-03-03
+- Operator: codex (automated shell pass)
+- Machine label: SUPLTV9N71
+- OS + version: Microsoft Windows 11 Pro (10.0.26200)
+- Repo commit (`git rev-parse --short HEAD`): `962eefd`
+- Branch: `main`
+
+### Preflight Environment Check
+1. `npm install` -> success (`up to date`, `found 0 vulnerabilities`).
+2. `npm run build` -> success (TypeScript + Vite build completed).
+3. `npm run tauri info` -> success.
+4. Missing toolchain/runtime dependencies observed:
+   - none for Tauri/desktop build path on this host.
+
+Result:
+- Build status: `pass`
+- Tauri info status: `pass`
+- Notes:
+  - WebView2, MSVC Build Tools 2022, rust/cargo/rustup detected.
+  - `wry` reported one patch-version behind latest (`0.54.1` vs `0.54.2`), non-blocking.
+
+### Live Log Readiness Check (No Dummy Data)
+1. Attempted `npm run tauri dev` from automation shell; process did not complete within command timeout (`exit 124`), and this run was non-interactive.
+2. Host cache evidence (local-only):
+   - `Test-Path %LOCALAPPDATA%\hermes-log-analyst\events.db` -> `True`
+   - DB metadata present: `C:\Users\dave.kahlbaugh\AppData\Local\hermes-log-analyst\events.db` (`Length: 22,106,112`)
+   - SQLite query (via Python stdlib):
+     - `select count(*) from events` -> `3537`
+     - `select coalesce(sum(imported),0) from events` -> `0`
+     - `select min(timestamp), max(timestamp) from events` -> `2026-02-16T14:39:16.6212712Z` to `2026-02-23T13:15:04.1451445Z`
+3. Diagnostics logs found at `%LOCALAPPDATA%\hermes-log-analyst\logs`; latest file `diagnostics-2026-03-03.log`.
+
+Result:
+- Live event collection status: `pass-with-caveat`
+- Approx live events visible: `3537` in local cache (all local, imported sum `0`)
+- Collector warnings/errors: none matched in latest diagnostics file for this automated pass
+- Notes:
+  - No dummy/imported data was used for evidence.
+  - Interactive in-app clicks (`Refresh Logs`, table filter/sort verification in UI) remain manual validation items.
+
+### Core Functional Validation
+1. Refresh collection succeeds and updates data window.
+2. Date-range `Load Events` succeeds with expected status messages.
+3. Crash import command runs and returns host crash metadata (or clear zero-result behavior).
+4. Export filtered events to CSV and JSON succeeds.
+5. Google search action and prompt-copy action work from selected event.
+
+Result:
+- Refresh: `blocked` (GUI interaction required in interactive desktop session)
+- Range load: `blocked` (GUI interaction required)
+- Crash import: `blocked` (GUI interaction required)
+- Export CSV/JSON: `blocked` (GUI interaction required)
+- Search + prompt: `blocked` (GUI interaction required)
+- Notes:
+  - This automated pass validated build/runtime/artifacts and host-cache readiness only.
+  - Full feature verification still requires manual in-app execution on this Windows machine.
+
+### Packaging Validation
+1. `npm run tauri build` -> success.
+2. Artifacts confirmed:
+   - `C:\Code\hermes\src-tauri\target\release\bundle\msi\Hermes Log Analyst_0.1.0_x64_en-US.msi`
+   - `C:\Code\hermes\src-tauri\target\release\bundle\nsis\Hermes Log Analyst_0.1.0_x64-setup.exe`
+3. Launch check:
+   - `C:\Code\hermes\src-tauri\target\release\hermes-log-analyst.exe` launched and remained running for 10s (`alive=True`), then terminated by automation.
+4. Install/uninstall:
+   - not executed in this automated pass.
+
+Result:
+- Bundle build status: `pass`
+- Artifact paths: `msi` + `nsis` present under `src-tauri\target\release\bundle\...`
+- Install/launch status: `partial-pass` (binary launch verified; installer flow not exercised)
+- Uninstall status: `blocked` (installer flow not exercised)
+- Notes:
+  - Manual install/uninstall verification remains required.
+
+### Forward Readiness Check (Planned Functionality)
+
+#### Local LLM Provider Readiness
+Result:
+- Ollama reachable: `yes` (`Invoke-WebRequest http://127.0.0.1:11434/api/tags` -> `status=200`)
+- LM Studio reachable: `no` (`Invoke-WebRequest http://127.0.0.1:1234/v1/models` -> connection refused)
+- Preferred provider: `ollama`
+- Notes: localhost Ollama is active on this host; LM Studio local endpoint was not listening during this pass.
+
+#### LAN Discovery Readiness
+Result:
+- LAN scan allowed: `not policy-confirmed` (organization/user policy not validated in automation pass)
+- Network constraints:
+  - Active non-link-local IPv4 interfaces observed:
+    - `Ethernet 2`: `192.168.10.161/24`
+    - `vEthernet (Default Switch)`: `172.21.144.1/20`
+    - `vEthernet (WSL (Hyper-V firewall))`: `172.17.80.1/20`
+  - Windows firewall profiles enabled (`Domain`, `Private`, `Public` all `Enabled=True`).
+- Risk notes: keep LAN discovery opt-in and preserve untrusted-host redaction safeguards.
+
+### Overall Status
+- Platform status: `pass-with-caveats`
+- Blockers:
+  - Full live functional checks are GUI-driven and were not completed in this non-interactive automated shell pass.
+  - Installer/uninstaller workflow not executed in this run.
+- Recommended next actions:
+  - Run manual Windows UI validation using the template items for Refresh/Range/Crash/Export/Search/Prompt.
+  - Run installer (`msi` and/or `nsis`) then verify uninstall path and document outcomes.
+  - Append manual results to this section to close remaining caveats.
+- Owner: dave
+
 ## Changelog - 2026-02-27 (Commit `3bf3dd7`)
 - Runtime launch hardening:
   - Added `scripts/tauri-runner.mjs` and switched `npm run tauri` to use it.

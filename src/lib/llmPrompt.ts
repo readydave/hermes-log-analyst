@@ -35,18 +35,20 @@ export function redactSensitiveText(input: string): string {
   return output;
 }
 
-function getOsVersionHint(event: NormalizedEvent, hostOsVersion?: string): string {
+function getOsVersionHint(event: NormalizedEvent, hostOsVersion?: string, redact = true): string {
+  const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
   if (hostOsVersion && hostOsVersion.trim()) {
-    return redactSensitiveText(hostOsVersion.trim());
+    return protect(hostOsVersion.trim());
   }
 
   const raw = event.raw as Record<string, unknown> | undefined;
   const value = raw?.osVersion ?? raw?.os_version ?? raw?.version;
-  return typeof value === "string" && value.trim() ? redactSensitiveText(value) : "Unknown (not provided by event source)";
+  return typeof value === "string" && value.trim() ? protect(value) : "Unknown (not provided by event source)";
 }
 
-function osLabel(event: NormalizedEvent, hostOsVersion?: string): string {
-  const version = getOsVersionHint(event, hostOsVersion).toLowerCase();
+function osLabel(event: NormalizedEvent, hostOsVersion?: string, redact = true): string {
+  const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
+  const version = getOsVersionHint(event, hostOsVersion, redact).toLowerCase();
   if (event.os === "windows") {
     if (version.includes("11")) return "Windows 11";
     if (version.includes("10")) return "Windows 10";
@@ -54,43 +56,48 @@ function osLabel(event: NormalizedEvent, hostOsVersion?: string): string {
   }
   if (event.os === "linux") return "Linux";
   if (event.os === "macos") return "macOS";
-  return redactSensitiveText(event.os);
+  return protect(event.os);
 }
 
-function categoryLabel(event: NormalizedEvent): string {
-  const logName = redactSensitiveText(event.logName);
-  const category = redactSensitiveText(event.category);
+function categoryLabel(event: NormalizedEvent, redact = true): string {
+  const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
+  const logName = protect(event.logName);
+  const category = protect(event.category);
   return `${logName} / ${category}`;
 }
 
-function analystRolePrompt(event: NormalizedEvent, hostOsVersion?: string): string {
-  const os = osLabel(event, hostOsVersion);
-  const focus = categoryLabel(event);
+function analystRolePrompt(event: NormalizedEvent, hostOsVersion?: string, redact = true): string {
+  const os = osLabel(event, hostOsVersion, redact);
+  const focus = categoryLabel(event, redact);
   return `Act as an expert in ${os} ${focus} log analysis for incident triage and remediation.`;
 }
 
-export function buildLlmPrompt(event: NormalizedEvent, hostOsVersion?: string): string {
-  const osName = osLabel(event, hostOsVersion);
-  const osVersion = getOsVersionHint(event, hostOsVersion);
-  const timestamp = redactSensitiveText(event.timestamp);
-  const logName = redactSensitiveText(event.logName);
-  const category = redactSensitiveText(event.category);
-  const provider = redactSensitiveText(event.provider);
-  const severity = redactSensitiveText(event.severity);
-  const message = redactSensitiveText(event.message);
+export function buildLlmPrompt(event: NormalizedEvent, hostOsVersion?: string, redact = true): string {
+  const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
+  const osName = osLabel(event, hostOsVersion, redact);
+  const osVersion = getOsVersionHint(event, hostOsVersion, redact);
+  const timestamp = protect(event.timestamp);
+  const logName = protect(event.logName);
+  const category = protect(event.category);
+  const provider = protect(event.provider);
+  const severity = protect(event.severity);
+  const message = protect(event.message);
 
   return [
-    analystRolePrompt(event, hostOsVersion),
+    analystRolePrompt(event, hostOsVersion, redact),
     `You are a senior incident response and reliability engineer specializing in ${osName} (version: ${osVersion}).`,
-    "Analyze the event below and provide concise, practical triage guidance for a sysadmin team.",
+    "Analyze the event below and provide concise, practical triage guidance for a sysadmin/helpdesk team.",
+    "Return FINAL answer only.",
+    "Do not include internal reasoning, self-talk, scratchpad notes, rule restatements, or chain-of-thought.",
+    "Keep response concise (target <= 220 words).",
     "",
     "Rules:",
-    "1) Treat any sensitive values as private and keep redacted placeholders as-is.",
-    `2) If sensitive content is present, use exactly "${REDACTION}" in your response.`,
+    "1) Treat any sensitive values as private.",
+    `2) If redacted placeholders are present, keep exactly "${REDACTION}" as-is.`,
     "3) Prefer safe, read-only verification steps first.",
     "4) If you recommend commands, place each command in fenced code blocks for copy/paste.",
     "5) Avoid destructive actions unless clearly marked optional and high-risk.",
-    "6) Search online for similar reported issues and include likely matches with short rationale.",
+    "6) If external lookup is needed, state what to check briefly; do not fabricate citations.",
     "7) If this could indicate a security threat, clearly flag it and prioritize containment actions.",
     "",
     "Event Context:",
@@ -104,15 +111,32 @@ export function buildLlmPrompt(event: NormalizedEvent, hostOsVersion?: string): 
     `Severity: ${severity}`,
     `Message: ${message}`,
     "",
-    "Return output in this exact structure:",
-    "1) Summary (1-2 lines)",
-    "2) Likely Causes (top 3, ranked)",
-    "3) Risk Level (Low/Medium/High/Critical + why)",
-    "4) Security Impact (state 'None observed' if not applicable)",
-    "5) Verify First (safe checks)",
-    "6) Remediation Options (ordered safest to strongest)",
-    "7) Escalate If (clear criteria)",
-    "8) Confidence (0-100%) and Missing Data"
+    "Return output in this exact Markdown template:",
+    "## Summary",
+    "- <1-2 line summary>",
+    "## Likely Causes",
+    "- <cause 1>",
+    "- <cause 2>",
+    "- <cause 3>",
+    "## Risk Level",
+    "- <Low|Medium|High|Critical> - <one-line reason>",
+    "## Security Impact",
+    "- <impact or 'None observed'>",
+    "## Verify First",
+    "- <safe read-only check 1>",
+    "- <safe read-only check 2>",
+    "## Remediation Options",
+    "- <safest action>",
+    "- <next action>",
+    "- <strongest action if needed>",
+    "## Escalate If",
+    "- <criteria 1>",
+    "- <criteria 2>",
+    "## Confidence",
+    "- <0-100%>",
+    "## Missing Data",
+    "- <missing item 1>",
+    "- <missing item 2>"
   ].join("\n");
 }
 
