@@ -46,8 +46,11 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - Sticky table headers, sortable columns, and row detail footer actions.
   - Fixed top and bottom bars with scrollable middle content region.
   - Collector warning banner shown when sync/backfill completes with recoverable collector issues.
+  - Home dashboard analytics for timeline, severity, providers, log types, Windows Event IDs, and noisy-source drilldown.
+  - Selected-event `Raw` / `Parsed` message view for structured payload inspection.
 - Export and actions:
   - Export filtered/single events to JSON, CSV, or TXT.
+  - Export scoped Ops Summary reports as plain text or HTML (print/PDF-ready).
   - Guided save dialog export workflow in desktop runtime.
   - Google search and copy-ready LLM prompt for selected event.
 - Theme switcher: `System`, `Light`, `Dark`.
@@ -118,6 +121,9 @@ Use these defaults for fast startup with useful breadth:
   - macOS: `~/Library/Application Support/hermes-log-analyst/logs/diagnostics-YYYY-MM-DD.log`
   - Linux: `~/.local/share/hermes-log-analyst/logs/diagnostics-YYYY-MM-DD.log`
 - If sync/backfill succeeds with warnings (for example, access denied to a selected channel), the app shows a yellow warning status and details are also written to diagnostics logs.
+- LLM/provider connectivity is not considered release-stable yet:
+  - localhost/LAN/cloud profile configuration exists, but end-to-end connection reliability still needs hardening and full cross-platform validation.
+  - treat `Copy LLM Prompt` / prompt-only workflows as the fallback path when provider connectivity is unreliable.
 - If no events appear for a chosen date range, confirm:
   - `Load Events` completed for that exact range.
   - Filters (date/log type/severity/category/text) are not excluding results.
@@ -132,6 +138,9 @@ Use these defaults for fast startup with useful breadth:
   - Cloud providers: OpenAI, Gemini, Claude, and Perplexity.
   - Generic OpenAI-compatible connector for custom/self-hosted endpoints.
   - OS-aware built-in prompt templates for Windows, Linux, and macOS event triage.
+- Connectivity stabilization for the LLM layer:
+  - harden local/LAN/cloud endpoint testing and profile application behavior.
+  - complete manual validation on Windows, macOS, and Garuda before treating provider flows as production-ready.
 - Deeper crash artifact parsing and optional symbolication pipeline.
 - Remote machine log access (future state): connect to remote host collectors for investigation without mandatory full download.
 - Continue Garuda Linux (Arch-based) packaging/compatibility hardening (AppImage path and install validation).

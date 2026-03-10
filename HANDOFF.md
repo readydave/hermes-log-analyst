@@ -15,6 +15,9 @@
   - hidden as a full group
   - collapsed/expanded all at once
   - collapsed individually (Crash Correlation, Filters, Data Window)
+- Home dashboard now includes aggregate analytics for timeline, severity, top providers, top log types, top Windows Event IDs, and noisy sources with drilldown into the Events tab.
+- Selected event details now support `Raw` and `Parsed` message views for structured payload inspection.
+- Export tab now supports scoped Ops Summary report generation as plain text or HTML (print/PDF-ready).
 
 ## Implemented Capabilities
 - Event collection:
@@ -85,6 +88,10 @@
 - Ingest telemetry is basic; per-channel timing/count breakdown is not yet surfaced.
 - Collector warning details are summarized in UI; full context remains diagnostics-log first.
 - Local/imported event lists are memory-capped; large loads are intentionally truncated in-memory for stability.
+- LLM/provider connectivity is not release-stable yet:
+  - local/LAN/cloud profile plumbing exists, but end-to-end connectivity is still inconsistent enough to require manual validation and hardening.
+  - localhost detection and LAN scan results should be treated as advisory until revalidated on Windows, macOS, and Garuda with real providers.
+  - prompt-only / copy-prompt workflows remain the dependable fallback when provider connection attempts fail.
 - `cargo audit` reports no vulnerabilities, but Linux-target transitive GTK3 dependencies are flagged as unmaintained/unsound informational warnings via Tauri/Wry stack.
 - Common terminal message during `tauri dev` is usually benign:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
@@ -100,10 +107,11 @@
   - Log-type filtering and persisted ingest profile controls are complete.
 
 ## Next Work Items (Recommended)
-1. Add remote machine connectors (SSH/WinRM).
-2. Enrich crash importers with minidump/panic/core parsing and optional symbolication.
-3. Add ingest diagnostics in UI (per-channel counts + timing).
-4. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
+1. Stabilize LLM/provider connectivity across localhost, LAN, and cloud profiles; revalidate on Windows, macOS, and Garuda with live providers.
+2. Add remote machine connectors (SSH/WinRM).
+3. Enrich crash importers with minidump/panic/core parsing and optional symbolication.
+4. Add ingest diagnostics in UI (per-channel counts + timing).
+5. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
 
 ## v0.2 Roadmap Draft (Packaging + Local LLM)
 
@@ -617,3 +625,31 @@ Expected notes to capture in Windows retest:
   - added persisted LLM settings model and new Settings section for provider profile configuration.
   - added backend commands + frontend integration for local provider detection and LAN provider scan.
   - added provider placeholders/config for OpenAI, Gemini, Claude, Perplexity, and generic OpenAI-compatible endpoints.
+
+## Changelog - 2026-03-10 (Commit Pending)
+- Home analytics:
+  - added dashboard timeline, severity distribution, top providers, top log types, top Windows Event IDs, and noisy-source ranking.
+  - dashboard aggregate widgets now drill into the `Events` tab with matching filters.
+- Event detail readability:
+  - added `Raw` / `Parsed` message modes for selected events.
+  - structured parsing supports object payloads, JSON messages, `key=value`, and `key: value` lines.
+- Export workflow:
+  - added scoped `Ops Summary` export in the `Export` tab.
+  - summary export supports TXT and HTML (print/PDF-ready) output using existing save-dialog plumbing.
+
+## Connectivity Stabilization Handoff - 2026-03-10
+- Current concern:
+  - provider connectivity remains the least-stable part of the product and should be treated as the next release blocker.
+- What is working:
+  - provider profile configuration UI exists.
+  - localhost detection / LAN scan plumbing exists.
+  - prompt-only, copy-prompt, Google search, and local report workflows remain usable even when model connectivity is unreliable.
+- What still needs focused validation:
+  - local profile detection -> apply-to-profile -> model selection -> test connection flow.
+  - LAN discovery -> trusted host handling -> endpoint application flow.
+  - cloud/generic profile save, secret retrieval, connection test, and run-analysis flow.
+  - cross-platform behavior parity on Windows, macOS, and Garuda.
+- Recommended next session:
+  1. Reproduce and list each provider connectivity failure path with exact UI steps and diagnostics output.
+  2. Fix provider test/apply/run behavior before adding more provider-facing features.
+  3. Re-run manual validation on all three platforms and append results to this handoff.

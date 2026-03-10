@@ -163,6 +163,7 @@ interface SortState {
 type WorkspaceTab = "home" | "events" | "crashes" | "data" | "import" | "export" | "settings" | "help";
 type ExportScope = "loaded" | "custom";
 type LlmResponseViewMode = "guide" | "raw";
+type MessageViewMode = "raw" | "parsed";
 type HelpSectionId =
   | "quick-start"
   | "filters"
@@ -222,6 +223,36 @@ interface ExportWizardFilters {
   logType: string;
   category: "all" | EventCategory;
   source: string;
+}
+
+interface CountMetric {
+  label: string;
+  value: string;
+  count: number;
+}
+
+interface TimelineMetric {
+  label: string;
+  date: string;
+  count: number;
+}
+
+interface ParsedMessageField {
+  key: string;
+  value: string;
+}
+
+interface OpsSummaryReport {
+  totalEvents: number;
+  coverageLabel: string;
+  severityCounts: CountMetric[];
+  topProviders: CountMetric[];
+  topLogTypes: CountMetric[];
+  topEventIds: CountMetric[];
+  noisySources: CountMetric[];
+  timeline: TimelineMetric[];
+  notableSpike: string;
+  selectedEventFinding: string;
 }
 
 const defaultExportCategoriesByOs: Record<SupportedOs, EventCategory[]> = {
@@ -380,6 +411,10 @@ function formatDateInputValue(timestamp: number): string {
   return `${year}-${month}-${day}`;
 }
 
+function formatMetricDateLabel(date: string): string {
+  return new Date(`${date}T00:00:00`).toLocaleDateString();
+}
+
 function formatExportTimestamp(value = new Date()): string {
   const year = value.getFullYear();
   const month = String(value.getMonth() + 1).padStart(2, "0");
@@ -411,6 +446,267 @@ function capEvents(events: NormalizedEvent[], max: number): { kept: NormalizedEv
     kept: events.slice(0, max),
     truncated: events.length - max
   };
+}
+
+function rankMetrics(values: Map<string, number>, limit: number): CountMetric[] {
+  return Array.from(values.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, limit)
+    .map(([label, count]) => ({
+      label,
+      value: label,
+      count
+    }));
+}
+
+function incrementMetric(map: Map<string, number>, label: string): void {
+  map.set(label, (map.get(label) ?? 0) + 1);
+}
+
+function buildTimelineMetrics(events: NormalizedEvent[], limit = 10): TimelineMetric[] {
+  const buckets = new Map<string, number>();
+  for (const event of events) {
+    const time = Date.parse(event.timestamp);
+    if (!Number.isFinite(time)) continue;
+    const date = formatDateInputValue(time);
+    buckets.set(date, (buckets.get(date) ?? 0) + 1);
+  }
+  return Array.from(buckets.entries())
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .slice(-limit)
+    .map(([date, count]) => ({
+      label: formatMetricDateLabel(date),
+      date,
+      count
+    }));
+}
+
+function normalizeFieldValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function flattenStructuredObject(value: unknown, prefix = "", depth = 0): ParsedMessageField[] {
+  if (depth > 2 || value === null || value === undefined) return [];
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [];
+    return [
+      {
+        key: prefix || "items",
+        value: value.map((entry) => normalizeFieldValue(entry)).join(", ")
+      }
+    ];
+  }
+  if (typeof value !== "object") {
+    if (!prefix) return [];
+    return [{ key: prefix, value: normalizeFieldValue(value) }];
+  }
+
+  const fields: ParsedMessageField[] = [];
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const nextKey = prefix ? `${prefix}.${key}` : key;
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const nested = flattenStructuredObject(entry, nextKey, depth + 1);
+      if (nested.length > 0) {
+        fields.push(...nested);
+        continue;
+      }
+    }
+    const normalized = normalizeFieldValue(entry);
+    if (!normalized) continue;
+    fields.push({ key: nextKey, value: normalized });
+  }
+  return fields;
+}
+
+function parseStructuredMessage(event: NormalizedEvent | null): ParsedMessageField[] {
+  if (!event) return [];
+
+  if (event.raw && typeof event.raw === "object" && !Array.isArray(event.raw)) {
+    const rawFields = flattenStructuredObject(event.raw);
+    if (rawFields.length > 0) return rawFields.slice(0, 40);
+  }
+
+  const message = event.message.trim();
+  if (!message) return [];
+
+  if ((message.startsWith("{") && message.endsWith("}")) || (message.startsWith("[") && message.endsWith("]"))) {
+    try {
+      const parsed = JSON.parse(message);
+      const jsonFields = flattenStructuredObject(parsed);
+      if (jsonFields.length > 0) return jsonFields.slice(0, 40);
+    } catch {
+      // fall through to line/token parsing
+    }
+  }
+
+  const tokenFields = new Map<string, string>();
+  const keyValuePattern = /([A-Za-z0-9_.-]{2,})=(\"[^\"]+\"|'[^']+'|[^,\s;]+)/g;
+  for (const match of message.matchAll(keyValuePattern)) {
+    const key = match[1]?.trim();
+    const value = match[2]?.trim().replace(/^['"]|['"]$/g, "");
+    if (key && value) tokenFields.set(key, value);
+  }
+  if (tokenFields.size > 0) {
+    return Array.from(tokenFields.entries())
+      .slice(0, 40)
+      .map(([key, value]) => ({ key, value }));
+  }
+
+  const lineFields: ParsedMessageField[] = [];
+  for (const line of message.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const separatorIndex = trimmed.indexOf(":");
+    if (separatorIndex <= 0) continue;
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim();
+    if (key.length < 2 || !value) continue;
+    lineFields.push({ key, value });
+  }
+  return lineFields.slice(0, 40);
+}
+
+function buildOpsSummaryReport(
+  events: NormalizedEvent[],
+  scopeLabel: string,
+  selectedEvent: NormalizedEvent | null
+): OpsSummaryReport {
+  const severityMap = new Map<string, number>();
+  const providerMap = new Map<string, number>();
+  const logTypeMap = new Map<string, number>();
+  const eventIdMap = new Map<string, number>();
+  const noisySourceMap = new Map<string, number>();
+
+  for (const event of events) {
+    incrementMetric(severityMap, event.severity);
+    incrementMetric(providerMap, event.provider);
+    incrementMetric(logTypeMap, event.logName);
+    if (typeof event.eventId === "number") {
+      incrementMetric(eventIdMap, String(event.eventId));
+    }
+    if (event.severity !== "information") {
+      incrementMetric(noisySourceMap, `${event.provider} (${event.severity})`);
+    }
+  }
+
+  const timeline = buildTimelineMetrics(events, 12);
+  const averageCount =
+    timeline.length > 0 ? timeline.reduce((sum, entry) => sum + entry.count, 0) / timeline.length : 0;
+  const peak = timeline.reduce<TimelineMetric | null>(
+    (best, entry) => (!best || entry.count > best.count ? entry : best),
+    null
+  );
+  const notableSpike =
+    peak && peak.count >= Math.max(10, Math.ceil(averageCount * 1.5))
+      ? `Highest activity on ${peak.label} with ${peak.count.toLocaleString()} events.`
+      : timeline.length > 0
+        ? "No major spike detected in the current timeline."
+        : "No timeline data available.";
+
+  const inScopeSelected = selectedEvent ? events.some((event) => event.id === selectedEvent.id) : false;
+  const selectedEventFinding =
+    selectedEvent && inScopeSelected
+      ? `${selectedEvent.provider} | ${selectedEvent.logName}${typeof selectedEvent.eventId === "number" ? ` | Event ID ${selectedEvent.eventId}` : ""} | ${selectedEvent.severity}`
+      : "No selected event included in this summary scope.";
+
+  return {
+    totalEvents: events.length,
+    coverageLabel: scopeLabel,
+    severityCounts: rankMetrics(severityMap, 4),
+    topProviders: rankMetrics(providerMap, 6),
+    topLogTypes: rankMetrics(logTypeMap, 6),
+    topEventIds: rankMetrics(eventIdMap, 6),
+    noisySources: rankMetrics(noisySourceMap, 6),
+    timeline,
+    notableSpike,
+    selectedEventFinding
+  };
+}
+
+function formatMetricList(metrics: CountMetric[]): string {
+  if (metrics.length === 0) return "- None";
+  return metrics.map((metric) => `- ${metric.label}: ${metric.count.toLocaleString()}`).join("\n");
+}
+
+function formatTimelineList(metrics: TimelineMetric[]): string {
+  if (metrics.length === 0) return "- None";
+  return metrics.map((metric) => `- ${metric.label}: ${metric.count.toLocaleString()} events`).join("\n");
+}
+
+function buildOpsSummaryText(report: OpsSummaryReport): string {
+  return [
+    "Hermes Ops Summary",
+    `Generated: ${new Date().toLocaleString()}`,
+    `Scope: ${report.coverageLabel}`,
+    `Total Events: ${report.totalEvents.toLocaleString()}`,
+    "",
+    "1) Severity Mix",
+    formatMetricList(report.severityCounts),
+    "",
+    "2) Top Providers",
+    formatMetricList(report.topProviders),
+    "",
+    "3) Top Log Types",
+    formatMetricList(report.topLogTypes),
+    "",
+    "4) Top Event IDs",
+    formatMetricList(report.topEventIds),
+    "",
+    "5) Noisy Sources",
+    formatMetricList(report.noisySources),
+    "",
+    "6) Activity Timeline",
+    formatTimelineList(report.timeline),
+    "",
+    "7) Notable Spike",
+    report.notableSpike,
+    "",
+    "8) Selected Event Finding",
+    report.selectedEventFinding
+  ].join("\n");
+}
+
+function buildOpsSummaryHtml(report: OpsSummaryReport): string {
+  const renderMetricItems = (items: Array<CountMetric | TimelineMetric>) =>
+    items.length === 0
+      ? "<li>None</li>"
+      : items
+          .map((item) =>
+            "date" in item
+              ? `<li>${escapeHtml(item.label)}: ${item.count.toLocaleString()} events</li>`
+              : `<li>${escapeHtml(item.label)}: ${item.count.toLocaleString()}</li>`
+          )
+          .join("");
+  return [
+    "<!doctype html>",
+    "<html><head><meta charset=\"utf-8\"/>",
+    "<title>Hermes Ops Summary</title>",
+    "<style>",
+    "body{font-family:Segoe UI,Arial,sans-serif;line-height:1.45;color:#111827;margin:32px;}",
+    "h1{margin:0 0 6px 0;font-size:24px;} h2{margin:18px 0 6px 0;font-size:16px;} ul{margin:6px 0 0 20px;}",
+    ".meta{color:#4b5563;font-size:12px;margin-bottom:14px;} .card{border:1px solid #d1d5db;padding:12px 14px;border-radius:8px;margin-bottom:10px;}",
+    "</style></head><body>",
+    "<h1>Hermes Ops Summary</h1>",
+    `<div class="meta">Generated: ${escapeHtml(new Date().toLocaleString())}<br/>Scope: ${escapeHtml(
+      report.coverageLabel
+    )}<br/>Total Events: ${report.totalEvents.toLocaleString()}</div>`,
+    `<div class="card"><h2>1) Severity Mix</h2><ul>${renderMetricItems(report.severityCounts)}</ul></div>`,
+    `<div class="card"><h2>2) Top Providers</h2><ul>${renderMetricItems(report.topProviders)}</ul></div>`,
+    `<div class="card"><h2>3) Top Log Types</h2><ul>${renderMetricItems(report.topLogTypes)}</ul></div>`,
+    `<div class="card"><h2>4) Top Event IDs</h2><ul>${renderMetricItems(report.topEventIds)}</ul></div>`,
+    `<div class="card"><h2>5) Noisy Sources</h2><ul>${renderMetricItems(report.noisySources)}</ul></div>`,
+    `<div class="card"><h2>6) Activity Timeline</h2><ul>${renderMetricItems(report.timeline)}</ul></div>`,
+    `<div class="card"><h2>7) Notable Spike</h2><div>${escapeHtml(report.notableSpike)}</div></div>`,
+    `<div class="card"><h2>8) Selected Event Finding</h2><div>${escapeHtml(report.selectedEventFinding)}</div></div>`,
+    "</body></html>"
+  ].join("");
 }
 
 function buildEventContextText(
@@ -863,6 +1159,7 @@ export default function App() {
   const [memoryNotice, setMemoryNotice] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
   const [copyEventTextStatus, setCopyEventTextStatus] = useState<"idle" | "copied">("idle");
+  const [messageViewMode, setMessageViewMode] = useState<MessageViewMode>("raw");
   const [llmWindowOpen, setLlmWindowOpen] = useState(false);
   const [llmPromptDraft, setLlmPromptDraft] = useState("");
   const [llmPromptWasRedacted, setLlmPromptWasRedacted] = useState(false);
@@ -926,6 +1223,37 @@ export default function App() {
       .sort((left, right) => (Date.parse(right.timestamp) || 0) - (Date.parse(left.timestamp) || 0))
       .slice(0, 8);
   }, [allEvents]);
+  const dashboardTimeline = useMemo(() => buildTimelineMetrics(allEvents, 10), [allEvents]);
+  const dashboardSeverityMetrics = useMemo(() => {
+    const values = new Map<string, number>();
+    for (const event of allEvents) incrementMetric(values, event.severity);
+    return rankMetrics(values, 4);
+  }, [allEvents]);
+  const dashboardProviderMetrics = useMemo(() => {
+    const values = new Map<string, number>();
+    for (const event of allEvents) incrementMetric(values, event.provider);
+    return rankMetrics(values, 6);
+  }, [allEvents]);
+  const dashboardLogTypeMetrics = useMemo(() => {
+    const values = new Map<string, number>();
+    for (const event of allEvents) incrementMetric(values, event.logName);
+    return rankMetrics(values, 6);
+  }, [allEvents]);
+  const dashboardEventIdMetrics = useMemo(() => {
+    const values = new Map<string, number>();
+    for (const event of allEvents) {
+      if (typeof event.eventId === "number") incrementMetric(values, String(event.eventId));
+    }
+    return rankMetrics(values, 6);
+  }, [allEvents]);
+  const dashboardNoisySources = useMemo(() => {
+    const values = new Map<string, number>();
+    for (const event of allEvents) {
+      if (event.severity === "information") continue;
+      incrementMetric(values, `${event.provider} (${event.severity})`);
+    }
+    return rankMetrics(values, 6);
+  }, [allEvents]);
   const hasWindowsEvents = useMemo(() => {
     if (localEvents.some((event) => event.os === "windows")) return true;
     return importedEvents.some((event) => event.os === "windows");
@@ -971,6 +1299,7 @@ export default function App() {
     () => redactSensitiveText(selectedEventOriginalContext),
     [selectedEventOriginalContext]
   );
+  const selectedEventParsedFields = useMemo(() => parseStructuredMessage(selected), [selected]);
   const llmParsedGuide = useMemo(
     () => parseLlmGuide(llmRunResult?.response ?? ""),
     [llmRunResult?.response]
@@ -1030,6 +1359,16 @@ export default function App() {
     if (exportScope === "loaded") return allEvents;
     return customExportEvents;
   }, [allEvents, customExportEvents, exportScope]);
+  const exportScopeLabel = useMemo(() => {
+    if (exportScope === "loaded") {
+      return `Current loaded list (${exportPreviewEvents.length.toLocaleString()} events)`;
+    }
+    return `Custom filtered export (${exportPreviewEvents.length.toLocaleString()} events)`;
+  }, [exportPreviewEvents.length, exportScope]);
+  const exportOpsSummary = useMemo(
+    () => buildOpsSummaryReport(exportPreviewEvents, exportScopeLabel, selected),
+    [exportPreviewEvents, exportScopeLabel, selected]
+  );
   const hostOsCoverage = useMemo(() => {
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
@@ -1912,6 +2251,7 @@ export default function App() {
 
   function toggleSelectedEvent(event: NormalizedEvent): void {
     setSelected((current) => (current?.id === event.id ? null : event));
+    setMessageViewMode("raw");
   }
 
   function sortIndicator(column: SortColumn): string {
@@ -1927,6 +2267,99 @@ export default function App() {
       }
       return { ...current, windowsChannels: current.windowsChannels.filter((entry) => entry !== channel) };
     });
+  }
+
+  function jumpToEventsWithFilters(patch: Partial<EventFilters>): void {
+    const next = createDefaultFilters();
+    const merged: EventFilters = {
+      ...next,
+      ...patch,
+      severities: patch.severities ? { ...patch.severities } : { ...next.severities }
+    };
+    setFilterDraft(merged);
+    setActiveFilters(merged);
+    setSelected(null);
+    setMessageViewMode("raw");
+    setSortState(null);
+    setActiveTab("events");
+  }
+
+  function applySeverityFocus(level: EventSeverity): void {
+    jumpToEventsWithFilters({
+      severities: {
+        information: level === "information",
+        warning: level === "warning",
+        error: level === "error",
+        critical: level === "critical"
+      }
+    });
+  }
+
+  function applyTimelineFocus(date: string): void {
+    jumpToEventsWithFilters({
+      dateFrom: date,
+      dateTo: date
+    });
+  }
+
+  function applyProviderFocus(provider: string): void {
+    jumpToEventsWithFilters({
+      source: provider
+    });
+  }
+
+  function applyLogTypeFocus(logType: string): void {
+    jumpToEventsWithFilters({
+      logType
+    });
+  }
+
+  function applyEventIdFocus(eventId: string): void {
+    jumpToEventsWithFilters({
+      eventId
+    });
+  }
+
+  async function exportOpsSummaryTextNow(): Promise<void> {
+    if (exportPreviewEvents.length === 0) {
+      setLastError("There are no events in the selected summary scope.");
+      return;
+    }
+    setLastError("");
+    try {
+      const filename = `${formatExportTimestamp()}-hermes-ops-summary.txt`;
+      const location = await saveTextWithDialog(filename, buildOpsSummaryText(exportOpsSummary));
+      if (!location) {
+        setExportStatus("Summary export canceled.");
+        window.setTimeout(() => setExportStatus(""), 2000);
+        return;
+      }
+      setExportStatus(`Ops summary exported: ${location}`);
+      window.setTimeout(() => setExportStatus(""), 2600);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to export ops summary.");
+    }
+  }
+
+  async function exportOpsSummaryHtmlNow(): Promise<void> {
+    if (exportPreviewEvents.length === 0) {
+      setLastError("There are no events in the selected summary scope.");
+      return;
+    }
+    setLastError("");
+    try {
+      const filename = `${formatExportTimestamp()}-hermes-ops-summary.html`;
+      const location = await saveTextWithDialog(filename, buildOpsSummaryHtml(exportOpsSummary));
+      if (!location) {
+        setExportStatus("Summary export canceled.");
+        window.setTimeout(() => setExportStatus(""), 2000);
+        return;
+      }
+      setExportStatus(`PDF-ready summary exported: ${location}`);
+      window.setTimeout(() => setExportStatus(""), 2600);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to export PDF-ready summary.");
+    }
   }
 
   function updateLlmProfile(profileId: string, patch: Partial<LlmConnectionProfile>): void {
@@ -2528,6 +2961,145 @@ export default function App() {
                 </div>
               </div>
             </div>
+            <div className="grid gap-3 xl:grid-cols-[1.2fr_0.8fr]">
+              <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted">Event Volume Timeline</div>
+                  <div className="text-[11px] text-muted">Click a day to focus Events tab</div>
+                </div>
+                {dashboardTimeline.length === 0 ? (
+                  <div className="mt-3 text-xs text-muted">No timeline data available yet.</div>
+                ) : (
+                  <div className="mt-3 space-y-2">
+                    {dashboardTimeline.map((entry) => {
+                      const maxCount = Math.max(...dashboardTimeline.map((item) => item.count), 1);
+                      const width = Math.max(10, Math.round((entry.count / maxCount) * 100));
+                      return (
+                        <button
+                          key={entry.date}
+                          type="button"
+                          className="grid w-full grid-cols-[120px_1fr_72px] items-center gap-3 text-left text-xs"
+                          onClick={() => applyTimelineFocus(entry.date)}
+                        >
+                          <span className="text-muted">{entry.label}</span>
+                          <span className="h-3 overflow-hidden rounded-full bg-black/5">
+                            <span
+                              className="block h-full rounded-full bg-accent/80 transition"
+                              style={{ width: `${width}%` }}
+                            />
+                          </span>
+                          <span className="text-right font-semibold text-text">{entry.count.toLocaleString()}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Severity Distribution</div>
+                {dashboardSeverityMetrics.length === 0 ? (
+                  <div className="mt-3 text-xs text-muted">No severity data available yet.</div>
+                ) : (
+                  <div className="mt-3 space-y-2">
+                    {dashboardSeverityMetrics.map((metric) => (
+                      <button
+                        key={metric.value}
+                        type="button"
+                        className="flex w-full items-center justify-between rounded-lg border border-panel-border px-3 py-2 text-left text-xs transition hover:border-accent"
+                        onClick={() => applySeverityFocus(metric.value as EventSeverity)}
+                      >
+                        <span className="capitalize">{metric.label}</span>
+                        <span className="font-semibold text-text">{metric.count.toLocaleString()}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
+              <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Top Providers</div>
+                <div className="mt-2 space-y-2">
+                  {dashboardProviderMetrics.length === 0 ? (
+                    <div className="text-xs text-muted">No provider data available yet.</div>
+                  ) : (
+                    dashboardProviderMetrics.map((metric) => (
+                      <button
+                        key={metric.value}
+                        type="button"
+                        className="flex w-full items-center justify-between gap-3 rounded-lg border border-panel-border px-3 py-2 text-left text-xs transition hover:border-accent"
+                        onClick={() => applyProviderFocus(metric.value)}
+                      >
+                        <span className="truncate">{metric.label}</span>
+                        <span className="font-semibold text-text">{metric.count.toLocaleString()}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+              <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Top Log Types</div>
+                <div className="mt-2 space-y-2">
+                  {dashboardLogTypeMetrics.length === 0 ? (
+                    <div className="text-xs text-muted">No log type data available yet.</div>
+                  ) : (
+                    dashboardLogTypeMetrics.map((metric) => (
+                      <button
+                        key={metric.value}
+                        type="button"
+                        className="flex w-full items-center justify-between gap-3 rounded-lg border border-panel-border px-3 py-2 text-left text-xs transition hover:border-accent"
+                        onClick={() => applyLogTypeFocus(metric.value)}
+                      >
+                        <span className="truncate">{metric.label}</span>
+                        <span className="font-semibold text-text">{metric.count.toLocaleString()}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+              {hasWindowsEvents && (
+                <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted">Top Windows Event IDs</div>
+                  <div className="mt-2 space-y-2">
+                    {dashboardEventIdMetrics.length === 0 ? (
+                      <div className="text-xs text-muted">No Windows event IDs available yet.</div>
+                    ) : (
+                      dashboardEventIdMetrics.map((metric) => (
+                        <button
+                          key={metric.value}
+                          type="button"
+                          className="flex w-full items-center justify-between gap-3 rounded-lg border border-panel-border px-3 py-2 text-left text-xs transition hover:border-accent"
+                          onClick={() => applyEventIdFocus(metric.value)}
+                        >
+                          <span>{metric.label}</span>
+                          <span className="font-semibold text-text">{metric.count.toLocaleString()}</span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+              <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Noisy Sources</div>
+                <div className="mt-2 space-y-2">
+                  {dashboardNoisySources.length === 0 ? (
+                    <div className="text-xs text-muted">No repeated warning/error sources detected yet.</div>
+                  ) : (
+                    dashboardNoisySources.map((metric) => (
+                      <button
+                        key={metric.value}
+                        type="button"
+                        className="flex w-full items-center justify-between gap-3 rounded-lg border border-panel-border px-3 py-2 text-left text-xs transition hover:border-accent"
+                        onClick={() => applyProviderFocus(metric.label.replace(/\s+\((?:information|warning|error|critical)\)$/i, ""))}
+                      >
+                        <span className="truncate">{metric.label}</span>
+                        <span className="font-semibold text-text">{metric.count.toLocaleString()}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
             <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
               <div className="text-xs font-semibold uppercase tracking-wide text-muted">Recent Events</div>
               {dashboardRecentEvents.length === 0 ? (
@@ -2737,6 +3309,51 @@ export default function App() {
               >
                 Export Logs
               </Button>
+            </div>
+            <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted">Ops Summary</div>
+                  <div className="text-sm text-text">
+                    Summary scope: {exportOpsSummary.coverageLabel}
+                  </div>
+                  <div className="text-xs text-muted">
+                    Includes totals, severity mix, top providers/log types, noisy sources, timeline spikes, and selected-event findings when applicable.
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => void exportOpsSummaryTextNow()}
+                    disabled={exportPreviewEvents.length === 0}
+                  >
+                    Export Summary TXT
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => void exportOpsSummaryHtmlNow()}
+                    disabled={exportPreviewEvents.length === 0}
+                  >
+                    Export Summary HTML (PDF-ready)
+                  </Button>
+                </div>
+              </div>
+              <div className="mt-3 grid gap-3 md:grid-cols-3">
+                <div className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                  <div className="text-[10px] uppercase tracking-wide text-muted">Events In Scope</div>
+                  <div className="mt-1 text-lg font-semibold text-text">
+                    {exportOpsSummary.totalEvents.toLocaleString()}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                  <div className="text-[10px] uppercase tracking-wide text-muted">Notable Spike</div>
+                  <div className="mt-1 text-xs text-text">{exportOpsSummary.notableSpike}</div>
+                </div>
+                <div className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                  <div className="text-[10px] uppercase tracking-wide text-muted">Selected Event</div>
+                  <div className="mt-1 text-xs text-text">{exportOpsSummary.selectedEventFinding}</div>
+                </div>
+              </div>
             </div>
           </section>
         )}
@@ -3532,8 +4149,50 @@ export default function App() {
                   ))}
                 </div>
                 <div className="space-y-1">
-                  <div className="text-[10px] uppercase tracking-wide text-muted">Message</div>
-                  <div className="max-h-24 overflow-auto text-sm text-text">{selected.message}</div>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-[10px] uppercase tracking-wide text-muted">Message</div>
+                    <div className="inline-flex rounded-md border border-panel-border bg-[var(--field-bg)] p-0.5">
+                      <button
+                        type="button"
+                        className={cn(
+                          "rounded px-2 py-1 text-[11px] transition",
+                          messageViewMode === "raw" ? "bg-accent text-white" : "text-text hover:bg-accent/10"
+                        )}
+                        onClick={() => setMessageViewMode("raw")}
+                      >
+                        Raw
+                      </button>
+                      <button
+                        type="button"
+                        disabled={selectedEventParsedFields.length === 0}
+                        className={cn(
+                          "rounded px-2 py-1 text-[11px] transition",
+                          messageViewMode === "parsed" ? "bg-accent text-white" : "text-text hover:bg-accent/10",
+                          selectedEventParsedFields.length === 0 && "cursor-not-allowed opacity-50 hover:bg-transparent"
+                        )}
+                        onClick={() => {
+                          if (selectedEventParsedFields.length === 0) return;
+                          setMessageViewMode("parsed");
+                        }}
+                      >
+                        Parsed
+                      </button>
+                    </div>
+                  </div>
+                  {messageViewMode === "raw" ? (
+                    <div className="max-h-24 overflow-auto text-sm text-text">{selected.message}</div>
+                  ) : selectedEventParsedFields.length > 0 ? (
+                    <div className="grid max-h-36 gap-2 overflow-auto sm:grid-cols-2">
+                      {selectedEventParsedFields.map((field) => (
+                        <div key={`${field.key}-${field.value}`} className="rounded-lg border border-panel-border bg-[var(--field-bg)] px-3 py-2">
+                          <div className="text-[10px] uppercase tracking-wide text-muted">{field.key}</div>
+                          <div className="mt-1 break-all text-sm text-text">{field.value}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-muted">No structured fields detected in this message.</div>
+                  )}
                 </div>
               </>
             )}
