@@ -6,6 +6,15 @@ This changelog is intentionally sanitized. It excludes machine names, user-speci
 
 The project does not currently publish formal version tags for each change group below, so entries are organized by date and representative commit.
 
+## 2026-03-11
+
+### Added
+- Remote host log collection capabilities via SSH (Linux & macOS targets) and WinRM PowerShell remoting (Windows targets).
+- Frontend Settings "Remote Hosts" management tab for configuring target OS identity, protocol, and authentication parameters.
+- Target Selection dropdowns across all frontend Data views and ingestion controls, allowing operators to seamlessly switch contextual views between `localhost` and explicitly registered remote servers.
+- Secure OS keychain bindings on the local backend to safely map credentials/passwords for WinRM authentication and automated SSH workflows without resorting to plaintext configurations.
+- Schema tracking on the local SQLite tier mapping each log event and crash metric precisely to its original `source_host`.
+
 ## 2026-03-10
 
 Representative commits:

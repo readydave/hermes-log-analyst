@@ -21,6 +21,7 @@ pub struct CrashRecord {
     pub summary: String,
     pub suspected_component: Option<String>,
     pub raw_path: Option<String>,
+    pub source_host: String,
     pub imported: bool,
 }
 
@@ -33,6 +34,7 @@ impl CrashRecord {
         summary: &str,
         suspected_component: Option<&str>,
         raw_path: Option<&str>,
+        source_host: &str,
         imported: bool,
     ) -> Self {
         Self {
@@ -45,6 +47,7 @@ impl CrashRecord {
             summary: summary.to_string(),
             suspected_component: suspected_component.map(ToString::to_string),
             raw_path: raw_path.map(ToString::to_string),
+            source_host: source_host.to_string(),
             imported,
         }
     }
@@ -96,6 +99,7 @@ fn build_imported_crash(
         summary,
         suspected_component,
         raw_path_value.as_deref(),
+        "localhost",
         true,
     );
     crash.id = stable_id(seed.as_str());

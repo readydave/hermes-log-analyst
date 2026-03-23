@@ -10,6 +10,7 @@ const EXPORT_DIR_FILE: &str = "export_dir.txt";
 const INGEST_DAYS_FILE: &str = "ingest_window_days.txt";
 const INGEST_PROFILE_FILE: &str = "ingest_profile.json";
 const LLM_SETTINGS_FILE: &str = "llm_settings.json";
+const REMOTE_SETTINGS_FILE: &str = "remote_settings.json";
 const DEFAULT_INGEST_DAYS: u32 = 7;
 const DEFAULT_MAX_EVENTS_PER_SYNC: u32 = 2000;
 const MIN_MAX_EVENTS_PER_SYNC: u32 = 100;
@@ -94,6 +95,31 @@ impl Default for IngestProfile {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteConnectionProfile {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub os: String,
+    pub protocol: String,
+    pub username: String,
+    pub ssh_key_path: Option<String>,
+    pub auth_type: String, // "key_only" or "password"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSettings {
+    pub profiles: Vec<RemoteConnectionProfile>,
+}
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        Self { profiles: Vec::new() }
+    }
+}
+
 fn settings_dir() -> Result<PathBuf, String> {
     let mut base = data_local_dir().ok_or("Unable to resolve local data directory")?;
     base.push("hermes-log-analyst");
@@ -128,6 +154,12 @@ fn ingest_profile_path() -> Result<PathBuf, String> {
 fn llm_settings_path() -> Result<PathBuf, String> {
     let mut dir = settings_dir()?;
     dir.push(LLM_SETTINGS_FILE);
+    Ok(dir)
+}
+
+fn remote_settings_path() -> Result<PathBuf, String> {
+    let mut dir = settings_dir()?;
+    dir.push(REMOTE_SETTINGS_FILE);
     Ok(dir)
 }
 
@@ -236,9 +268,23 @@ fn sanitize_ingest_profile(profile: IngestProfile) -> IngestProfile {
                 channels.push(normalized.to_string());
             }
         }
+    }
+    
+    IngestProfile {
+        auto_sync_on_startup: profile.auto_sync_on_startup,
+        max_events_per_sync: profile.max_events_per_sync.clamp(MIN_MAX_EVENTS_PER_SYNC, MAX_MAX_EVENTS_PER_SYNC),
+        windows_channels: channels,
+        request_elevation: profile.request_elevation,
+    }
+}
+
+pub fn load_ingest_profile() -> IngestProfile {
+    let path_result = ingest_profile_path();
+    if path_result.is_err() {
         return IngestProfile::default();
-    };
-    let Ok(raw) = fs::read_to_string(path) else {
+    }
+    let path = path_result.unwrap();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
         return IngestProfile::default();
     };
     let Ok(parsed) = serde_json::from_str::<IngestProfile>(raw.as_str()) else {
@@ -254,6 +300,32 @@ pub fn save_ingest_profile(profile: IngestProfile) -> Result<IngestProfile, Stri
         serde_json::to_string_pretty(&sanitized).map_err(|error| format!("Failed to serialize ingest profile: {error}"))?;
     fs::write(path, payload.as_bytes()).map_err(|error| format!("Failed to save ingest profile: {error}"))?;
     Ok(sanitized)
+}
+
+pub fn load_remote_settings() -> RemoteSettings {
+    let path = remote_settings_path();
+    if path.is_err() {
+        return RemoteSettings::default();
+    }
+    let Ok(path) = path else {
+        return RemoteSettings::default();
+    };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return RemoteSettings::default();
+    };
+    let Ok(parsed) = serde_json::from_str::<RemoteSettings>(raw.as_str()) else {
+        return RemoteSettings::default();
+    };
+    parsed
+}
+
+pub fn save_remote_settings(settings: RemoteSettings) -> Result<RemoteSettings, String> {
+    let path = remote_settings_path()?;
+    let payload = serde_json::to_string_pretty(&settings)
+        .map_err(|error| format!("Failed to serialize remote settings: {error}"))?;
+    fs::write(path, payload.as_bytes())
+        .map_err(|error| format!("Failed to save remote settings: {error}"))?;
+    Ok(settings)
 }
 
 fn sanitize_trusted_hosts(values: Vec<String>) -> Vec<String> {
@@ -576,4 +648,42 @@ pub fn save_llm_settings(settings: LlmSettings) -> Result<LlmSettings, String> {
         serde_json::to_string_pretty(&sanitized).map_err(|error| format!("Failed to serialize LLM settings: {error}"))?;
     fs::write(path, payload.as_bytes()).map_err(|error| format!("Failed to save LLM settings: {error}"))?;
     Ok(sanitized)
+}
+
+
+const REMOTE_HOST_KEYCHAIN_SERVICE: &str = "hermes-log-analyst-remote-hosts";
+
+pub fn set_remote_profile_secret(profile_id: &str, secret: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(REMOTE_HOST_KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    entry
+        .set_password(secret)
+        .map_err(|error| format!("Unable to save secret in OS keychain: {error}"))
+}
+
+pub fn clear_remote_profile_secret(profile_id: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(REMOTE_HOST_KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    match entry.delete_credential() {
+        Ok(_) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Unable to clear secret from OS keychain: {error}")),
+    }
+}
+
+pub fn get_remote_profile_secret(profile_id: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(REMOTE_HOST_KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    match entry.get_password() {
+        Ok(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Unable to read secret from OS keychain: {error}")),
+    }
 }

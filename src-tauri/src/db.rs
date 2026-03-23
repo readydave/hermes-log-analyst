@@ -32,6 +32,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             event_id INTEGER,
             severity TEXT NOT NULL,
             message TEXT NOT NULL,
+            source_host TEXT NOT NULL DEFAULT 'localhost',
             imported INTEGER NOT NULL DEFAULT 0
         );
 
@@ -49,6 +50,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             summary TEXT NOT NULL,
             suspected_component TEXT,
             raw_path TEXT,
+            source_host TEXT NOT NULL DEFAULT 'localhost',
             imported INTEGER NOT NULL DEFAULT 0
         );
 
@@ -58,6 +60,10 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to create schema: {e}"))?;
 
+    // Migration for existing tables (ignore errors if column already exists)
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN source_host TEXT NOT NULL DEFAULT 'localhost'", []);
+    let _ = conn.execute("ALTER TABLE crashes ADD COLUMN source_host TEXT NOT NULL DEFAULT 'localhost'", []);
+    
     Ok(())
 }
 
@@ -72,7 +78,8 @@ fn row_to_event(row: &Row<'_>) -> rusqlite::Result<NormalizedEvent> {
         event_id: row.get(6)?,
         severity: row.get(7)?,
         message: row.get(8)?,
-        imported: row.get::<_, i64>(9)? != 0,
+        source_host: row.get(9)?,
+        imported: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -87,7 +94,8 @@ fn row_to_crash(row: &Row<'_>) -> rusqlite::Result<CrashRecord> {
         summary: row.get(6)?,
         suspected_component: row.get(7)?,
         raw_path: row.get(8)?,
-        imported: row.get::<_, i64>(9)? != 0,
+        source_host: row.get(9)?,
+        imported: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -100,8 +108,8 @@ pub fn save_local_events(events: &[NormalizedEvent]) -> Result<(), String> {
     for event in events {
         tx.execute(
             "
-            INSERT INTO events (id, timestamp, os, log_name, category, provider, event_id, severity, message, imported)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+            INSERT INTO events (id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host, imported)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
             ON CONFLICT(id) DO UPDATE SET
                 timestamp=excluded.timestamp,
                 os=excluded.os,
@@ -110,7 +118,8 @@ pub fn save_local_events(events: &[NormalizedEvent]) -> Result<(), String> {
                 provider=excluded.provider,
                 event_id=excluded.event_id,
                 severity=excluded.severity,
-                message=excluded.message
+                message=excluded.message,
+                source_host=excluded.source_host
             ",
             params![
                 event.id,
@@ -122,6 +131,7 @@ pub fn save_local_events(events: &[NormalizedEvent]) -> Result<(), String> {
                 event.event_id,
                 event.severity,
                 event.message,
+                event.source_host,
             ],
         )
         .map_err(|e| format!("Failed to upsert event: {e}"))?;
@@ -133,22 +143,22 @@ pub fn save_local_events(events: &[NormalizedEvent]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn get_local_events(limit: u32) -> Result<Vec<NormalizedEvent>, String> {
+pub fn get_local_events(limit: u32, host: Option<&str>) -> Result<Vec<NormalizedEvent>, String> {
     let conn = open_connection()?;
-    let mut stmt = conn
-        .prepare(
-            "
-            SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, imported
-            FROM events
-            ORDER BY timestamp DESC
-            LIMIT ?1
-            ",
-        )
-        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+    
+    let query = if host.is_some() {
+        "SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host, imported FROM events WHERE source_host = ?1 ORDER BY timestamp DESC LIMIT ?2"
+    } else {
+        "SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host, imported FROM events ORDER BY timestamp DESC LIMIT ?1"
+    };
 
-    let rows = stmt
-        .query_map([limit], row_to_event)
-        .map_err(|e| format!("Failed to execute query: {e}"))?;
+    let mut stmt = conn.prepare(query).map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let rows = if let Some(h) = host {
+        stmt.query_map(params![h, limit], row_to_event)
+    } else {
+        stmt.query_map(params![limit], row_to_event)
+    }.map_err(|e| format!("Failed to execute query: {e}"))?;
 
     let mut events = Vec::new();
     for row in rows {
@@ -158,28 +168,59 @@ pub fn get_local_events(limit: u32) -> Result<Vec<NormalizedEvent>, String> {
     Ok(events)
 }
 
-pub fn get_local_events_range(from: &str, to: &str, limit: u32) -> Result<Vec<NormalizedEvent>, String> {
+pub fn get_local_events_range(from: &str, to: &str, limit: u32, host: Option<&str>) -> Result<Vec<NormalizedEvent>, String> {
     let conn = open_connection()?;
-    let mut stmt = conn
-        .prepare(
-            "
-            SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, imported
-            FROM events
-            WHERE julianday(timestamp) >= julianday(?1)
-              AND julianday(timestamp) <= julianday(?2)
-            ORDER BY timestamp DESC
-            LIMIT ?3
-            ",
-        )
-        .map_err(|e| format!("Failed to prepare range query: {e}"))?;
+    
+    let query = if host.is_some() {
+        "SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host, imported FROM events WHERE julianday(timestamp) >= julianday(?1) AND julianday(timestamp) <= julianday(?2) AND source_host = ?3 ORDER BY timestamp DESC LIMIT ?4"
+    } else {
+        "SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host, imported FROM events WHERE julianday(timestamp) >= julianday(?1) AND julianday(timestamp) <= julianday(?2) ORDER BY timestamp DESC LIMIT ?3"
+    };
 
-    let rows = stmt
-        .query_map(params![from, to, limit], row_to_event)
-        .map_err(|e| format!("Failed to execute range query: {e}"))?;
+    let mut stmt = conn.prepare(query).map_err(|e| format!("Failed to prepare range query: {e}"))?;
+
+    let rows = if let Some(h) = host {
+        stmt.query_map(params![from, to, h, limit], row_to_event)
+    } else {
+        stmt.query_map(params![from, to, limit], row_to_event)
+    }.map_err(|e| format!("Failed to execute range query: {e}"))?;
 
     let mut events = Vec::new();
     for row in rows {
         events.push(row.map_err(|e| format!("Failed to parse range row: {e}"))?);
+    }
+
+    Ok(events)
+}
+
+pub fn get_local_events_window(
+    from: &str,
+    to: &str,
+    limit: u32,
+    host: Option<&str>,
+) -> Result<Vec<NormalizedEvent>, String> {
+    let conn = open_connection()?;
+
+    let query = if host.is_some() {
+        "SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host, imported FROM events WHERE julianday(timestamp) >= julianday(?1) AND julianday(timestamp) <= julianday(?2) AND source_host = ?3 ORDER BY timestamp DESC LIMIT ?4"
+    } else {
+        "SELECT id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host, imported FROM events WHERE julianday(timestamp) >= julianday(?1) AND julianday(timestamp) <= julianday(?2) ORDER BY timestamp DESC LIMIT ?3"
+    };
+
+    let mut stmt = conn
+        .prepare(query)
+        .map_err(|e| format!("Failed to prepare window query: {e}"))?;
+
+    let rows = if let Some(h) = host {
+        stmt.query_map(params![from, to, h, limit], row_to_event)
+    } else {
+        stmt.query_map(params![from, to, limit], row_to_event)
+    }
+    .map_err(|e| format!("Failed to execute window query: {e}"))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.map_err(|e| format!("Failed to parse window row: {e}"))?);
     }
 
     Ok(events)
@@ -194,8 +235,8 @@ pub fn save_crashes(crashes: &[CrashRecord]) -> Result<(), String> {
     for crash in crashes {
         tx.execute(
             "
-            INSERT INTO crashes (id, timestamp, os, source, crash_type, code, summary, suspected_component, raw_path, imported)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            INSERT INTO crashes (id, timestamp, os, source, crash_type, code, summary, suspected_component, raw_path, source_host, imported)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(id) DO UPDATE SET
                 timestamp=excluded.timestamp,
                 os=excluded.os,
@@ -205,6 +246,7 @@ pub fn save_crashes(crashes: &[CrashRecord]) -> Result<(), String> {
                 summary=excluded.summary,
                 suspected_component=excluded.suspected_component,
                 raw_path=excluded.raw_path,
+                source_host=excluded.source_host,
                 imported=excluded.imported
             ",
             params![
@@ -217,6 +259,7 @@ pub fn save_crashes(crashes: &[CrashRecord]) -> Result<(), String> {
                 crash.summary,
                 crash.suspected_component,
                 crash.raw_path,
+                crash.source_host,
                 if crash.imported { 1 } else { 0 },
             ],
         )
@@ -229,22 +272,22 @@ pub fn save_crashes(crashes: &[CrashRecord]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn get_crashes(limit: u32) -> Result<Vec<CrashRecord>, String> {
+pub fn get_crashes(limit: u32, host: Option<&str>) -> Result<Vec<CrashRecord>, String> {
     let conn = open_connection()?;
-    let mut stmt = conn
-        .prepare(
-            "
-            SELECT id, timestamp, os, source, crash_type, code, summary, suspected_component, raw_path, imported
-            FROM crashes
-            ORDER BY timestamp DESC
-            LIMIT ?1
-            ",
-        )
-        .map_err(|e| format!("Failed to prepare crash query: {e}"))?;
+    
+    let query = if host.is_some() {
+        "SELECT id, timestamp, os, source, crash_type, code, summary, suspected_component, raw_path, source_host, imported FROM crashes WHERE source_host = ?1 ORDER BY timestamp DESC LIMIT ?2"
+    } else {
+        "SELECT id, timestamp, os, source, crash_type, code, summary, suspected_component, raw_path, source_host, imported FROM crashes ORDER BY timestamp DESC LIMIT ?1"
+    };
 
-    let rows = stmt
-        .query_map([limit], row_to_crash)
-        .map_err(|e| format!("Failed to execute crash query: {e}"))?;
+    let mut stmt = conn.prepare(query).map_err(|e| format!("Failed to prepare crash query: {e}"))?;
+
+    let rows = if let Some(h) = host {
+        stmt.query_map(params![h, limit], row_to_crash)
+    } else {
+        stmt.query_map(params![limit], row_to_crash)
+    }.map_err(|e| format!("Failed to execute crash query: {e}"))?;
 
     let mut crashes = Vec::new();
     for row in rows {
@@ -289,10 +332,11 @@ pub fn correlate_crash_events(
     let mut stmt = conn
         .prepare(
             "
-            SELECT e.id, e.timestamp, e.os, e.log_name, e.category, e.provider, e.event_id, e.severity, e.message, e.imported
+            SELECT e.id, e.timestamp, e.os, e.log_name, e.category, e.provider, e.event_id, e.severity, e.message, e.source_host, e.imported
             FROM events e
             JOIN crashes c ON c.id = ?1
             WHERE e.os = c.os
+              AND e.source_host = c.source_host
               AND ABS((julianday(e.timestamp) - julianday(c.timestamp)) * 24 * 60) <= ?2
             ORDER BY ABS((julianday(e.timestamp) - julianday(c.timestamp)) * 24 * 60) ASC, e.timestamp DESC
             LIMIT ?3

@@ -29,7 +29,8 @@ function parseJson(content: string, hostOs: SupportedOs): NormalizedEvent[] {
     severity: normalizeSeverity(String(raw.severity ?? "information")),
     message: String(raw.message ?? `Imported event ${index + 1}`),
     raw,
-    imported: true
+    imported: true,
+    sourceHost: "localhost"
   }));
 }
 
@@ -53,7 +54,8 @@ function parseCsv(content: string, hostOs: SupportedOs): NormalizedEvent[] {
       severity: normalizeSeverity(String(row.severity || "information")),
       message: String(row.message || `Imported event ${index + 1}`),
       raw: row,
-      imported: true
+      imported: true,
+      sourceHost: "localhost"
     };
   });
 }

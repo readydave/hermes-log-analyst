@@ -1,6 +1,6 @@
-mod linux;
-mod macos;
-mod windows;
+pub mod linux;
+pub mod macos;
+pub mod windows;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,7 @@ pub struct NormalizedEvent {
     pub event_id: Option<u32>,
     pub severity: String,
     pub message: String,
+    pub source_host: String,
     pub imported: bool,
 }
 
@@ -44,6 +45,15 @@ pub struct NormalizedEvent {
 #[serde(rename_all = "camelCase")]
 pub struct CollectionResult {
     pub events: Vec<NormalizedEvent>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionEstimate {
+    pub estimated_count: usize,
+    pub estimated_bytes: usize,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
 }
@@ -57,6 +67,7 @@ impl NormalizedEvent {
         event_id: Option<u32>,
         severity: &str,
         message: &str,
+        source_host: &str,
     ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -68,6 +79,7 @@ impl NormalizedEvent {
             event_id,
             severity: severity.to_string(),
             message: message.to_string(),
+            source_host: source_host.to_string(),
             imported: false,
         }
     }
@@ -103,5 +115,18 @@ pub fn collect_host_events_range_with_windows_channels(
         }
         SupportedOs::Linux => linux::collect_events_range(start, end, max_events, request_elevation),
         SupportedOs::Macos => macos::collect_events_range(start, end, max_events, request_elevation),
+    }
+}
+
+pub fn estimate_host_events_range_with_windows_channels(
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    windows_channels: Option<&[String]>,
+    request_elevation: bool,
+) -> CollectionEstimate {
+    match detect_host_os() {
+        SupportedOs::Windows => windows::estimate_events_range_with_channels(start, end, windows_channels),
+        SupportedOs::Linux => linux::estimate_events_range(start, end, request_elevation),
+        SupportedOs::Macos => macos::estimate_events_range(start, end, request_elevation),
     }
 }

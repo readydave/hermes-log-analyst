@@ -1,4 +1,5 @@
-use super::{CollectionResult, NormalizedEvent, SupportedOs};
+use super::{CollectionEstimate, CollectionResult, NormalizedEvent, SupportedOs};
+use crate::settings::RemoteConnectionProfile;
 #[cfg(target_os = "windows")]
 use chrono::SecondsFormat;
 use chrono::{DateTime, Utc};
@@ -22,6 +23,8 @@ use windows_sys::Win32::System::EventLog::{
 
 #[cfg(target_os = "windows")]
 const DEFAULT_CHANNELS: [&str; 3] = ["Application", "System", "Security"];
+#[cfg(target_os = "windows")]
+const ESTIMATE_SAMPLE_LIMIT: usize = 200;
 
 #[cfg(target_os = "windows")]
 struct EvtHandle(EVT_HANDLE);
@@ -53,6 +56,16 @@ pub fn collect_events_range_with_channels(
     collect_with_wevtapi(start, end, max, selected_channels.as_slice())
 }
 
+#[cfg(target_os = "windows")]
+pub fn estimate_events_range_with_channels(
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    channels: Option<&[String]>,
+) -> CollectionEstimate {
+    let selected_channels = normalize_channels(channels);
+    estimate_with_wevtapi(start, end, selected_channels.as_slice())
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn collect_events_range_with_channels(
     _start: Option<DateTime<Utc>>,
@@ -61,6 +74,15 @@ pub fn collect_events_range_with_channels(
     _channels: Option<&[String]>,
 ) -> CollectionResult {
     CollectionResult::default()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn estimate_events_range_with_channels(
+    _start: Option<DateTime<Utc>>,
+    _end: Option<DateTime<Utc>>,
+    _channels: Option<&[String]>,
+) -> CollectionEstimate {
+    CollectionEstimate::default()
 }
 
 #[cfg(target_os = "windows")]
@@ -97,6 +119,56 @@ fn collect_with_wevtapi(
     }
 
     result
+}
+
+#[cfg(target_os = "windows")]
+fn estimate_with_wevtapi(
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    channels: &[&'static str],
+) -> CollectionEstimate {
+    let query = build_time_query(start, end);
+    let mut result = CollectionEstimate::default();
+
+    for channel in channels {
+        match estimate_channel_events(*channel, query.as_deref()) {
+            Ok(channel_estimate) => {
+                result.estimated_count += channel_estimate.count;
+                result.estimated_bytes += channel_estimate.estimated_bytes();
+            }
+            Err(error) => {
+                if error.to_ascii_lowercase().contains("access denied") {
+                    result.warnings.push(error);
+                } else {
+                    result.errors.push(error);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct ChannelEstimate {
+    count: usize,
+    sampled_bytes: usize,
+    sampled_count: usize,
+}
+
+#[cfg(target_os = "windows")]
+impl ChannelEstimate {
+    fn estimated_bytes(&self) -> usize {
+        if self.count == 0 {
+            return 0;
+        }
+        if self.sampled_count == 0 {
+            return self.count * 512;
+        }
+        let average_bytes = (self.sampled_bytes / self.sampled_count).max(128);
+        average_bytes * self.count
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -179,6 +251,69 @@ fn collect_channel_events(
 }
 
 #[cfg(target_os = "windows")]
+fn estimate_channel_events(channel: &str, query: Option<&str>) -> Result<ChannelEstimate, String> {
+    let query = query.unwrap_or("*");
+    let channel_w = to_wide(channel);
+    let query_w = to_wide(query);
+    let handle = unsafe { EvtQuery(0, channel_w.as_ptr(), query_w.as_ptr(), EvtQueryChannelPath) };
+    if handle == 0 {
+        let error = last_error();
+        if error == ERROR_ACCESS_DENIED {
+            return Err(format!(
+                "Access denied reading Windows '{channel}' channel (win32 {error})."
+            ));
+        }
+        return Err(format!("EvtQuery failed for {channel}: win32 {error}"));
+    }
+
+    let _query_handle = EvtHandle(handle);
+    let mut estimate = ChannelEstimate::default();
+    let mut handles = vec![0 as EVT_HANDLE; 32];
+
+    loop {
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            EvtNext(
+                handle,
+                handles.len() as u32,
+                handles.as_mut_ptr(),
+                0,
+                0,
+                &mut returned,
+            )
+        };
+        if ok == 0 {
+            let error = last_error();
+            if error == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            return Err(format!("EvtNext failed for {channel}: win32 {error}"));
+        }
+
+        for idx in 0..returned as usize {
+            let event_handle = handles[idx];
+            if event_handle == 0 {
+                continue;
+            }
+
+            estimate.count += 1;
+            if estimate.sampled_count < ESTIMATE_SAMPLE_LIMIT {
+                if let Some(xml) = render_event_xml(event_handle) {
+                    estimate.sampled_bytes += xml.len();
+                    estimate.sampled_count += 1;
+                }
+            }
+
+            unsafe {
+                EvtClose(event_handle);
+            }
+        }
+    }
+
+    Ok(estimate)
+}
+
+#[cfg(target_os = "windows")]
 fn render_event(handle: EVT_HANDLE, fallback_channel: &str) -> Option<NormalizedEvent> {
     let xml = render_event_xml(handle)?;
     let provider = extract_xml_attr(&xml, "Provider", "Name")
@@ -202,6 +337,7 @@ fn render_event(handle: EVT_HANDLE, fallback_channel: &str) -> Option<Normalized
         event_id,
         severity,
         sanitize_message(message.as_str()),
+        "localhost",
     );
 
     if let Some(timestamp) = extract_xml_attr(&xml, "TimeCreated", "SystemTime") {
@@ -478,4 +614,147 @@ fn wide_to_string(value: &[u16]) -> String {
 #[cfg(target_os = "windows")]
 fn last_error() -> u32 {
     unsafe { GetLastError() }
+}
+
+
+pub fn collect_remote_windows_events(
+    profile: &RemoteConnectionProfile,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max_events: Option<u32>,
+    channels: Option<&[String]>,
+) -> CollectionResult {
+    let mut result = CollectionResult::default();
+    let max = max_events.unwrap_or(2000);
+    
+    let default_channels = vec!["Application".to_string(), "System".to_string(), "Security".to_string()];
+    let channel_list = channels
+        .map(|c| c.to_vec())
+        .unwrap_or(default_channels)
+        .iter()
+        .map(|c| format!("'{}'", c))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // A simpler filter payload using XPath could be used, but since we map heavily, simple parameters work.
+    let script_block = format!(
+        r#"$Max = {};
+          $LogNames = @({});
+          $Events = Get-WinEvent -LogName $LogNames -MaxEvents $Max -ErrorAction SilentlyContinue;
+          $Result = @();
+          foreach ($e in $Events) {{
+             $Result += [PSCustomObject]@{{
+                 Id = $e.Id
+                 LogName = $e.LogName
+                 ProviderName = $e.ProviderName
+                 LevelDisplayName = $e.LevelDisplayName
+                 Message = $e.Message
+                 TimeCreated = $e.TimeCreated.ToString('o')
+             }}
+          }}
+          $Result | ConvertTo-Json -Depth 2 -Compress"#,
+        max,
+        channel_list
+    );
+
+    // If we need explicit password, we'd build a PSCredential here. 
+    // For now, assume domain auth context (No explicit password flag needed, just ComputerName) unless specified.
+let mut cred_setup = String::new();
+    let mut cred_arg = String::new();
+    
+    if profile.auth_type == "password" && !profile.username.is_empty() {
+        if let Ok(Some(secret)) = crate::settings::get_remote_profile_secret(&profile.id) {
+            cred_setup = format!(
+                "$SecPwd = ConvertTo-SecureString '{}' -AsPlainText -Force; $Cred = New-Object System.Management.Automation.PSCredential ('{}', $SecPwd); ",
+                secret.replace("'", "''"),
+                profile.username.replace("'", "''")
+            );
+            cred_arg = "-Credential $Cred".to_string();
+        }
+    }
+
+    let wrapper_script = format!(
+        "{}$sb = [scriptblock]::Create('{}'); Invoke-Command -ComputerName '{}' {} -ScriptBlock $sb",
+        cred_setup,
+        script_block.replace("'", "''"),
+        profile.host.replace("'", "''"),
+        cred_arg
+    );
+
+    let output = match std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(&wrapper_script)
+        .output() 
+    {
+        Ok(out) => out,
+        Err(e) => {
+            result.errors.push(format!("Failed to execute powershell: {}", e));
+            return result;
+        }
+    };
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        if err.to_ascii_lowercase().contains("access is denied") {
+            result.warnings.push(format!("Access Denied connecting to {}. Verify credentials/WinRM.", profile.host));
+        } else {
+            result.errors.push(format!("WinRM error on {}: {}", profile.host, err));
+        }
+        return result;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return result; // No events
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(serde_json::Value::Array(arr)) => {
+            for item in arr {
+                let log_name = item.get("LogName").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let provider = item.get("ProviderName").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let message = item.get("Message").and_then(|v| v.as_str()).unwrap_or("No message.");
+                let level = item.get("LevelDisplayName").and_then(|v| v.as_str()).unwrap_or("Information");
+                let event_id = item.get("Id").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let time = item.get("TimeCreated").and_then(|v| v.as_str()).unwrap_or("");
+
+                let severity = match level.to_ascii_lowercase().as_str() {
+                    "error" | "critical" => "Error",
+                    "warning" => "Warning",
+                    "verbose" => "Information",
+                    _ => "Information",
+                };
+                
+                let category = map_category(log_name);
+
+                let mut ev = NormalizedEvent::new(
+                    SupportedOs::Windows,
+                    log_name,
+                    map_category(log_name),
+                    provider,
+                    event_id,
+                    severity,
+                    sanitize_message(message),
+                    &profile.host,
+                );
+                
+                if !time.is_empty() {
+                    ev.timestamp = time.to_string();
+                }
+
+                result.events.push(ev);
+            }
+        }
+        Ok(single) => {
+            // Unlikely, but if only one event matches, it might return a single object, not array.
+            result.warnings.push("Only one event matched. Need to handle singleton parsing.".to_string());
+        }
+        Err(e) => {
+            result.errors.push(format!("Failed to parse WinRM json output: {}", e));
+        }
+    }
+
+    result
 }

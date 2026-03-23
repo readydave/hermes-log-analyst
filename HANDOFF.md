@@ -108,6 +108,7 @@
 
 ## Next Work Items (Recommended)
 1. Stabilize LLM/provider connectivity across localhost, LAN, and cloud profiles; revalidate on Windows, macOS, and Garuda with live providers.
+   - When local or LAN Ollama/LM Studio providers are detected and applied, auto-select the currently loaded/available model as the default model for that profile instead of leaving a stale or mismatched model value.
 2. Add remote machine connectors (SSH/WinRM).
 3. Enrich crash importers with minidump/panic/core parsing and optional symbolication.
 4. Add ingest diagnostics in UI (per-channel counts + timing).

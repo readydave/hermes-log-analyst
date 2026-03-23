@@ -25,6 +25,7 @@ export interface NormalizedEvent {
   eventId?: number;
   severity: EventSeverity;
   message: string;
+  sourceHost: string;
   raw?: unknown;
   imported?: boolean;
 }
@@ -39,6 +40,7 @@ export interface CrashRecord {
   summary: string;
   suspectedComponent?: string;
   rawPath?: string;
+  sourceHost: string;
   imported?: boolean;
 }
 

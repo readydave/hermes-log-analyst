@@ -14,6 +14,41 @@ export interface SyncOperationResult {
   warnings: string[];
 }
 
+export interface EventLoadEstimate {
+  windowStart: string;
+  windowEnd: string;
+  estimatedCount: number;
+  estimatedBytes: number;
+  warnings: string[];
+}
+
+export interface RemoteConnectionProfile {
+  id: string;
+  name: string;
+  host: string;
+  os: string;
+  protocol: string;
+  username: string;
+  ssh_key_path: string | null;
+  auth_type: string;
+}
+
+export interface RemoteSettings {
+  profiles: RemoteConnectionProfile[];
+}
+
+export async function getRemoteSettings(): Promise<RemoteSettings> {
+  if (!isTauriRuntime()) return { profiles: [] };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<RemoteSettings>("get_remote_settings");
+}
+
+export async function saveRemoteSettings(settings: RemoteSettings): Promise<RemoteSettings> {
+  if (!isTauriRuntime()) return settings;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<RemoteSettings>("save_remote_settings", { settings });
+}
+
 export interface LlmConnectionProfile {
   id: string;
   name: string;
@@ -101,7 +136,6 @@ function createDefaultLlmSettings(): LlmSettings {
     backupProfileId: "",
     preferredLanInterfaceId: ""
   };
-}
 }
 
 export async function setIngestProfile(profile: IngestProfile): Promise<IngestProfile> {
@@ -224,21 +258,52 @@ export async function syncLocalEventsRange(
   return invoke<SyncOperationResult>("sync_local_events_range", { from, to, replaceOutsideRange });
 }
 
-export async function refreshLocalEvents(): Promise<SyncOperationResult> {
+export async function estimateRefreshLocalEvents(): Promise<EventLoadEstimate> {
+  if (!isTauriRuntime()) {
+    return {
+      windowStart: new Date().toISOString(),
+      windowEnd: new Date().toISOString(),
+      estimatedCount: 0,
+      estimatedBytes: 0,
+      warnings: []
+    };
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<EventLoadEstimate>("estimate_refresh_local_events");
+}
+
+export async function estimateLocalEventsRange(from: string, to: string): Promise<EventLoadEstimate> {
+  if (!isTauriRuntime()) {
+    return {
+      windowStart: new Date().toISOString(),
+      windowEnd: new Date().toISOString(),
+      estimatedCount: 0,
+      estimatedBytes: 0,
+      warnings: []
+    };
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<EventLoadEstimate>("estimate_local_events_range", { from, to });
+}
+
+export async function refreshLocalEvents(targetId?: string): Promise<SyncOperationResult> {
   if (!isTauriRuntime()) return { collected: 0, warnings: [] };
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<SyncOperationResult>("refresh_local_events");
+  return invoke<SyncOperationResult>("refresh_local_events", { targetId });
 }
 
-export async function getLocalEvents(limit = 10000): Promise<NormalizedEvent[]> {
+export async function getLocalEvents(targetId?: string, limit = 10000): Promise<NormalizedEvent[]> {
   if (!isTauriRuntime()) return [];
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<NormalizedEvent[]>("get_local_events", { limit });
+  return invoke<NormalizedEvent[]>("get_local_events", { targetId, limit });
 }
 
 export async function getLocalEventsRange(
+  targetId: string | undefined,
   from: string,
   to: string,
   limit = 20000
@@ -246,21 +311,21 @@ export async function getLocalEventsRange(
   if (!isTauriRuntime()) return [];
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<NormalizedEvent[]>("get_local_events_range", { from, to, limit });
+  return invoke<NormalizedEvent[]>("get_local_events_range", { targetId, from, to, limit });
 }
 
-export async function importHostCrashes(limit = 200): Promise<number> {
+export async function importHostCrashes(targetId?: string, limit = 200): Promise<number> {
   if (!isTauriRuntime()) return 0;
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("import_host_crashes", { limit });
+  return invoke<number>("import_host_crashes", { targetId, limit });
 }
 
-export async function getCrashes(limit = 250): Promise<CrashRecord[]> {
+export async function getCrashes(targetId?: string, limit = 250): Promise<CrashRecord[]> {
   if (!isTauriRuntime()) return [];
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<CrashRecord[]>("get_crashes", { limit });
+  return invoke<CrashRecord[]>("get_crashes", { targetId, limit });
 }
 
 export async function getCrashRelatedEvents(
@@ -276,6 +341,29 @@ export async function getCrashRelatedEvents(
     windowMinutes,
     limit
   });
+}
+
+export async function syncLocalEventsWindow(
+  start: string,
+  end: string,
+  targetId?: string
+): Promise<SyncOperationResult> {
+  if (!isTauriRuntime()) return { collected: 0, warnings: [] };
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<SyncOperationResult>("sync_local_events_window", { targetId, start, end });
+}
+
+export async function getLocalEventsWindow(
+  start: string,
+  end: string,
+  limit = 10000,
+  targetId?: string
+): Promise<NormalizedEvent[]> {
+  if (!isTauriRuntime()) return [];
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<NormalizedEvent[]>("get_local_events_window", { targetId, start, end, limit });
 }
 
 export async function openExternalUrl(url: string): Promise<void> {
@@ -379,21 +467,13 @@ export async function quitApp(): Promise<void> {
   await invoke("quit_app");
 }
 
-export async function setAppTheme(theme: ThemeMode): Promise<void> {
-  if (!isTauriRuntime()) return;
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("set_app_theme", { theme });
-}
-
-export async function quitApp(): Promise<void> {
+export async function restartElevated(): Promise<void> {
   if (!isTauriRuntime()) {
-    window.close();
-    return;
+    throw new Error("Elevated restart is only available in desktop runtime.");
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("quit_app");
+  await invoke("restart_elevated");
 }
 
 export async function setAppTheme(theme: ThemeMode): Promise<void> {
@@ -402,6 +482,8 @@ export async function setAppTheme(theme: ThemeMode): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("set_app_theme", { theme });
 }
+
+
 
 export async function getSavedTheme(): Promise<ThemeMode | null> {
   if (!isTauriRuntime()) return null;
@@ -412,3 +494,31 @@ export async function getSavedTheme(): Promise<ThemeMode | null> {
   return null;
 }
 
+
+export function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+export async function getHostOs(): Promise<SupportedOs> {
+  if (!isTauriRuntime()) return "windows";
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<SupportedOs>("host_os");
+}
+
+export async function getHostOsVersion(): Promise<string> {
+  if (!isTauriRuntime()) return "Unknown";
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("host_os_version");
+}
+
+export async function getIngestProfile(): Promise<IngestProfile> {
+  if (!isTauriRuntime()) return { autoSyncOnStartup: false, maxEventsPerSync: 1000, windowsChannels: ["Application", "System", "Security"], requestElevation: false };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<IngestProfile>("get_ingest_profile");
+}
+
+export async function getIngestWindowDays(): Promise<number> {
+  if (!isTauriRuntime()) return 7;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("get_ingest_window_days");
+}

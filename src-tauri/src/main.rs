@@ -9,11 +9,13 @@ use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use crash::{import_host_crashes as collect_host_crashes, CrashRecord};
 use db::{
     correlate_crash_events, get_crashes as read_crashes, get_local_events as read_local_events,
-    get_local_events_range as read_local_events_range, prune_events_before, prune_events_outside,
-    save_crashes, save_local_events,
+    get_local_events_range as read_local_events_range,
+    get_local_events_window as read_local_events_window, prune_events_before,
+    prune_events_outside, save_crashes, save_local_events,
 };
 use logs::{
-    collect_host_events_range_with_windows_channels, detect_host_os, CollectionResult,
+    collect_host_events_range_with_windows_channels, detect_host_os,
+    estimate_host_events_range_with_windows_channels, CollectionEstimate, CollectionResult,
     NormalizedEvent,
 };
 use serde::{Deserialize, Serialize};
@@ -110,6 +112,16 @@ struct SyncOperationResult {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EventLoadEstimateResult {
+    window_start: String,
+    window_end: String,
+    estimated_count: usize,
+    estimated_bytes: usize,
+    warnings: Vec<String>,
+}
+
 fn summarize_messages(messages: &[String], max_count: usize) -> String {
     if messages.is_empty() {
         return String::new();
@@ -162,6 +174,44 @@ fn report_collection_outcome(
         warnings,
     })
 }
+
+fn report_collection_estimate(
+    context: &str,
+    window_start: &DateTime<Utc>,
+    window_end: &DateTime<Utc>,
+    estimate: &CollectionEstimate,
+) -> Result<EventLoadEstimateResult, String> {
+    for warning in &estimate.warnings {
+        diagnostics::warn("collector", format!("{context}: {warning}"));
+    }
+    for error in &estimate.errors {
+        diagnostics::error("collector", format!("{context}: {error}"));
+    }
+
+    if estimate.estimated_count == 0 && !estimate.errors.is_empty() {
+        return Err(format!(
+            "{context} failed before any estimate was produced. {}",
+            summarize_messages(&estimate.errors, 2)
+        ));
+    }
+
+    let mut warnings = estimate.warnings.clone();
+    if !estimate.errors.is_empty() {
+        warnings.push(format!(
+            "Estimate reported recoverable errors. {}",
+            summarize_messages(&estimate.errors, 2)
+        ));
+    }
+
+    Ok(EventLoadEstimateResult {
+        window_start: window_start.to_rfc3339(),
+        window_end: window_end.to_rfc3339(),
+        estimated_count: estimate.estimated_count,
+        estimated_bytes: estimate.estimated_bytes,
+        warnings,
+    })
+}
+
 
 fn command_error(subsystem: &str, context: &str, error: impl AsRef<str>) -> String {
     let message = error.as_ref().to_string();
@@ -262,6 +312,20 @@ fn parse_model_ids(value: &Value) -> Vec<String> {
 
     models.sort();
     models
+}
+
+fn summarize_http_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let condensed = trimmed.replace('\n', " ");
+    if condensed.len() <= 240 {
+        condensed
+    } else {
+        format!("{}...", &condensed[..240])
+    }
 }
 
 fn default_test_result(profile: &LlmConnectionProfile) -> LlmConnectionTestResult {
@@ -737,7 +801,16 @@ fn run_ollama_analysis(
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Ollama analysis request failed (HTTP {}).", status.as_u16()));
+        let summary = summarize_http_body(body.as_str());
+        return Err(if summary.is_empty() {
+            format!("Ollama analysis request failed (HTTP {}).", status.as_u16())
+        } else {
+            format!(
+                "Ollama analysis request failed (HTTP {}). {}",
+                status.as_u16(),
+                summary
+            )
+        });
     }
     let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
     parse_chat_completion_text(&parsed)
@@ -772,10 +845,19 @@ fn run_openai_compatible_analysis(
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!(
-            "{provider} analysis request failed (HTTP {}).",
-            status.as_u16()
-        ));
+        let summary = summarize_http_body(body.as_str());
+        return Err(if summary.is_empty() {
+            format!(
+                "{provider} analysis request failed (HTTP {}).",
+                status.as_u16()
+            )
+        } else {
+            format!(
+                "{provider} analysis request failed (HTTP {}). {}",
+                status.as_u16(),
+                summary
+            )
+        });
     }
     let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
     parse_chat_completion_text(&parsed).ok_or_else(|| {
@@ -892,6 +974,17 @@ fn profile_warning_for_settings(profile: &LlmConnectionProfile, settings: &LlmSe
     ))
 }
 
+fn analysis_timeout_for_profile(profile: &LlmConnectionProfile) -> Duration {
+    let provider = profile.provider.trim().to_ascii_lowercase();
+    let scope = profile.scope.trim().to_ascii_lowercase();
+
+    if provider == "ollama" || provider == "lmstudio" || scope == "local" || scope == "lan" {
+        Duration::from_secs(600)
+    } else {
+        Duration::from_secs(90)
+    }
+}
+
 fn run_profile_analysis(
     profile: &LlmConnectionProfile,
     prompt: &str,
@@ -907,7 +1000,7 @@ fn run_profile_analysis(
     }
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(75))
+        .timeout(analysis_timeout_for_profile(profile))
         .build()
         .map_err(|error| format!("Failed to initialize HTTP client: {error}"))?;
     let model = resolve_model_for_profile(profile, &client, api_key)?;
@@ -1049,22 +1142,44 @@ fn analyze_with_local_llm_sync(
     ))
 }
 
+
+fn resolve_target_profile(target_id: Option<&str>) -> Option<crate::settings::RemoteConnectionProfile> {
+    let id = target_id?;
+    if id == "localhost" || id.trim().is_empty() {
+        return None;
+    }
+    let settings = crate::settings::load_remote_settings();
+    settings.profiles.into_iter().find(|p| p.id == id)
+}
+
 #[tauri::command]
-async fn refresh_local_events() -> Result<SyncOperationResult, String> {
+async fn refresh_local_events(target_id: Option<String>) -> Result<SyncOperationResult, String> {
     let days = load_ingest_window_days();
     let profile = load_ingest_profile();
     let now = Utc::now();
     let start = now - chrono::Duration::days(days as i64);
     let start_str = start.to_rfc3339();
 
+    let target = target_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let outcome = collect_host_events_range_with_windows_channels(
-            Some(start),
-            Some(now),
-            Some(profile.max_events_per_sync),
-            Some(profile.windows_channels.as_slice()),
-            profile.request_elevation,
-        );
+        let remote_profile = resolve_target_profile(target.as_deref());
+        
+        let outcome = if let Some(remote) = remote_profile {
+            match remote.os.to_lowercase().as_str() {
+                "windows" => crate::logs::windows::collect_remote_windows_events(&remote, Some(start), Some(now), Some(profile.max_events_per_sync), Some(profile.windows_channels.as_slice())),
+                "linux" => crate::logs::linux::collect_remote_linux_events(&remote, Some(start), Some(now), Some(profile.max_events_per_sync), Some(profile.windows_channels.as_slice())),
+                "macos" => crate::logs::macos::collect_remote_macos_events(&remote, Some(start), Some(now), Some(profile.max_events_per_sync), Some(profile.windows_channels.as_slice())),
+                _ => crate::logs::CollectionResult::default()
+            }
+        } else {
+            collect_host_events_range_with_windows_channels(
+                Some(start),
+                Some(now),
+                Some(profile.max_events_per_sync),
+                Some(profile.windows_channels.as_slice()),
+                profile.request_elevation,
+            )
+        };
         let report = report_collection_outcome("Refresh collection", &outcome)?;
         save_local_events(outcome.events.as_slice())
             .map_err(|error| command_error("storage", "Failed to save refreshed events", error))?;
@@ -1084,14 +1199,42 @@ async fn refresh_local_events() -> Result<SyncOperationResult, String> {
 }
 
 #[tauri::command]
-fn get_local_events(limit: Option<u32>) -> Result<Vec<NormalizedEvent>, String> {
+async fn estimate_refresh_local_events() -> Result<EventLoadEstimateResult, String> {
+    let days = load_ingest_window_days();
+    let profile = load_ingest_profile();
+    let now = Utc::now();
+    let start = now - chrono::Duration::days(days as i64);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let estimate = estimate_host_events_range_with_windows_channels(
+            Some(start),
+            Some(now),
+            Some(profile.windows_channels.as_slice()),
+            profile.request_elevation,
+        );
+        report_collection_estimate("Refresh estimate", &start, &now, &estimate)
+    })
+    .await
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join refresh estimate task",
+            error.to_string(),
+        )
+    })?
+}
+
+#[tauri::command]
+fn get_local_events(target_id: Option<String>, limit: Option<u32>) -> Result<Vec<NormalizedEvent>, String> {
     let limit = limit.unwrap_or(10000).min(50000);
-    read_local_events(limit)
+    let host = resolve_target_profile(target_id.as_deref()).map(|p| p.host).unwrap_or_else(|| "localhost".to_string());
+    read_local_events(limit, Some(&host))
         .map_err(|error| command_error("storage", "Failed to read local events", error))
 }
 
 #[tauri::command]
 fn get_local_events_range(
+    target_id: Option<String>,
     from: String,
     to: String,
     limit: Option<u32>,
@@ -1101,12 +1244,33 @@ fn get_local_events_range(
     let limit = limit.unwrap_or(10000).min(50000);
     let start_str = start.to_rfc3339();
     let end_str = end.to_rfc3339();
-    read_local_events_range(start_str.as_str(), end_str.as_str(), limit)
+    let host = resolve_target_profile(target_id.as_deref()).map(|p| p.host).unwrap_or_else(|| "localhost".to_string());
+    read_local_events_range(start_str.as_str(), end_str.as_str(), limit, Some(&host))
         .map_err(|error| command_error("storage", "Failed to read local events for range", error))
 }
 
 #[tauri::command]
-async fn import_host_crashes(limit: Option<u32>) -> Result<usize, String> {
+fn get_local_events_window(
+    target_id: Option<String>,
+    start: String,
+    end: String,
+    limit: Option<u32>,
+) -> Result<Vec<NormalizedEvent>, String> {
+    let (start_value, end_value) = parse_timestamp_window(start.as_str(), end.as_str())
+        .map_err(|error| command_error("runtime", "Invalid local events window", error))?;
+    let limit = limit.unwrap_or(10000).min(50000);
+    let start_str = start_value.to_rfc3339();
+    let end_str = end_value.to_rfc3339();
+    let host = resolve_target_profile(target_id.as_deref())
+        .map(|p| p.host)
+        .unwrap_or_else(|| "localhost".to_string());
+    read_local_events_window(start_str.as_str(), end_str.as_str(), limit, Some(&host)).map_err(
+        |error| command_error("storage", "Failed to read local events for window", error),
+    )
+}
+
+#[tauri::command]
+async fn import_host_crashes(target_id: Option<String>, limit: Option<u32>) -> Result<usize, String> {
     let max = limit.unwrap_or(200).clamp(1, 2000) as usize;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -1130,9 +1294,10 @@ async fn import_host_crashes(limit: Option<u32>) -> Result<usize, String> {
 }
 
 #[tauri::command]
-fn get_crashes(limit: Option<u32>) -> Result<Vec<CrashRecord>, String> {
+fn get_crashes(target_id: Option<String>, limit: Option<u32>) -> Result<Vec<CrashRecord>, String> {
     let limit = limit.unwrap_or(250).min(5000);
-    read_crashes(limit).map_err(|error| command_error("storage", "Failed to read crashes", error))
+    let host = resolve_target_profile(target_id.as_deref()).map(|p| p.host).unwrap_or_else(|| "localhost".to_string());
+    read_crashes(limit, Some(&host)).map_err(|error| command_error("storage", "Failed to read crashes", error))
 }
 
 #[tauri::command]
@@ -1295,7 +1460,7 @@ async fn analyze_with_local_llm(
     profile_id: Option<String>,
 ) -> Result<LlmAnalysisResult, String> {
     let settings = load_llm_settings_with_migration().settings;
-    tauri::async_runtime::spawn_blocking(move || {
+    let analysis = tauri::async_runtime::spawn_blocking(move || {
         analyze_with_local_llm_sync(settings, prompt, profile_id)
     })
     .await
@@ -1305,7 +1470,9 @@ async fn analyze_with_local_llm(
             "Failed to join local LLM analysis task",
             error.to_string(),
         )
-    })?
+    })?;
+
+    analysis.map_err(|error| command_error("llm", "Local LLM analysis failed", error))
 }
 
 #[tauri::command]
@@ -1374,6 +1541,99 @@ async fn sync_local_events_range(
         command_error(
             "runtime",
             "Failed to join range sync task",
+            error.to_string(),
+        )
+    })?
+}
+
+#[tauri::command]
+async fn sync_local_events_window(
+    target_id: Option<String>,
+    start: String,
+    end: String,
+) -> Result<SyncOperationResult, String> {
+    let (start_value, end_value) = parse_timestamp_window(start.as_str(), end.as_str())
+        .map_err(|error| command_error("runtime", "Invalid sync window", error))?;
+    let profile = load_ingest_profile();
+    let target = target_id.clone();
+    let max_events = profile.max_events_per_sync.max(5000);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let remote_profile = resolve_target_profile(target.as_deref());
+
+        let outcome = if let Some(remote) = remote_profile {
+            match remote.os.to_lowercase().as_str() {
+                "windows" => crate::logs::windows::collect_remote_windows_events(
+                    &remote,
+                    Some(start_value),
+                    Some(end_value),
+                    Some(max_events),
+                    Some(profile.windows_channels.as_slice()),
+                ),
+                "linux" => crate::logs::linux::collect_remote_linux_events(
+                    &remote,
+                    Some(start_value),
+                    Some(end_value),
+                    Some(max_events),
+                    Some(profile.windows_channels.as_slice()),
+                ),
+                "macos" => crate::logs::macos::collect_remote_macos_events(
+                    &remote,
+                    Some(start_value),
+                    Some(end_value),
+                    Some(max_events),
+                    Some(profile.windows_channels.as_slice()),
+                ),
+                _ => crate::logs::CollectionResult::default(),
+            }
+        } else {
+            collect_host_events_range_with_windows_channels(
+                Some(start_value),
+                Some(end_value),
+                Some(max_events),
+                Some(profile.windows_channels.as_slice()),
+                profile.request_elevation,
+            )
+        };
+        let report = report_collection_outcome("Crash window collection", &outcome)?;
+        save_local_events(outcome.events.as_slice()).map_err(|error| {
+            command_error("storage", "Failed to save crash-window events", error)
+        })?;
+        Ok::<SyncOperationResult, String>(report)
+    })
+    .await
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join crash window sync task",
+            error.to_string(),
+        )
+    })?
+}
+
+#[tauri::command]
+async fn estimate_local_events_range(
+    from: String,
+    to: String,
+) -> Result<EventLoadEstimateResult, String> {
+    let (start, end) = parse_local_date_range(from.as_str(), to.as_str())
+        .map_err(|error| command_error("runtime", "Invalid estimate range", error))?;
+    let profile = load_ingest_profile();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let estimate = estimate_host_events_range_with_windows_channels(
+            Some(start),
+            Some(end),
+            Some(profile.windows_channels.as_slice()),
+            profile.request_elevation,
+        );
+        report_collection_estimate("Range estimate", &start, &end, &estimate)
+    })
+    .await
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join range estimate task",
             error.to_string(),
         )
     })?
@@ -1678,6 +1938,29 @@ fn parse_local_date_range(from: &str, to: &str) -> Result<(DateTime<Utc>, DateTi
     Ok((start, end))
 }
 
+fn parse_timestamp_window(
+    start: &str,
+    end: &str,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    let start_value = DateTime::parse_from_rfc3339(start)
+        .map_err(|_| "Invalid start timestamp format (expected RFC3339).")?;
+    let end_value = DateTime::parse_from_rfc3339(end)
+        .map_err(|_| "Invalid end timestamp format (expected RFC3339).")?;
+
+    let mut start_utc = start_value.with_timezone(&Utc);
+    let mut end_utc = end_value.with_timezone(&Utc);
+    if start_utc > end_utc {
+        std::mem::swap(&mut start_utc, &mut end_utc);
+    }
+
+    let max_span = chrono::Duration::days(7);
+    if end_utc - start_utc > max_span {
+        return Err("Crash investigation window is too large (max 7 days).".to_string());
+    }
+
+    Ok((start_utc, end_utc))
+}
+
 #[cfg(target_os = "linux")]
 fn configure_linux_runtime_defaults() {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
@@ -1724,36 +2007,72 @@ fn restart_elevated() -> Result<(), String> {
 
         std::process::exit(0);
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err("Elevation restart is only supported on Windows.".to_string())
-    }
-}
 
-#[tauri::command]
-fn restart_elevated() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
+    #[cfg(target_os = "macos")]
     {
         let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
-        std::process::Command::new("powershell")
-            .arg("-Command")
-            .arg("Start-Process")
-            .arg("-FilePath")
-            .arg(format!("'{}'", exe_path.display()))
-            .arg("-Verb")
-            .arg("RunAs")
+        let shell_path = exe_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "do shell script quoted form of \"{}\" with administrator privileges",
+            shell_path
+        );
+
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
             .spawn()
             .map_err(|e| e.to_string())?;
 
         std::process::exit(0);
     }
-    #[cfg(not(target_os = "windows"))]
+
+    #[cfg(target_os = "linux")]
     {
-        Err("Elevation restart is only supported on Windows.".to_string())
+        let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        std::process::Command::new("pkexec")
+            .arg(exe_path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        std::process::exit(0);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err("Elevation restart is not supported on this platform.".to_string())
     }
 }
 
+
+
+
+
+
+
+
+
+#[tauri::command]
+fn get_remote_settings() -> crate::settings::RemoteSettings {
+    crate::settings::load_remote_settings()
+}
+
+#[tauri::command]
+fn save_remote_settings(settings: crate::settings::RemoteSettings) -> Result<crate::settings::RemoteSettings, String> {
+    crate::settings::save_remote_settings(settings)
+}
+
+#[tauri::command]
+fn save_remote_profile_secret(profile_id: String, secret: String) -> Result<(), String> {
+    crate::settings::set_remote_profile_secret(&profile_id, &secret)
+}
+
+#[tauri::command]
+fn clear_remote_profile_secret(profile_id: String) -> Result<(), String> {
+    crate::settings::clear_remote_profile_secret(&profile_id)
+}
+
 fn sanitize_filename(filename: &str, extension: &str) -> String {
+
     let raw_name = Path::new(filename)
         .file_name()
         .and_then(|value| value.to_str())
@@ -1933,9 +2252,21 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            host_os,
+            host_os_version,
+            get_remote_settings,
+            save_remote_settings,
+            save_remote_profile_secret,
+            clear_remote_profile_secret,
             open_external_url,
             restart_elevated,
-            restart_elevated,
+            refresh_local_events,
+            get_local_events,
+            get_local_events_range,
+            get_local_events_window,
+            import_host_crashes,
+            get_crashes,
+            get_crash_related_events,
             get_ingest_window_days,
             set_ingest_window_days,
             get_ingest_profile,
@@ -1950,7 +2281,10 @@ fn main() {
             test_llm_profile_connection,
             analyze_with_local_llm,
             backfill_local_events,
+            estimate_local_events_range,
+            estimate_refresh_local_events,
             sync_local_events_range,
+            sync_local_events_window,
             get_export_directory,
             choose_export_directory,
             set_export_directory,

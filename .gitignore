@@ -9,3 +9,6 @@ tsconfig.tsbuildinfo
 # Generated PDF artifacts
 output/pdf/
 tmp/pdfs/
+
+# Local convenience launchers
+scripts/hermes-start.cmd

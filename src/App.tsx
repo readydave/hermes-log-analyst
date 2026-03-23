@@ -8,11 +8,15 @@ import {
   getHostOsVersion,
   getLocalEvents,
   getSavedTheme,
+  getLocalEventsWindow,
   isTauriRuntime,
   openExternalUrl,
   quitApp,
+  estimateRefreshLocalEvents,
+  estimateLocalEventsRange,
   refreshLocalEvents,
   syncLocalEventsRange,
+  syncLocalEventsWindow,
   getLocalEventsRange,
   getIngestProfile,
   getLlmSettings,
@@ -27,7 +31,10 @@ import {
   setIngestWindowDays,
   detectLocalLlmProviders,
   scanLanLlmProviders,
-  listLlmNetworkInterfaces
+  listLlmNetworkInterfaces,
+  getRemoteSettings,
+  saveRemoteSettings,
+  restartElevated
 } from "./lib/backend";
 import type {
   IngestProfile,
@@ -37,7 +44,10 @@ import type {
   LlmEndpointCandidate,
   LlmNetworkInterface,
   LlmSettings,
-  SyncOperationResult
+  EventLoadEstimate,
+  SyncOperationResult,
+  RemoteSettings,
+  RemoteConnectionProfile
 } from "./lib/backend";
 import { exportAsCsv, exportAsJson, exportAsText } from "./lib/export";
 import { applyFilters, defaultFilters } from "./lib/filters";
@@ -144,6 +154,18 @@ function providerLabel(providerId: string): string {
   return found ? found.label : providerId;
 }
 
+function scopeLabel(scope: string): string {
+  if (scope === "local") return "Local";
+  if (scope === "lan") return "LAN";
+  if (scope === "cloud") return "Cloud";
+  if (scope === "generic") return "Generic";
+  return scope || "Profile";
+}
+
+function defaultProfileName(provider: string, scope: string): string {
+  return `${providerLabel(provider)} ${scopeLabel(scope)}`;
+}
+
 function newProfileId(): string {
   const suffix =
     typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -164,6 +186,7 @@ type WorkspaceTab = "home" | "events" | "crashes" | "data" | "import" | "export"
 type ExportScope = "loaded" | "custom";
 type LlmResponseViewMode = "guide" | "raw";
 type MessageViewMode = "raw" | "parsed";
+type LoadEstimateMode = "rolling-sync" | "range-load";
 type HelpSectionId =
   | "quick-start"
   | "filters"
@@ -204,6 +227,20 @@ interface HelpTopic {
 interface WorkspaceTabDescriptor {
   id: Exclude<WorkspaceTab, "help">;
   label: string;
+}
+
+interface PendingLoadEstimate {
+  mode: LoadEstimateMode;
+  actionLabel: string;
+  description: string;
+  estimate: EventLoadEstimate;
+  normalizedFrom: string;
+  normalizedTo: string;
+}
+
+interface LlmGuardrailBlock {
+  host: string;
+  message: string;
 }
 
 const workspaceTabs: WorkspaceTabDescriptor[] = [
@@ -253,6 +290,16 @@ interface OpsSummaryReport {
   timeline: TimelineMetric[];
   notableSpike: string;
   selectedEventFinding: string;
+}
+
+interface PrivilegedAccessWarning {
+  requiresPrivilege: boolean;
+  platform: SupportedOs;
+  restrictedSources: string[];
+  stillCollectedNonPrivilegedData: boolean;
+  title: string;
+  detail: string;
+  rawMessage: string;
 }
 
 const defaultExportCategoriesByOs: Record<SupportedOs, EventCategory[]> = {
@@ -423,6 +470,33 @@ function formatExportTimestamp(value = new Date()): string {
   const minutes = String(value.getMinutes()).padStart(2, "0");
   const seconds = String(value.getSeconds()).padStart(2, "0");
   return `${year}${month}${day}-${hours}${minutes}${seconds}`;
+}
+
+function formatBytesApprox(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function classifyLoadImpact(estimatedCount: number, estimatedBytes: number): "Fast" | "Moderate" | "Heavy" {
+  if (estimatedCount >= 25000 || estimatedBytes >= 20 * 1024 * 1024) return "Heavy";
+  if (estimatedCount >= 5000 || estimatedBytes >= 5 * 1024 * 1024) return "Moderate";
+  return "Fast";
+}
+
+function formatEstimateWindowLabel(estimate: EventLoadEstimate): string {
+  const start = new Date(estimate.windowStart);
+  const end = new Date(estimate.windowEnd);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return "Window unavailable";
+  }
+  return `${start.toLocaleString()} to ${end.toLocaleString()}`;
 }
 
 function sanitizeFileTag(value: string, fallback: string): string {
@@ -707,6 +781,102 @@ function buildOpsSummaryHtml(report: OpsSummaryReport): string {
     `<div class="card"><h2>8) Selected Event Finding</h2><div>${escapeHtml(report.selectedEventFinding)}</div></div>`,
     "</body></html>"
   ].join("");
+}
+
+function summarizeCollectorWarnings(warnings: string[]): string {
+  const preview = warnings.slice(0, 2).join(" ");
+  const suffix =
+    warnings.length > 2 ? ` (+${warnings.length - 2} more; see diagnostics logs.)` : " (see diagnostics logs).";
+  return `${preview}${suffix}`;
+}
+
+function classifyPrivilegedAccessWarning(
+  platform: SupportedOs,
+  warnings: string[],
+  collected: number
+): PrivilegedAccessWarning | null {
+  if (warnings.length === 0) return null;
+
+  const joined = warnings.join(" ");
+  const lower = joined.toLowerCase();
+  const stillCollectedNonPrivilegedData = collected > 0;
+
+  if (platform === "windows") {
+    const channelMatches = Array.from(joined.matchAll(/Windows '([^']+)' channel/gi));
+    const restrictedSources = Array.from(
+      new Set(
+        channelMatches
+          .map((match) => match[1]?.trim())
+          .filter((value): value is string => Boolean(value))
+      )
+    );
+    const requiresPrivilege =
+      /access denied reading windows/i.test(joined) ||
+      /check channel permissions/i.test(joined) ||
+      restrictedSources.some((source) => source.toLowerCase() === "security");
+    if (!requiresPrivilege) return null;
+
+    const mentionsSecurity = restrictedSources.some((source) => source.toLowerCase() === "security");
+    return {
+      requiresPrivilege: true,
+      platform,
+      restrictedSources: restrictedSources.length > 0 ? restrictedSources : mentionsSecurity ? ["Security"] : ["restricted Windows logs"],
+      stillCollectedNonPrivilegedData,
+      title: mentionsSecurity
+        ? "Security logs require Administrator rights."
+        : "Some Windows event logs require Administrator rights.",
+      detail: stillCollectedNonPrivilegedData
+        ? "Accessible channels were still collected. Restart elevated to include the restricted Windows logs."
+        : "The requested Windows logs could not be collected without Administrator rights.",
+      rawMessage: summarizeCollectorWarnings(warnings)
+    };
+  }
+
+  if (platform === "linux") {
+    const requiresPrivilege =
+      /journalctl requires elevated access/i.test(joined) ||
+      /journal-reader privileges/i.test(joined) ||
+      /permission denied/i.test(lower) ||
+      /operation not permitted/i.test(lower) ||
+      /access denied/i.test(lower);
+    if (!requiresPrivilege) return null;
+
+    return {
+      requiresPrivilege: true,
+      platform,
+      restrictedSources: ["journal/system logs"],
+      stillCollectedNonPrivilegedData,
+      title: "Some journal/system logs require elevated access.",
+      detail: stillCollectedNonPrivilegedData
+        ? "Accessible logs were still collected. Restart elevated to include the restricted journal or system logs."
+        : "The requested journal or system logs could not be collected without elevated access.",
+      rawMessage: summarizeCollectorWarnings(warnings)
+    };
+  }
+
+  if (platform === "macos") {
+    const requiresPrivilege =
+      /macos log collection requires elevated access/i.test(joined) ||
+      /not authorized/i.test(lower) ||
+      /permission denied/i.test(lower) ||
+      /operation not permitted/i.test(lower) ||
+      /administrator privileges/i.test(lower);
+    if (!requiresPrivilege) return null;
+
+    return {
+      requiresPrivilege: true,
+      platform,
+      restrictedSources: ["system logs"],
+      stillCollectedNonPrivilegedData,
+      title: "Some system logs require elevated access.",
+      detail: stillCollectedNonPrivilegedData
+        ? "Accessible logs were still collected. Restart elevated to include the restricted macOS system logs."
+        : "The requested macOS system logs could not be collected without elevated access.",
+      rawMessage: summarizeCollectorWarnings(warnings)
+    };
+  }
+
+  return null;
 }
 
 function buildEventContextText(
@@ -1114,6 +1284,15 @@ export default function App() {
   const [hostOs, setHostOs] = useState<SupportedOs>(browserDefaultOs);
   const [hostOsVersion, setHostOsVersion] = useState<string>("Unknown");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("home");
+  const [targetHostId, setTargetHostId] = useState<string>("localhost");
+  const [remoteSelectedId, setRemoteSelectedId] = useState<string>("");
+  const [remoteSettings, setRemoteSettingsState] = useState<RemoteSettings>({ profiles: [] });
+  useEffect(() => {
+    if (isTauriRuntime()) {
+      getRemoteSettings().then(setRemoteSettingsState).catch(console.error);
+    }
+  }, []);
+
   const [helpTabOpen, setHelpTabOpen] = useState(false);
   const [activeHelpTopic, setActiveHelpTopic] = useState<HelpTopicId>("getting-started");
   const [filterDraft, setFilterDraft] = useState<EventFilters>(createDefaultFilters);
@@ -1123,6 +1302,7 @@ export default function App() {
   const [crashes, setCrashes] = useState<CrashRecord[]>([]);
   const [selectedCrashId, setSelectedCrashId] = useState<string>("");
   const [correlatedEvents, setCorrelatedEvents] = useState<NormalizedEvent[]>([]);
+  const [preCrashEvents, setPreCrashEvents] = useState<NormalizedEvent[]>([]);
   const [preCrashWindowMinutes, setPreCrashWindowMinutes] = useState<number>(15);
   const [preCrashFocusEnabled, setPreCrashFocusEnabled] = useState(false);
   const [selected, setSelected] = useState<NormalizedEvent | null>(null);
@@ -1134,7 +1314,8 @@ export default function App() {
   const [ingestProfile, setIngestProfileState] = useState<IngestProfile>({
     autoSyncOnStartup: false,
     maxEventsPerSync: 2000,
-    windowsChannels: ["Application", "System", "Security"]
+    windowsChannels: ["Application", "System", "Security"],
+    requestElevation: false
   });
   const [llmSettings, setLlmSettingsState] = useState<LlmSettings>(createDefaultLlmSettings);
   const [llmSelectedProfileId, setLlmSelectedProfileId] = useState<string>("");
@@ -1150,12 +1331,16 @@ export default function App() {
   const [llmTestResult, setLlmTestResult] = useState<LlmConnectionTestResult | null>(null);
   const [backfillFrom, setBackfillFrom] = useState("");
   const [backfillTo, setBackfillTo] = useState("");
+  const [pendingLoadEstimate, setPendingLoadEstimate] = useState<PendingLoadEstimate | null>(null);
+  const [isEstimatingLoad, setIsEstimatingLoad] = useState(false);
   const [rangeViewActive, setRangeViewActive] = useState(false);
   const [rangeLoadMessage, setRangeLoadMessage] = useState<string>("");
   const [isRangeLoading, setIsRangeLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [lastError, setLastError] = useState<string>("");
   const [collectorWarning, setCollectorWarning] = useState<string>("");
+  const [privilegedAccessWarning, setPrivilegedAccessWarning] = useState<PrivilegedAccessWarning | null>(null);
+  const [isRestartingElevated, setIsRestartingElevated] = useState(false);
   const [memoryNotice, setMemoryNotice] = useState<string>("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
   const [copyEventTextStatus, setCopyEventTextStatus] = useState<"idle" | "copied">("idle");
@@ -1166,6 +1351,8 @@ export default function App() {
   const [llmPromptPreRedactionDraft, setLlmPromptPreRedactionDraft] = useState("");
   const [llmRunProfileId, setLlmRunProfileId] = useState("");
   const [llmRunResult, setLlmRunResult] = useState<LlmAnalysisResult | null>(null);
+  const [llmRunError, setLlmRunError] = useState<string>("");
+  const [llmGuardrailBlock, setLlmGuardrailBlock] = useState<LlmGuardrailBlock | null>(null);
   const [llmResponseViewMode, setLlmResponseViewMode] = useState<LlmResponseViewMode>("guide");
   const [isRunningLlmAnalysis, setIsRunningLlmAnalysis] = useState(false);
   const [exportStatus, setExportStatus] = useState<string>("");
@@ -1180,29 +1367,8 @@ export default function App() {
     [importedEvents, localEvents, activeFilters]
   );
   const allEvents = useMemo(() => [...importedEvents, ...localEvents], [importedEvents, localEvents]);
-  const preCrashFocus = useMemo(() => {
-    if (!preCrashFocusEnabled) return null;
-    const crash = crashes.find((entry) => entry.id === selectedCrashId);
-    if (!crash) return null;
-    const crashTime = Date.parse(crash.timestamp);
-    if (!Number.isFinite(crashTime)) return null;
-    return {
-      start: crashTime - preCrashWindowMinutes * 60 * 1000,
-      end: crashTime,
-      os: crash.os
-    };
-  }, [preCrashFocusEnabled, preCrashWindowMinutes, crashes, selectedCrashId]);
-  const crashFocusEvents = useMemo(() => {
-    if (!preCrashFocus) return [];
-    return allEvents.filter((event) => {
-      const eventTime = Date.parse(event.timestamp);
-      if (!Number.isFinite(eventTime)) return false;
-      if (event.os !== preCrashFocus.os) return false;
-      return eventTime >= preCrashFocus.start && eventTime <= preCrashFocus.end;
-    });
-  }, [allEvents, preCrashFocus]);
   const visibleEvents = useMemo(() => sortEvents(filtered, sortState), [filtered, sortState]);
-  const crashVisibleEvents = useMemo(() => sortEvents(crashFocusEvents, sortState), [crashFocusEvents, sortState]);
+  const crashVisibleEvents = useMemo(() => sortEvents(preCrashEvents, sortState), [preCrashEvents, sortState]);
   const correlatedVisibleEvents = useMemo(() => sortEvents(correlatedEvents, sortState), [correlatedEvents, sortState]);
   const useCrashCorrelatedFallback = useMemo(() => {
     return preCrashFocusEnabled && crashVisibleEvents.length === 0 && correlatedVisibleEvents.length > 0;
@@ -1369,6 +1535,12 @@ export default function App() {
     () => buildOpsSummaryReport(exportPreviewEvents, exportScopeLabel, selected),
     [exportPreviewEvents, exportScopeLabel, selected]
   );
+  const currentTargetOs = useMemo<SupportedOs>(() => {
+    if (targetHostId === "localhost") return hostOs;
+    const selectedProfile = remoteSettings.profiles.find((profile) => profile.id === targetHostId);
+    const remoteOs = selectedProfile?.os?.toLowerCase();
+    return remoteOs === "windows" || remoteOs === "linux" || remoteOs === "macos" ? remoteOs : hostOs;
+  }, [hostOs, remoteSettings.profiles, targetHostId]);
   const hostOsCoverage = useMemo(() => {
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
@@ -1586,6 +1758,10 @@ export default function App() {
   const inputClass =
     "h-9 w-full rounded-lg border border-[var(--field-border)] bg-[var(--field-bg)] px-3 text-sm text-text placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:cursor-not-allowed disabled:bg-[var(--field-bg-disabled)] disabled:text-muted";
   const selectClass = `${inputClass} appearance-none pr-8`;
+  const isDevHostedRuntime =
+    isTauriRuntime() &&
+    typeof window !== "undefined" &&
+    (window.location.protocol === "http:" || window.location.protocol === "https:");
   const filterGridClass = hasWindowsEvents
     ? "grid gap-2 lg:grid-cols-[1.35fr_1fr_1fr_1fr_0.9fr_0.9fr_1fr]"
     : "grid gap-2 lg:grid-cols-[1.35fr_1fr_1fr_0.9fr_0.9fr_1fr]";
@@ -1593,14 +1769,64 @@ export default function App() {
   function applyCollectorWarnings(context: string, result: SyncOperationResult): void {
     if (result.warnings.length === 0) {
       setCollectorWarning("");
+      setPrivilegedAccessWarning(null);
       return;
     }
 
-    const preview = result.warnings.slice(0, 2).join(" ");
-    const suffix = result.warnings.length > 2
-      ? ` (+${result.warnings.length - 2} more; see diagnostics logs.)`
-      : " (see diagnostics logs).";
-    setCollectorWarning(`${context}: ${preview}${suffix}`);
+    const privilegeWarning = classifyPrivilegedAccessWarning(currentTargetOs, result.warnings, result.collected);
+    if (privilegeWarning) {
+      setPrivilegedAccessWarning(privilegeWarning);
+      setCollectorWarning("");
+      return;
+    }
+
+    setPrivilegedAccessWarning(null);
+    setCollectorWarning(`${context}: ${summarizeCollectorWarnings(result.warnings)}`);
+  }
+
+  function dismissCollectorWarning(): void {
+    setCollectorWarning("");
+    setPrivilegedAccessWarning(null);
+  }
+
+  async function restartElevatedNow(): Promise<void> {
+    setLastError("");
+    if (isDevHostedRuntime) {
+      setLastError(
+        "Restart with elevated access is disabled during `npm run tauri dev`. Start the dev session from an elevated terminal instead."
+      );
+      return;
+    }
+    setIsRestartingElevated(true);
+    try {
+      await restartElevated();
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to restart with elevated access.");
+    } finally {
+      setIsRestartingElevated(false);
+    }
+  }
+
+  async function disableSecurityCollectionNow(): Promise<void> {
+    setLastError("");
+    const nextChannels = ingestProfile.windowsChannels.filter((channel) => channel !== "Security");
+    if (nextChannels.length === ingestProfile.windowsChannels.length) {
+      dismissCollectorWarning();
+      return;
+    }
+
+    try {
+      const saved = await setIngestProfile({
+        ...ingestProfile,
+        windowsChannels: nextChannels.length > 0 ? nextChannels : ["Application"]
+      });
+      setIngestProfileState(saved);
+      setExportStatus("Security log collection disabled.");
+      window.setTimeout(() => setExportStatus(""), 2500);
+      dismissCollectorWarning();
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to disable Security log collection.");
+    }
   }
 
   function applyLocalEventsCache(events: NormalizedEvent[], context: string): number {
@@ -1822,7 +2048,7 @@ export default function App() {
   async function initialize(): Promise<void> {
     setIsLoading(true);
     setLastError("");
-    setCollectorWarning("");
+    dismissCollectorWarning();
 
     try {
       const os = await getHostOs();
@@ -1848,10 +2074,10 @@ export default function App() {
         "";
       setLlmSelectedNetworkId(networkId);
       if (profile.autoSyncOnStartup) {
-        const syncResult = await refreshLocalEvents();
+        const syncResult = await refreshLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined);
         applyCollectorWarnings("Startup sync warning", syncResult);
       }
-      const collected = await getLocalEvents(LOCAL_FETCH_LIMIT);
+      const collected = await getLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined, LOCAL_FETCH_LIMIT);
       if (collected.length > 0) {
         applyLocalEventsCache(collected, "Startup load");
       } else {
@@ -1871,11 +2097,12 @@ export default function App() {
   async function refreshNow(): Promise<void> {
     setIsLoading(true);
     setLastError("");
+    dismissCollectorWarning();
 
     try {
-      const result = await refreshLocalEvents();
+      const result = await refreshLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined);
       applyCollectorWarnings("Refresh warning", result);
-      applyLocalEventsCache(await getLocalEvents(LOCAL_FETCH_LIMIT), "Refresh load");
+      applyLocalEventsCache(await getLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined, LOCAL_FETCH_LIMIT), "Refresh load");
       if (rangeViewActive) {
         clearAppliedDateRangeFilters();
       }
@@ -1891,7 +2118,7 @@ export default function App() {
   }
 
   async function refreshCrashes(): Promise<void> {
-    const records = await getCrashes();
+    const records = await getCrashes(targetHostId !== "localhost" ? targetHostId : undefined);
     setCrashes(records);
 
     if (records.length === 0) {
@@ -1912,7 +2139,7 @@ export default function App() {
   async function importHostCrashesNow(): Promise<void> {
     setLastError("");
     try {
-      const count = await importHostCrashes(300);
+      const count = await importHostCrashes(targetHostId !== "localhost" ? targetHostId : undefined, 300);
       await refreshCrashes();
       setExportStatus(
         count > 0
@@ -1927,6 +2154,7 @@ export default function App() {
 
   async function onCrashSelectionChange(crashId: string): Promise<void> {
     setSelectedCrashId(crashId);
+    setPreCrashEvents([]);
     if (!crashId) {
       setCorrelatedEvents([]);
       setPreCrashFocusEnabled(false);
@@ -1954,27 +2182,51 @@ export default function App() {
 
     const windowStart = crashTime - preCrashWindowMinutes * 60 * 1000;
     const windowEnd = crashTime;
-    const outsideCoverage =
-      !localCoverage || windowStart < localCoverage.start || windowEnd > localCoverage.end;
 
-    if (outsideCoverage) {
-      const from = formatDateInputValue(windowStart);
-      const to = formatDateInputValue(windowEnd);
-      setBackfillFrom(from);
-      setBackfillTo(to);
-      const loaded = await loadEventsForResolvedRange(from, to, {
-        applyToFilters: false,
-        contextLabel: "Crash pre-window load"
-      });
-      if (!loaded) {
-        return;
-      }
-      try {
-        setCorrelatedEvents(await getCrashRelatedEvents(selectedCrash.id, 15, 250));
-      } catch (error) {
-        setLastError(error instanceof Error ? error.message : "Failed to refresh correlated events after loading crash range.");
-        return;
-      }
+    const startIso = new Date(windowStart).toISOString();
+    const endIso = new Date(windowEnd).toISOString();
+    const from = formatDateInputValue(windowStart);
+    const to = formatDateInputValue(windowEnd);
+    setBackfillFrom(from);
+    setBackfillTo(to);
+
+    setLastError("");
+    dismissCollectorWarning();
+    setRangeLoadMessage(`Loading crash-adjacent events for ${new Date(selectedCrash.timestamp).toLocaleString()}...`);
+    setIsRangeLoading(true);
+    try {
+      const syncResult = await syncLocalEventsWindow(
+        startIso,
+        endIso,
+        targetHostId !== "localhost" ? targetHostId : undefined
+      );
+      applyCollectorWarnings("Crash window warning", syncResult);
+      const [windowEvents, related] = await Promise.all([
+        getLocalEventsWindow(
+          startIso,
+          endIso,
+          LOCAL_FETCH_LIMIT,
+          targetHostId !== "localhost" ? targetHostId : undefined
+        ),
+        getCrashRelatedEvents(selectedCrash.id, 15, 250)
+      ]);
+      setPreCrashEvents(windowEvents);
+      setCorrelatedEvents(related);
+      applyLocalEventsCache(
+        await getLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined, LOCAL_FETCH_LIMIT),
+        "Crash window load"
+      );
+      setRangeLoadMessage(
+        windowEvents.length > 0
+          ? `Loaded ${windowEvents.length.toLocaleString()} events in the ${preCrashWindowMinutes}-minute pre-crash window.`
+          : `Crash window loaded, but no events were found in the ${preCrashWindowMinutes}-minute pre-crash window.`
+      );
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to load crash investigation window.");
+      setRangeLoadMessage("");
+      return;
+    } finally {
+      setIsRangeLoading(false);
     }
 
     setLastError("");
@@ -1983,6 +2235,7 @@ export default function App() {
 
   function clearPreCrashFocus(): void {
     setPreCrashFocusEnabled(false);
+    setPreCrashEvents([]);
   }
 
   function updateFilter<K extends keyof EventFilters>(key: K, value: EventFilters[K]): void {
@@ -2081,6 +2334,8 @@ export default function App() {
     setLlmPromptPreRedactionDraft("");
     setLlmRunProfileId(preferredProfileId);
     setLlmRunResult(null);
+    setLlmRunError("");
+    setLlmGuardrailBlock(null);
     setLlmResponseViewMode("guide");
     setLlmWindowOpen(true);
   }
@@ -2090,6 +2345,8 @@ export default function App() {
     setLlmPromptDraft(buildLlmPrompt(selected, hostOsVersion, false));
     setLlmPromptWasRedacted(false);
     setLlmPromptPreRedactionDraft("");
+    setLlmRunError("");
+    setLlmGuardrailBlock(null);
     setExportStatus("Prompt reset (unredacted).");
     window.setTimeout(() => setExportStatus(""), 2000);
   }
@@ -2126,6 +2383,7 @@ export default function App() {
 
   function onLlmPromptDraftChange(nextValue: string): void {
     setLlmPromptDraft(nextValue);
+    setLlmGuardrailBlock(null);
     if (llmPromptWasRedacted && llmPromptPreRedactionDraft.trim()) {
       // User edited the redacted prompt; restoring original draft no longer maps cleanly.
       setLlmPromptPreRedactionDraft("");
@@ -2135,20 +2393,29 @@ export default function App() {
     }
   }
 
-  async function runLlmAnalysisNow(): Promise<void> {
+  async function runLlmAnalysisNow(options?: { allowUntrustedRawOnce?: boolean }): Promise<void> {
     if (!selected) return;
     if (!llmRunProfileId) {
+      setLlmRunError("No local LLM profile is selected.");
+      setLlmGuardrailBlock(null);
       setLastError("No local LLM profile is selected.");
       return;
     }
     const outboundPrompt = llmPromptDraft.trim();
     if (!outboundPrompt) {
+      setLlmRunError("LLM prompt is empty.");
+      setLlmGuardrailBlock(null);
       setLastError("LLM prompt is empty.");
       return;
     }
 
     const profile = llmSettings.profiles.find((p) => p.id === llmRunProfileId);
-    if (profile && llmSettings.neverSendRawEventToUntrusted && profile.scope !== "local") {
+    if (
+      !options?.allowUntrustedRawOnce &&
+      profile &&
+      llmSettings.neverSendRawEventToUntrusted &&
+      profile.scope !== "local"
+    ) {
       try {
         const url = new URL(profile.baseUrl);
         const host = url.hostname.toLowerCase();
@@ -2157,17 +2424,25 @@ export default function App() {
         if (!isLocalhost && !isTrusted) {
           const isRaw = redactSensitiveText(outboundPrompt) !== outboundPrompt;
           if (isRaw) {
-            setLastError(`Guardrail block: Target host '${host}' is untrusted, and prompt contains sensitive raw data. Please apply redaction or add to trusted hosts.`);
+            const message = `Guardrail block: Target host '${host}' is untrusted, and prompt contains sensitive raw data. Please apply redaction or add to trusted hosts.`;
+            setLlmRunError(message);
+            setLlmGuardrailBlock({ host, message });
+            setLastError(message);
             return;
           }
         }
       } catch {
+        setLlmRunError("Guardrail block: Profile base URL is invalid.");
+        setLlmGuardrailBlock(null);
         setLastError("Guardrail block: Profile base URL is invalid.");
         return;
       }
     }
 
+    setLlmRunError("");
+    setLlmGuardrailBlock(null);
     setLastError("");
+    setLlmRunResult(null);
     setIsRunningLlmAnalysis(true);
     try {
       const result = await analyzeWithLocalLlm(outboundPrompt, llmRunProfileId);
@@ -2179,7 +2454,9 @@ export default function App() {
       );
       window.setTimeout(() => setExportStatus(""), 3500);
     } catch (error) {
-      setLastError(error instanceof Error ? error.message : "Failed to run local LLM analysis.");
+      const message = error instanceof Error ? error.message : "Failed to run local LLM analysis.";
+      setLlmRunError(message);
+      setLastError(message);
     } finally {
       setIsRunningLlmAnalysis(false);
     }
@@ -2408,10 +2685,30 @@ export default function App() {
       const currentUrl = llmSelectedProfile.baseUrl.trim();
       const currentDefault = defaultBaseUrlForProvider(llmSelectedProfile.provider);
       const nextDefault = defaultBaseUrlForProvider(nextProvider);
+      const currentDefaultName = defaultProfileName(llmSelectedProfile.provider, llmSelectedProfile.scope);
+      const nextDefaultName = defaultProfileName(nextProvider, defaultScope);
       updateLlmProfile(llmSelectedProfile.id, {
         provider: nextProvider,
         scope: defaultScope,
+        name:
+          !llmSelectedProfile.name.trim() || llmSelectedProfile.name.trim() === currentDefaultName
+            ? nextDefaultName
+            : llmSelectedProfile.name,
         baseUrl: !currentUrl || currentUrl === currentDefault ? nextDefault : currentUrl
+      });
+      return;
+    }
+
+    if (field === "scope" && typeof value === "string") {
+      const nextScope = value;
+      const currentDefaultName = defaultProfileName(llmSelectedProfile.provider, llmSelectedProfile.scope);
+      const nextDefaultName = defaultProfileName(llmSelectedProfile.provider, nextScope);
+      updateLlmProfile(llmSelectedProfile.id, {
+        scope: nextScope,
+        name:
+          !llmSelectedProfile.name.trim() || llmSelectedProfile.name.trim() === currentDefaultName
+            ? nextDefaultName
+            : llmSelectedProfile.name
       });
       return;
     }
@@ -2424,7 +2721,7 @@ export default function App() {
     const scope = defaultScopeForProvider(provider);
     const profile: LlmConnectionProfile = {
       id: newProfileId(),
-      name: `${providerLabel(provider)} ${scope === "local" ? "Local" : scope === "cloud" ? "Cloud" : "Generic"}`,
+      name: defaultProfileName(provider, scope),
       provider,
       scope,
       baseUrl: defaultBaseUrlForProvider(provider),
@@ -2466,8 +2763,14 @@ export default function App() {
     if (!llmSelectedProfile) return;
     const mappedScope = candidate.scope === "localhost" ? "local" : "lan";
     const nextProvider = candidate.providerId;
+    const currentDefaultName = defaultProfileName(llmSelectedProfile.provider, llmSelectedProfile.scope);
+    const nextDefaultName = defaultProfileName(nextProvider, mappedScope);
     const nextProfile: LlmConnectionProfile = {
       ...llmSelectedProfile,
+      name:
+        !llmSelectedProfile.name.trim() || llmSelectedProfile.name.trim() === currentDefaultName
+          ? nextDefaultName
+          : llmSelectedProfile.name,
       provider: nextProvider,
       scope: mappedScope,
       baseUrl: candidate.endpoint,
@@ -2475,6 +2778,10 @@ export default function App() {
       enabled: true
     };
     updateLlmProfile(llmSelectedProfile.id, {
+      name:
+        !llmSelectedProfile.name.trim() || llmSelectedProfile.name.trim() === currentDefaultName
+          ? nextDefaultName
+          : llmSelectedProfile.name,
       provider: nextProvider,
       scope: mappedScope,
       baseUrl: candidate.endpoint,
@@ -2633,7 +2940,8 @@ export default function App() {
       const saved = await setIngestProfile({
         autoSyncOnStartup: ingestProfile.autoSyncOnStartup,
         maxEventsPerSync: maxEvents,
-        windowsChannels: channels
+        windowsChannels: channels,
+        requestElevation: ingestProfile.requestElevation ?? false
       });
       setIngestProfileState(saved);
       setExportStatus("Collection settings saved.");
@@ -2644,15 +2952,62 @@ export default function App() {
   }
 
 
-  async function saveIngestWindow(): Promise<void> {
+
+  async function saveRemoteHostSettings(): Promise<void> {
+    try {
+      await saveRemoteSettings(remoteSettings);
+      setExportStatus("Remote settings saved successfully.");
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (e: any) {
+      setLastError(e.message || "Failed to save remote settings");
+    }
+  }
+
+  function addRemoteProfile() {
+    const newProfile = {
+      id: crypto.randomUUID(),
+      name: "New Profile",
+      host: "192.168.1.100",
+      os: "linux",
+      protocol: "ssh",
+      username: "root",
+      ssh_key_path: "",
+      auth_type: "key"
+    };
+    setRemoteSettingsState(prev => ({ profiles: [...prev.profiles, newProfile] }));
+    setRemoteSelectedId(newProfile.id);
+  }
+
+  function deleteSelectedRemoteProfile() {
+    setRemoteSettingsState(prev => {
+      const arr = prev.profiles.filter(p => p.id !== remoteSelectedId);
+      return { profiles: arr };
+    });
+    setRemoteSelectedId("");
+  }
+  
+  function updateSelectedRemoteProfile(key: string, value: string) {
+    setRemoteSettingsState(prev => {
+      const idx = prev.profiles.findIndex(p => p.id === remoteSelectedId);
+      if (idx === -1) return prev;
+      const clone = [...prev.profiles];
+      clone[idx] = { ...clone[idx], [key]: value };
+      return { profiles: clone };
+    });
+  }
+
+  const selectedRemoteProfile = remoteSettings.profiles.find(p => p.id === remoteSelectedId);
+
+  async function performSaveIngestWindow(): Promise<void> {
     setLastError("");
+    dismissCollectorWarning();
     try {
       const days = Math.max(1, Math.min(365, Math.floor(ingestWindowDays)));
       const saved = await setIngestWindowDays(days);
       setIngestWindowDaysState(saved);
-      const syncResult = await refreshLocalEvents();
+      const syncResult = await refreshLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined);
       applyCollectorWarnings("Sync warning", syncResult);
-      applyLocalEventsCache(await getLocalEvents(LOCAL_FETCH_LIMIT), "Sync load");
+      applyLocalEventsCache(await getLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined, LOCAL_FETCH_LIMIT), "Sync load");
       if (rangeViewActive) {
         clearAppliedDateRangeFilters();
       }
@@ -2664,6 +3019,61 @@ export default function App() {
       window.setTimeout(() => setExportStatus(""), 2500);
     } catch (error) {
       setLastError(error instanceof Error ? error.message : "Failed to update ingest window.");
+    }
+  }
+
+  async function trustGuardrailHostAndRun(): Promise<void> {
+    if (!llmGuardrailBlock) return;
+    const host = llmGuardrailBlock.host.toLowerCase();
+    setLlmSettingsState((current) => {
+      if (current.trustedHosts.some((entry) => entry.toLowerCase() === host)) {
+        return current;
+      }
+      return {
+        ...current,
+        trustedHosts: [...current.trustedHosts, host]
+      };
+    });
+    setExportStatus(`Added '${host}' to trusted hosts for this session. Save LLM Settings to persist.`);
+    window.setTimeout(() => setExportStatus(""), 3500);
+    await runLlmAnalysisNow();
+  }
+
+  async function sendLlmAnalysisOnceAnyway(): Promise<void> {
+    if (!llmGuardrailBlock) return;
+    setExportStatus(`Bypassing untrusted-host guardrail once for ${llmGuardrailBlock.host}.`);
+    window.setTimeout(() => setExportStatus(""), 3000);
+    await runLlmAnalysisNow({ allowUntrustedRawOnce: true });
+  }
+
+  async function previewRollingSyncLoad(): Promise<void> {
+    if (targetHostId !== "localhost") {
+      await performSaveIngestWindow();
+      return;
+    }
+
+    setLastError("");
+    dismissCollectorWarning();
+    setIsEstimatingLoad(true);
+    setPendingLoadEstimate(null);
+    try {
+      const days = Math.max(1, Math.min(365, Math.floor(ingestWindowDays)));
+      const saved = await setIngestWindowDays(days);
+      setIngestWindowDaysState(saved);
+      const estimate = await estimateRefreshLocalEvents();
+      setPendingLoadEstimate({
+        mode: "rolling-sync",
+        actionLabel: "Save & Sync",
+        description: `Rolling sync estimate for the current ${saved}-day ingest window.`,
+        estimate,
+        normalizedFrom: formatDateInputValue(new Date(estimate.windowStart).getTime()),
+        normalizedTo: formatDateInputValue(new Date(estimate.windowEnd).getTime())
+      });
+      setRangeLoadMessage("");
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to preview ingest window.");
+    } finally {
+      setIsEstimatingLoad(false);
     }
   }
 
@@ -2683,12 +3093,13 @@ export default function App() {
     const applyToFilters = options?.applyToFilters ?? true;
     const contextLabel = options?.contextLabel ?? "Range load";
     setLastError("");
+    dismissCollectorWarning();
     setRangeLoadMessage(`Loading events for ${normalized.from} to ${normalized.to}...`);
     setIsRangeLoading(true);
     try {
       const syncResult = await syncLocalEventsRange(normalized.from, normalized.to, false);
       applyCollectorWarnings(`${contextLabel} warning`, syncResult);
-      const events = await getLocalEventsRange(normalized.from, normalized.to, LOCAL_FETCH_LIMIT);
+      const events = await getLocalEventsRange(targetHostId !== "localhost" ? targetHostId : undefined, normalized.from, normalized.to, LOCAL_FETCH_LIMIT);
       const truncated = applyLocalEventsCache(events, contextLabel);
       if (applyToFilters) {
         applyViewDateRange(normalized.from, normalized.to);
@@ -2710,15 +3121,56 @@ export default function App() {
     }
   }
 
-  async function loadEventsForRange(): Promise<void> {
+  async function previewRangeLoad(): Promise<void> {
     if (!backfillFrom || !backfillTo) {
       setLastError("Range actions require both From and To dates.");
       return;
     }
-    await loadEventsForResolvedRange(backfillFrom, backfillTo, {
-      applyToFilters: true,
-      contextLabel: "Range load"
-    });
+
+    if (targetHostId !== "localhost") {
+      await loadEventsForResolvedRange(backfillFrom, backfillTo, {
+        applyToFilters: true,
+        contextLabel: "Range load"
+      });
+      return;
+    }
+
+    const normalized = normalizeDateRange(backfillFrom, backfillTo);
+    setLastError("");
+    dismissCollectorWarning();
+    setIsEstimatingLoad(true);
+    setPendingLoadEstimate(null);
+    try {
+      const estimate = await estimateLocalEventsRange(normalized.from, normalized.to);
+      setPendingLoadEstimate({
+        mode: "range-load",
+        actionLabel: "Load Events",
+        description: "Exact-range estimate for the selected investigation window.",
+        estimate,
+        normalizedFrom: normalized.from,
+        normalizedTo: normalized.to
+      });
+      setRangeLoadMessage("");
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to preview selected range.");
+    } finally {
+      setIsEstimatingLoad(false);
+    }
+  }
+
+  async function confirmPendingLoadEstimate(): Promise<void> {
+    if (!pendingLoadEstimate) return;
+
+    if (pendingLoadEstimate.mode === "rolling-sync") {
+      await performSaveIngestWindow();
+    } else {
+      await loadEventsForResolvedRange(pendingLoadEstimate.normalizedFrom, pendingLoadEstimate.normalizedTo, {
+        applyToFilters: true,
+        contextLabel: "Range load"
+      });
+    }
+
+    setPendingLoadEstimate(null);
   }
 
   async function autoLoadCoverageForActiveFilters(): Promise<void> {
@@ -2818,6 +3270,26 @@ export default function App() {
             <p className="text-sm text-muted">Host OS: {hostOs} ({hostOsVersion})</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-2 border-r border-panel-border pr-3">
+              <span className="text-xs font-semibold text-muted">Target Node</span>
+              <select
+                className="rounded-md border border-panel-border bg-[var(--field-bg)] px-2 py-1 text-[11px] text-text outline-none"
+                value={targetHostId}
+                onChange={(e) => {
+                  setTargetHostId(e.target.value);
+                  setLocalEvents([]);
+                  setCrashes([]);
+                  setCorrelatedEvents([]);
+                  setSelected(null);
+                  dismissCollectorWarning();
+                }}
+              >
+                <option value="localhost">Local Machine</option>
+                {remoteSettings.profiles.map(p => (
+                  <option key={p.id} value={p.id}>{p.name} ({p.host})</option>
+                ))}
+              </select>
+            </div>
             <Button variant="primary" onClick={() => void refreshNow()} disabled={isLoading}>
               {isLoading ? "Refreshing..." : "Refresh Logs"}
             </Button>
@@ -2830,7 +3302,58 @@ export default function App() {
         {lastError && (
           <div className={cn(panelClass, "border-danger text-danger")}>{lastError}</div>
         )}
-        {collectorWarning && (
+        {privilegedAccessWarning && (
+          <div className={cn(panelClass, "border-panel-border bg-[var(--sev-warning)] px-4 py-3 text-sm text-text")}>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="space-y-1">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Restricted Logs</div>
+                <div className="text-sm font-semibold text-text">{privilegedAccessWarning.title}</div>
+                <div className="text-sm text-text">{privilegedAccessWarning.detail}</div>
+                <div className="text-xs text-muted">
+                  Restricted source{privilegedAccessWarning.restrictedSources.length === 1 ? "" : "s"}:{" "}
+                  {privilegedAccessWarning.restrictedSources.join(", ")}.
+                </div>
+                <div className="text-xs text-muted">{privilegedAccessWarning.rawMessage}</div>
+                {targetHostId !== "localhost" && (
+                  <div className="text-xs text-muted">
+                    Elevated restart is only available for local collection. Remote targets must be handled on the remote host.
+                  </div>
+                )}
+                {targetHostId === "localhost" && !ingestProfile.requestElevation && (
+                  <div className="text-xs text-muted">
+                    Enable `Allow elevated restart for restricted logs` in Settings to use one-click restart assistance.
+                  </div>
+                )}
+                {targetHostId === "localhost" && ingestProfile.requestElevation && isDevHostedRuntime && (
+                  <div className="text-xs text-muted">
+                    Elevated restart is unavailable during `npm run tauri dev`. Start Hermes from an elevated terminal to test restricted-log access in development.
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {targetHostId === "localhost" && ingestProfile.requestElevation && !isDevHostedRuntime && (
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={() => void restartElevatedNow()}
+                    disabled={isRestartingElevated}
+                  >
+                    {isRestartingElevated ? "Restarting..." : "Restart with Elevated Access"}
+                  </Button>
+                )}
+                {targetHostId === "localhost" &&
+                  privilegedAccessWarning.platform === "windows" &&
+                  privilegedAccessWarning.restrictedSources.some((source) => source.toLowerCase() === "security") && (
+                    <Button size="sm" onClick={() => void disableSecurityCollectionNow()}>
+                      Disable Security Collection
+                    </Button>
+                  )}
+                <Button size="sm" onClick={dismissCollectorWarning}>Dismiss</Button>
+              </div>
+            </div>
+          </div>
+        )}
+        {!privilegedAccessWarning && collectorWarning && (
           <div className={cn(panelClass, "border-panel-border bg-[var(--sev-warning)] text-text px-4 py-3 text-sm")}>
             {collectorWarning}
           </div>
@@ -3391,6 +3914,16 @@ export default function App() {
                 />
                 Auto-sync logs on app startup
               </label>
+              <label className="flex items-center gap-2 text-xs text-muted">
+                <input
+                  type="checkbox"
+                  checked={Boolean(ingestProfile.requestElevation)}
+                  onChange={(e) =>
+                    setIngestProfileState((current) => ({ ...current, requestElevation: e.target.checked }))
+                  }
+                />
+                Allow elevated restart for restricted logs
+              </label>
               <div className="grid gap-2 md:grid-cols-[220px_1fr]">
                 <label className="text-xs text-muted">Max events per sync</label>
                 <input
@@ -3430,6 +3963,73 @@ export default function App() {
                 </Button>
               </div>
             </div>
+            <div className="grid gap-3 border-t border-panel-border pt-4">
+              <div className="text-sm font-semibold">Remote Hosts (Connections)</div>
+              <div className="grid gap-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Hosts</div>
+                <div className="grid gap-3 md:grid-cols-[280px_1fr]">
+                  <div className="space-y-2">
+                    <select
+                      className={cn(selectClass, "h-[220px]")}
+                      size={8}
+                      value={remoteSelectedId}
+                      onChange={(e) => setRemoteSelectedId(e.target.value)}
+                    >
+                      {remoteSettings.profiles.map(p => (
+                        <option key={p.id} value={p.id}>{p.name} ({p.host})</option>
+                      ))}
+                    </select>
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" onClick={addRemoteProfile}>Add Host</Button>
+                      <Button size="sm" onClick={deleteSelectedRemoteProfile} disabled={!remoteSelectedId}>Remove</Button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    {!selectedRemoteProfile ? <div className="text-xs text-muted">No host selected.</div> : (
+                      <>
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <label className="text-xs text-muted">Name
+                            <input className={inputClass} value={selectedRemoteProfile.name} onChange={e => updateSelectedRemoteProfile("name", e.target.value)} />
+                          </label>
+                          <label className="text-xs text-muted">Host IP / FQDN
+                            <input className={inputClass} value={selectedRemoteProfile.host} onChange={e => updateSelectedRemoteProfile("host", e.target.value)} />
+                          </label>
+                          <label className="text-xs text-muted">Target OS
+                            <select className={selectClass} value={selectedRemoteProfile.os} onChange={e => updateSelectedRemoteProfile("os", e.target.value)}>
+                              <option value="windows">Windows</option>
+                              <option value="linux">Linux</option>
+                              <option value="macos">macOS</option>
+                            </select>
+                          </label>
+                          <label className="text-xs text-muted">Protocol
+                            <select className={selectClass} value={selectedRemoteProfile.protocol} onChange={e => updateSelectedRemoteProfile("protocol", e.target.value)}>
+                              <option value="ssh">SSH</option>
+                              <option value="winrm">WinRM (HTTPS)</option>
+                            </select>
+                          </label>
+                          <label className="text-xs text-muted">Username
+                            <input className={inputClass} value={selectedRemoteProfile.username} onChange={e => updateSelectedRemoteProfile("username", e.target.value)} />
+                          </label>
+                          <label className="text-xs text-muted">Auth Type
+                            <select className={selectClass} value={selectedRemoteProfile.auth_type} onChange={e => updateSelectedRemoteProfile("auth_type", e.target.value)}>
+                              <option value="key">SSH Key / OS Keychain</option>
+                              <option value="password">Password</option>
+                            </select>
+                          </label>
+                        </div>
+                        {selectedRemoteProfile.auth_type === "key" && selectedRemoteProfile.protocol === "ssh" && (
+                          <label className="text-xs text-muted block mt-2">SSH Key Path (IdentityFile)
+                            <input className={inputClass} placeholder="~/.ssh/id_rsa" value={selectedRemoteProfile.ssh_key_path || ""} onChange={e => updateSelectedRemoteProfile("ssh_key_path", e.target.value)} />
+                          </label>
+                        )}
+                        <Button variant="primary" size="sm" className="mt-3" onClick={() => void saveRemoteHostSettings()}>Save Remote Layout</Button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <div className="grid gap-3 border-t border-panel-border pt-4">
               <div className="text-sm font-semibold">Research Assistant (LLM)</div>
               <div className="grid gap-2 md:grid-cols-2">
@@ -3969,13 +4569,21 @@ export default function App() {
                   min={1}
                   max={365}
                   value={ingestWindowDays}
-                  onChange={(e) => setIngestWindowDaysState(Number(e.target.value))}
+                  onChange={(e) => {
+                    setIngestWindowDaysState(Number(e.target.value));
+                    setPendingLoadEstimate(null);
+                  }}
                 />
-                <Button size="sm" variant="primary" onClick={() => void saveIngestWindow()}>
-                  Save & Sync
+                <Button
+                  size="sm"
+                  variant="primary"
+                  onClick={() => void previewRollingSyncLoad()}
+                  disabled={isEstimatingLoad || isRangeLoading}
+                >
+                  {isEstimatingLoad && pendingLoadEstimate?.mode !== "range-load" ? "Estimating..." : "Save & Sync"}
                 </Button>
                 <div className="w-full text-[11px] text-muted">
-                  Rolling default window. `Save & Sync` loads logs from now minus N days through now.
+                  Rolling default window. `Save & Sync` now previews the estimated load first, then confirms before collecting.
                 </div>
               </div>
             </div>
@@ -3993,6 +4601,7 @@ export default function App() {
                     value={backfillFrom}
                     onChange={(e) => {
                       setBackfillFrom(e.currentTarget.value);
+                      setPendingLoadEstimate(null);
                       blurDateInputIfComplete(e.currentTarget);
                     }}
                   />
@@ -4005,16 +4614,98 @@ export default function App() {
                     value={backfillTo}
                     onChange={(e) => {
                       setBackfillTo(e.currentTarget.value);
+                      setPendingLoadEstimate(null);
                       blurDateInputIfComplete(e.currentTarget);
                     }}
                   />
                 </label>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Button size="sm" variant="primary" onClick={() => void loadEventsForRange()} disabled={isRangeLoading}>
-                  {isRangeLoading ? "Loading Events..." : "Load Events"}
+                <Button
+                  size="sm"
+                  variant="primary"
+                  onClick={() => void previewRangeLoad()}
+                  disabled={isRangeLoading || isEstimatingLoad}
+                >
+                  {isEstimatingLoad ? "Estimating..." : "Load Events"}
                 </Button>
               </div>
+              {pendingLoadEstimate && (
+                <div className="space-y-3 rounded-xl border border-panel-border bg-panel px-4 py-3">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-semibold">Load estimate ready</div>
+                      <div className="text-xs text-muted">{pendingLoadEstimate.description}</div>
+                    </div>
+                    <div className="rounded-lg border border-panel-border px-2 py-1 text-xs font-semibold">
+                      Impact: {classifyLoadImpact(
+                        pendingLoadEstimate.estimate.estimatedCount,
+                        pendingLoadEstimate.estimate.estimatedBytes
+                      )}
+                    </div>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-lg border border-panel-border px-3 py-2">
+                      <div className="text-[11px] uppercase tracking-wide text-muted">Estimated events</div>
+                      <div className="text-sm font-semibold">
+                        {pendingLoadEstimate.estimate.estimatedCount.toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-panel-border px-3 py-2">
+                      <div className="text-[11px] uppercase tracking-wide text-muted">Approx. payload</div>
+                      <div className="text-sm font-semibold">
+                        {formatBytesApprox(pendingLoadEstimate.estimate.estimatedBytes)}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-panel-border px-3 py-2">
+                      <div className="text-[11px] uppercase tracking-wide text-muted">Current sync cap</div>
+                      <div className="text-sm font-semibold">
+                        {ingestProfile.maxEventsPerSync.toLocaleString()} events
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-panel-border px-3 py-2">
+                      <div className="text-[11px] uppercase tracking-wide text-muted">Target window</div>
+                      <div className="text-sm font-semibold">
+                        {formatEstimateWindowLabel(pendingLoadEstimate.estimate)}
+                      </div>
+                    </div>
+                  </div>
+                  {pendingLoadEstimate.estimate.estimatedCount > ingestProfile.maxEventsPerSync && (
+                    <div className="rounded-lg border border-danger px-3 py-2 text-xs text-text">
+                      The selected window likely contains more events than the current sync cap. This action will only
+                      ingest the newest {ingestProfile.maxEventsPerSync.toLocaleString()} events unless you raise
+                      `Max events per sync` first.
+                    </div>
+                  )}
+                  {Math.min(
+                    pendingLoadEstimate.estimate.estimatedCount,
+                    ingestProfile.maxEventsPerSync
+                  ) > MAX_LOCAL_EVENTS_IN_MEMORY && (
+                    <div className="rounded-lg border border-panel-border px-3 py-2 text-xs text-text">
+                      Hermes will still cap the in-memory table view to{" "}
+                      {MAX_LOCAL_EVENTS_IN_MEMORY.toLocaleString()} events to keep RAM stable.
+                    </div>
+                  )}
+                  {pendingLoadEstimate.estimate.warnings.length > 0 && (
+                    <div className="rounded-lg border border-danger px-3 py-2 text-xs text-text">
+                      {pendingLoadEstimate.estimate.warnings.join(" ")}
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      onClick={() => void confirmPendingLoadEstimate()}
+                      disabled={isRangeLoading}
+                    >
+                      Continue {pendingLoadEstimate.actionLabel}
+                    </Button>
+                    <Button size="sm" onClick={() => setPendingLoadEstimate(null)}>
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              )}
               {rangeLoadMessage && (
                 <div className={cn("text-xs", isRangeLoading ? "text-muted animate-pulse" : "text-ok")}>
                   {rangeLoadMessage}
@@ -4291,7 +4982,7 @@ export default function App() {
 
                 <div className="grid gap-2 md:grid-cols-[1fr_auto] md:items-end">
                   <label className="text-xs text-muted">
-                    Target local profile
+                    Target profile
                     <select
                       className={selectClass}
                       value={llmRunProfileId}
@@ -4305,6 +4996,17 @@ export default function App() {
                       ))}
                     </select>
                   </label>
+                  {(() => {
+                    const activeProfile = llmLocalProfiles.find((profile) => profile.id === llmRunProfileId);
+                    if (!activeProfile) return null;
+                    return (
+                      <div className="text-right text-xs text-muted">
+                        <div>Provider: {activeProfile.provider}</div>
+                        <div>Endpoint: {activeProfile.baseUrl || "Not set"}</div>
+                        <div>Model: {activeProfile.model || "Auto-detect"}</div>
+                      </div>
+                    );
+                  })()}
                   <div className="flex flex-wrap items-center justify-end gap-2">
                     <Button size="sm" onClick={rebuildPrompt}>
                       Reset Prompt
@@ -4346,6 +5048,32 @@ export default function App() {
                       : "Prompt is unredacted. Run Analysis sends it as shown."}
                   </span>
                 </div>
+
+                {llmRunError && (
+                  <div className="rounded-lg border border-danger bg-danger-bg px-3 py-2 text-xs text-danger">
+                    <div className="font-semibold">LLM analysis failed</div>
+                    <div className="mt-1 whitespace-pre-wrap">{llmRunError}</div>
+                    {llmGuardrailBlock && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={() => void sendLlmAnalysisOnceAnyway()}
+                          disabled={isRunningLlmAnalysis}
+                        >
+                          Send Once Anyway
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={() => void trustGuardrailHostAndRun()}
+                          disabled={isRunningLlmAnalysis}
+                        >
+                          Trust Host and Send
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {llmRunResult && (
                   <div className="rounded-lg border border-panel-border bg-[var(--field-bg)] px-3 py-2 text-xs text-muted">
