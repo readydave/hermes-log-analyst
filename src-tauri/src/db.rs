@@ -3,6 +3,7 @@ use dirs::data_local_dir;
 use rusqlite::{params, Connection, Row};
 use std::fs;
 use std::path::PathBuf;
+use std::collections::HashSet;
 
 fn db_path() -> Result<PathBuf, String> {
     let mut base = data_local_dir().ok_or("Unable to resolve local data directory")?;
@@ -17,6 +18,31 @@ fn open_connection() -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| format!("Failed to open SQLite database: {e}"))?;
     ensure_schema(&conn)?;
     Ok(conn)
+}
+
+fn dedupe_events(events: Vec<NormalizedEvent>) -> Vec<NormalizedEvent> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(events.len());
+    for event in events {
+        let identity = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            event.os,
+            event.source_host,
+            event.log_name,
+            event.timestamp,
+            event.provider,
+            event.event_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            event.severity,
+            event.category,
+            event.message
+        );
+        if seen.insert(identity) {
+            deduped.push(event);
+        }
+    }
+    deduped
 }
 
 fn ensure_schema(conn: &Connection) -> Result<(), String> {
@@ -190,7 +216,7 @@ pub fn get_local_events_range(from: &str, to: &str, limit: u32, host: Option<&st
         events.push(row.map_err(|e| format!("Failed to parse range row: {e}"))?);
     }
 
-    Ok(events)
+    Ok(dedupe_events(events))
 }
 
 pub fn get_local_events_window(
@@ -223,7 +249,7 @@ pub fn get_local_events_window(
         events.push(row.map_err(|e| format!("Failed to parse window row: {e}"))?);
     }
 
-    Ok(events)
+    Ok(dedupe_events(events))
 }
 
 pub fn save_crashes(crashes: &[CrashRecord]) -> Result<(), String> {
@@ -323,6 +349,79 @@ pub fn prune_events_outside(start: &str, end: &str) -> Result<usize, String> {
     Ok(deleted)
 }
 
+pub fn cleanup_duplicate_events() -> Result<usize, String> {
+    let mut conn = open_connection()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("Failed to start duplicate cleanup transaction: {e}"))?;
+
+    let mut stmt = tx
+        .prepare(
+            "
+            SELECT rowid, id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host
+            FROM events
+            ORDER BY
+                timestamp DESC,
+                CASE WHEN id LIKE 'evt-%' THEN 0 ELSE 1 END,
+                rowid DESC
+            ",
+        )
+        .map_err(|e| format!("Failed to prepare duplicate cleanup query: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<u32>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to execute duplicate cleanup query: {e}"))?;
+
+    let mut seen = HashSet::new();
+    let mut rowids_to_delete = Vec::new();
+
+    for row in rows {
+        let (rowid, _id, timestamp, os, log_name, category, provider, event_id, severity, message, source_host) =
+            row.map_err(|e| format!("Failed to parse duplicate cleanup row: {e}"))?;
+        let identity = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            os,
+            source_host,
+            log_name,
+            timestamp,
+            provider,
+            event_id.map(|value| value.to_string()).unwrap_or_default(),
+            severity,
+            category,
+            message
+        );
+        if !seen.insert(identity) {
+            rowids_to_delete.push(rowid);
+        }
+    }
+
+    drop(stmt);
+
+    for rowid in &rowids_to_delete {
+        tx.execute("DELETE FROM events WHERE rowid = ?1", params![rowid])
+            .map_err(|e| format!("Failed to delete duplicate event row: {e}"))?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("Failed to commit duplicate cleanup transaction: {e}"))?;
+
+    Ok(rowids_to_delete.len())
+}
+
 pub fn correlate_crash_events(
     crash_id: &str,
     window_minutes: i64,
@@ -353,5 +452,5 @@ pub fn correlate_crash_events(
         events.push(row.map_err(|e| format!("Failed to parse correlated event row: {e}"))?);
     }
 
-    Ok(events)
+    Ok(dedupe_events(events))
 }

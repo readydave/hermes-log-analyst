@@ -324,6 +324,8 @@ fn parse_journal_line(line: &str) -> Option<NormalizedEvent> {
         event.timestamp = timestamp;
     }
 
+    event.assign_stable_id();
+
     Some(event)
 }
 
@@ -488,6 +490,7 @@ pub fn collect_remote_linux_events(
         // Use local parser but update source_host
         if let Some(mut event) = parse_journal_line(line.as_str()) {
             event.source_host = profile.host.clone();
+            event.assign_stable_id();
             result.events.push(event);
             if result.events.len() >= max {
                 let _ = child.kill();

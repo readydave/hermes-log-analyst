@@ -344,6 +344,8 @@ fn render_event(handle: EVT_HANDLE, fallback_channel: &str) -> Option<Normalized
         event.timestamp = timestamp;
     }
 
+    event.assign_stable_id();
+
     Some(event)
 }
 
@@ -743,6 +745,8 @@ let mut cred_setup = String::new();
                 if !time.is_empty() {
                     ev.timestamp = time.to_string();
                 }
+
+                ev.assign_stable_id();
 
                 result.events.push(ev);
             }

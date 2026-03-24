@@ -83,6 +83,33 @@ impl NormalizedEvent {
             imported: false,
         }
     }
+
+    pub fn assign_stable_id(&mut self) {
+        let identity = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.os,
+            self.source_host,
+            self.log_name,
+            self.timestamp,
+            self.provider,
+            self.event_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            self.severity,
+            self.category,
+            self.message
+        );
+        self.id = stable_event_id(identity.as_str());
+    }
+}
+
+fn stable_event_id(identity: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in identity.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("evt-{hash:016x}")
 }
 
 pub fn detect_host_os() -> SupportedOs {

@@ -336,6 +336,8 @@ fn parse_log_line(line: &str) -> Option<NormalizedEvent> {
         event.timestamp = timestamp.to_string();
     }
 
+    event.assign_stable_id();
+
     Some(event)
 }
 
@@ -477,6 +479,7 @@ pub fn collect_remote_macos_events(
         
         if let Some(mut event) = parse_log_line(line.as_str()) {
             event.source_host = profile.host.clone();
+            event.assign_stable_id();
             result.events.push(event);
             if result.events.len() >= max {
                 let _ = child.kill();

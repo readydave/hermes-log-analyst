@@ -8,7 +8,8 @@ mod settings;
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use crash::{import_host_crashes as collect_host_crashes, CrashRecord};
 use db::{
-    correlate_crash_events, get_crashes as read_crashes, get_local_events as read_local_events,
+    cleanup_duplicate_events, correlate_crash_events,
+    get_crashes as read_crashes, get_local_events as read_local_events,
     get_local_events_range as read_local_events_range,
     get_local_events_window as read_local_events_window, prune_events_before,
     prune_events_outside, save_crashes, save_local_events,
@@ -1301,6 +1302,12 @@ fn get_crashes(target_id: Option<String>, limit: Option<u32>) -> Result<Vec<Cras
 }
 
 #[tauri::command]
+fn cleanup_local_duplicate_events() -> Result<usize, String> {
+    cleanup_duplicate_events()
+        .map_err(|error| command_error("storage", "Failed to clean up duplicate events", error))
+}
+
+#[tauri::command]
 fn get_crash_related_events(
     crash_id: String,
     window_minutes: Option<i64>,
@@ -2266,6 +2273,7 @@ fn main() {
             get_local_events_window,
             import_host_crashes,
             get_crashes,
+            cleanup_local_duplicate_events,
             get_crash_related_events,
             get_ingest_window_days,
             set_ingest_window_days,
