@@ -1,3 +1,4 @@
+use crate::logs::NormalizedEvent;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -23,6 +24,44 @@ pub struct CrashRecord {
     pub raw_path: Option<String>,
     pub source_host: String,
     pub imported: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MinidumpAnalysisResult {
+    pub ok: bool,
+    pub crash_id: String,
+    pub crash_type: String,
+    pub source: String,
+    pub dump_path: Option<String>,
+    pub dump_exists: bool,
+    pub dump_kind: String,
+    pub dump_size_bytes: Option<u64>,
+    pub dump_modified_at: Option<String>,
+    pub header_signature: Option<String>,
+    pub header_version: Option<String>,
+    pub header_stream_count: Option<u32>,
+    pub header_timestamp: Option<String>,
+    pub bugcheck_code: Option<String>,
+    pub bugcheck_parameters: Vec<String>,
+    pub suspected_module: Option<String>,
+    pub likely_cause_category: String,
+    pub confidence: u8,
+    pub summary: String,
+    pub crash_details: Vec<String>,
+    pub likely_cause: String,
+    pub verify_first: Vec<String>,
+    pub escalate_if: Vec<String>,
+    pub warnings: Vec<String>,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DumpHeaderInfo {
+    signature: String,
+    version: String,
+    stream_count: u32,
+    timestamp: Option<String>,
 }
 
 impl CrashRecord {
@@ -51,6 +90,514 @@ impl CrashRecord {
             imported,
         }
     }
+}
+
+pub fn analyze_windows_minidump(
+    crash: &CrashRecord,
+    related_events: &[NormalizedEvent],
+) -> Result<MinidumpAnalysisResult, String> {
+    let dump_kind = if crash.source.eq_ignore_ascii_case("KernelDump")
+        || crash.crash_type.eq_ignore_ascii_case("Kernel Memory Dump")
+    {
+        "kernel_dump".to_string()
+    } else if crash.source.eq_ignore_ascii_case("Minidump")
+        || crash.crash_type.eq_ignore_ascii_case("Minidump")
+    {
+        "minidump".to_string()
+    } else {
+        "unsupported".to_string()
+    };
+
+    if !crash.os.eq_ignore_ascii_case("windows") || dump_kind == "unsupported" {
+        return Ok(unavailable_minidump_analysis(
+            crash,
+            dump_kind,
+            "Selected crash is not a supported Windows dump-backed crash.".to_string(),
+        ));
+    }
+
+    let Some(raw_path) = crash.raw_path.as_ref() else {
+        return Ok(unavailable_minidump_analysis(
+            crash,
+            dump_kind,
+            "Crash record does not include a dump file path.".to_string(),
+        ));
+    };
+
+    let path = PathBuf::from(raw_path);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Ok(unavailable_minidump_analysis(
+                crash,
+                dump_kind,
+                format!("Dump file is unavailable: {error}"),
+            ))
+        }
+    };
+
+    let mut warnings = Vec::new();
+    let header = match read_dump_header(path.as_path()) {
+        Ok(info) => Some(info),
+        Err(error) => {
+            warnings.push(error);
+            None
+        }
+    };
+
+    let bugcheck_code = crash
+        .code
+        .clone()
+        .or_else(|| infer_bugcheck_code(related_events));
+    let bugcheck_parameters = infer_bugcheck_parameters(related_events);
+    let suspected_module = crash
+        .suspected_component
+        .clone()
+        .or_else(|| infer_suspected_module(related_events));
+    let likely_cause_category =
+        infer_likely_cause_category(bugcheck_code.as_deref(), suspected_module.as_deref(), related_events);
+    let likely_cause = build_likely_cause_text(
+        likely_cause_category.as_str(),
+        suspected_module.as_deref(),
+        bugcheck_code.as_deref(),
+        related_events,
+    );
+    let confidence = estimate_confidence(
+        bugcheck_code.as_deref(),
+        suspected_module.as_deref(),
+        header.is_some(),
+        related_events,
+    );
+    let dump_modified_at = metadata.modified().ok().map(system_time_to_rfc3339);
+    let header_timestamp = header.as_ref().and_then(|info| info.timestamp.clone());
+    let summary = build_minidump_summary(
+        crash,
+        dump_kind.as_str(),
+        bugcheck_code.as_deref(),
+        suspected_module.as_deref(),
+        likely_cause_category.as_str(),
+        related_events.len(),
+    );
+    let crash_details = build_crash_details(
+        crash,
+        raw_path,
+        dump_kind.as_str(),
+        metadata.len(),
+        dump_modified_at.as_deref(),
+        header.as_ref(),
+        bugcheck_code.as_deref(),
+        bugcheck_parameters.as_slice(),
+    );
+    let verify_first = build_verify_first(
+        likely_cause_category.as_str(),
+        suspected_module.as_deref(),
+        bugcheck_code.as_deref(),
+        raw_path,
+    );
+    let escalate_if = build_escalate_if(
+        likely_cause_category.as_str(),
+        bugcheck_code.as_deref(),
+        suspected_module.as_deref(),
+    );
+
+    Ok(MinidumpAnalysisResult {
+        ok: true,
+        crash_id: crash.id.clone(),
+        crash_type: crash.crash_type.clone(),
+        source: crash.source.clone(),
+        dump_path: Some(raw_path.clone()),
+        dump_exists: true,
+        dump_kind,
+        dump_size_bytes: Some(metadata.len()),
+        dump_modified_at,
+        header_signature: header.as_ref().map(|info| info.signature.clone()),
+        header_version: header.as_ref().map(|info| info.version.clone()),
+        header_stream_count: header.as_ref().map(|info| info.stream_count),
+        header_timestamp,
+        bugcheck_code,
+        bugcheck_parameters,
+        suspected_module,
+        likely_cause_category,
+        confidence,
+        summary,
+        crash_details,
+        likely_cause,
+        verify_first,
+        escalate_if,
+        warnings,
+        unavailable_reason: None,
+    })
+}
+
+fn unavailable_minidump_analysis(
+    crash: &CrashRecord,
+    dump_kind: String,
+    reason: String,
+) -> MinidumpAnalysisResult {
+    MinidumpAnalysisResult {
+        ok: false,
+        crash_id: crash.id.clone(),
+        crash_type: crash.crash_type.clone(),
+        source: crash.source.clone(),
+        dump_path: crash.raw_path.clone(),
+        dump_exists: false,
+        dump_kind,
+        dump_size_bytes: None,
+        dump_modified_at: None,
+        header_signature: None,
+        header_version: None,
+        header_stream_count: None,
+        header_timestamp: None,
+        bugcheck_code: crash.code.clone(),
+        bugcheck_parameters: Vec::new(),
+        suspected_module: crash.suspected_component.clone(),
+        likely_cause_category: "unknown".to_string(),
+        confidence: 10,
+        summary: "Minidump analysis is unavailable for the selected crash.".to_string(),
+        crash_details: vec![
+            format!("Crash type: {}", crash.crash_type),
+            format!("Source: {}", crash.source),
+            format!("Timestamp: {}", crash.timestamp),
+        ],
+        likely_cause: "Hermes could not inspect the dump artifact, so only crash metadata is available.".to_string(),
+        verify_first: vec![
+            "Confirm the dump path still exists and is readable on the local machine.".to_string(),
+            "Load related pre-crash logs to recover supporting context.".to_string(),
+        ],
+        escalate_if: vec![
+            "The system continues to crash and the dump file cannot be accessed.".to_string(),
+            "Support needs kernel-level evidence that Hermes cannot recover from metadata alone.".to_string(),
+        ],
+        warnings: Vec::new(),
+        unavailable_reason: Some(reason),
+    }
+}
+
+fn read_dump_header(path: &Path) -> Result<DumpHeaderInfo, String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("Failed to open dump header: {error}"))?;
+    let mut buffer = [0u8; 32];
+    use std::io::Read;
+    file.read_exact(&mut buffer)
+        .map_err(|error| format!("Failed to read dump header: {error}"))?;
+
+    let signature = String::from_utf8_lossy(&buffer[0..4]).to_string();
+    if signature != "MDMP" {
+        return Err("Dump header signature is not MDMP; treating file as metadata-only.".to_string());
+    }
+
+    let version = u32::from_le_bytes(buffer[4..8].try_into().unwrap_or([0; 4]));
+    let stream_count = u32::from_le_bytes(buffer[8..12].try_into().unwrap_or([0; 4]));
+    let timestamp_raw = u32::from_le_bytes(buffer[20..24].try_into().unwrap_or([0; 4]));
+    let timestamp = if timestamp_raw == 0 {
+        None
+    } else {
+        DateTime::<Utc>::from_timestamp(timestamp_raw as i64, 0).map(|value| value.to_rfc3339())
+    };
+
+    Ok(DumpHeaderInfo {
+        signature,
+        version: format!("0x{version:08X}"),
+        stream_count,
+        timestamp,
+    })
+}
+
+fn infer_bugcheck_code(events: &[NormalizedEvent]) -> Option<String> {
+    for event in events {
+        let lower = event.message.to_ascii_lowercase();
+        if lower.contains("bugcheck") || lower.contains("stop code") {
+            if let Some(code) = first_hex_token(event.message.as_str()) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn infer_bugcheck_parameters(events: &[NormalizedEvent]) -> Vec<String> {
+    for event in events {
+        let lower = event.message.to_ascii_lowercase();
+        if !(lower.contains("bugcheck") || lower.contains("parameter")) {
+            continue;
+        }
+        let tokens = collect_hex_tokens(event.message.as_str(), 4);
+        if !tokens.is_empty() {
+            return tokens;
+        }
+    }
+    Vec::new()
+}
+
+fn infer_suspected_module(events: &[NormalizedEvent]) -> Option<String> {
+    for event in events {
+        if let Some(module) = extract_module_candidate(event.message.as_str()) {
+            return Some(module);
+        }
+    }
+    None
+}
+
+fn extract_module_candidate(message: &str) -> Option<String> {
+    for token in message.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')' | '[' | ']' | '"' | '\'')) {
+        let trimmed = token.trim_matches(|ch: char| matches!(ch, '.' | ':' | '\\' | '/'));
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.ends_with(".sys") || lower.ends_with(".dll") || lower.ends_with(".exe") {
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn infer_likely_cause_category(
+    bugcheck_code: Option<&str>,
+    suspected_module: Option<&str>,
+    events: &[NormalizedEvent],
+) -> String {
+    let module_lower = suspected_module.unwrap_or_default().to_ascii_lowercase();
+    if module_lower.contains("stor") || module_lower.contains("nvme") || module_lower.contains("disk") {
+        return "storage".to_string();
+    }
+    if module_lower.contains("nvlddmkm")
+        || module_lower.contains("amdkmdag")
+        || module_lower.contains("igdkmd")
+        || module_lower.contains("intel")
+    {
+        return "driver".to_string();
+    }
+    if module_lower.contains("crowdstrike")
+        || module_lower.contains("sentinel")
+        || module_lower.contains("defender")
+        || module_lower.contains("edr")
+    {
+        return "security software".to_string();
+    }
+
+    let code_lower = bugcheck_code.unwrap_or_default().to_ascii_lowercase();
+    if code_lower.contains("0x1a") || code_lower.contains("memory_management") {
+        return "memory".to_string();
+    }
+    if code_lower.contains("0x7a") || code_lower.contains("0x7b") || code_lower.contains("0xf4") {
+        return "storage".to_string();
+    }
+
+    for event in events {
+        let lower = format!("{} {}", event.provider, event.message).to_ascii_lowercase();
+        if lower.contains("disk") || lower.contains("storport") || lower.contains("ntfs") || lower.contains("nvme") {
+            return "storage".to_string();
+        }
+        if lower.contains("memory") || lower.contains("ram") || lower.contains("pagefile") {
+            return "memory".to_string();
+        }
+        if lower.contains("firmware") || lower.contains("acpi") || lower.contains("bios") || lower.contains("pluton") {
+            return "firmware".to_string();
+        }
+        if lower.contains("driver") || lower.contains(".sys") || lower.contains("wudfrd") {
+            return "driver".to_string();
+        }
+        if lower.contains("defender") || lower.contains("endpoint") || lower.contains("security") {
+            return "security software".to_string();
+        }
+    }
+
+    "unknown".to_string()
+}
+
+fn build_likely_cause_text(
+    category: &str,
+    suspected_module: Option<&str>,
+    bugcheck_code: Option<&str>,
+    events: &[NormalizedEvent],
+) -> String {
+    let module_text = suspected_module
+        .map(|value| format!(" Possible suspect module: {value}."))
+        .unwrap_or_default();
+    let code_text = bugcheck_code
+        .map(|value| format!(" Observed bugcheck code: {value}."))
+        .unwrap_or_default();
+    let context_text = if events.is_empty() {
+        " No related event evidence is currently loaded.".to_string()
+    } else {
+        format!(" Hermes correlated {} nearby event(s) for context.", events.len())
+    };
+
+    format!(
+        "Likely cause category: {}.{}{}{}",
+        title_case_label(category),
+        code_text,
+        module_text,
+        context_text
+    )
+}
+
+fn estimate_confidence(
+    bugcheck_code: Option<&str>,
+    suspected_module: Option<&str>,
+    has_header: bool,
+    events: &[NormalizedEvent],
+) -> u8 {
+    let mut confidence = 30u8;
+    if bugcheck_code.is_some() {
+        confidence = confidence.saturating_add(20);
+    }
+    if suspected_module.is_some() {
+        confidence = confidence.saturating_add(20);
+    }
+    if has_header {
+        confidence = confidence.saturating_add(10);
+    }
+    if !events.is_empty() {
+        confidence = confidence.saturating_add(15);
+    }
+    confidence.min(95)
+}
+
+fn build_minidump_summary(
+    crash: &CrashRecord,
+    dump_kind: &str,
+    bugcheck_code: Option<&str>,
+    suspected_module: Option<&str>,
+    likely_cause_category: &str,
+    related_count: usize,
+) -> String {
+    let dump_label = if dump_kind == "kernel_dump" {
+        "kernel dump"
+    } else {
+        "minidump"
+    };
+    let code_text = bugcheck_code.unwrap_or("not recovered");
+    let module_text = suspected_module.unwrap_or("no specific module identified");
+    format!(
+        "Hermes found a Windows {dump_label} for the selected crash. Bugcheck code: {code_text}. Likely cause category: {}. Suspect: {module_text}. Related evidence count: {related_count}. Crash summary: {}.",
+        title_case_label(likely_cause_category),
+        crash.summary
+    )
+}
+
+fn build_crash_details(
+    crash: &CrashRecord,
+    raw_path: &str,
+    dump_kind: &str,
+    dump_size: u64,
+    dump_modified_at: Option<&str>,
+    header: Option<&DumpHeaderInfo>,
+    bugcheck_code: Option<&str>,
+    bugcheck_parameters: &[String],
+) -> Vec<String> {
+    let mut details = vec![
+        format!("Crash timestamp: {}", crash.timestamp),
+        format!("Crash type: {}", crash.crash_type),
+        format!("Dump kind: {}", title_case_label(dump_kind)),
+        format!("Dump path: {raw_path}"),
+        format!("Dump size: {} bytes", dump_size),
+    ];
+    if let Some(value) = dump_modified_at {
+        details.push(format!("Dump modified: {value}"));
+    }
+    if let Some(value) = bugcheck_code {
+        details.push(format!("Bugcheck code: {value}"));
+    }
+    if !bugcheck_parameters.is_empty() {
+        details.push(format!("Bugcheck parameters: {}", bugcheck_parameters.join(", ")));
+    }
+    if let Some(info) = header {
+        details.push(format!("Header signature: {}", info.signature));
+        details.push(format!("Header version: {}", info.version));
+        details.push(format!("Header stream count: {}", info.stream_count));
+        if let Some(value) = &info.timestamp {
+            details.push(format!("Header timestamp: {value}"));
+        }
+    }
+    details
+}
+
+fn build_verify_first(
+    category: &str,
+    suspected_module: Option<&str>,
+    bugcheck_code: Option<&str>,
+    _raw_path: &str,
+) -> Vec<String> {
+    let mut steps = vec![
+        "If Hermes already loaded pre-crash evidence, review the strongest warning/error events there first. Only fall back to System/WER crash logs if the needed event IDs are not yet loaded in Hermes.".to_string(),
+    ];
+    if let Some(value) = bugcheck_code {
+        steps.push(format!("Search internal KB/vendor guidance for bugcheck code {value} before making changes."));
+    }
+    if let Some(value) = suspected_module {
+        steps.push(format!("Verify the file version, signer, and recent update or rollout history for suspected module/driver '{value}' before making changes."));
+    } else if category == "storage" {
+        steps.push("Check disk/NVMe/NTFS controller health and firmware before replacing software.".to_string());
+    } else if category == "memory" {
+        steps.push("Run safe memory diagnostics and confirm recent BIOS/XMP/overclock changes.".to_string());
+    } else if category == "security software" {
+        steps.push("Check recent EDR/AV updates, policy changes, or driver components loaded at boot.".to_string());
+    }
+    steps
+}
+
+fn build_escalate_if(
+    category: &str,
+    bugcheck_code: Option<&str>,
+    suspected_module: Option<&str>,
+) -> Vec<String> {
+    let mut items = vec![
+        "The system is repeatedly crashing after version, signer, and recent update-history verification for the suspected driver path.".to_string(),
+        "Support needs WinDbg or other symbol-backed stack analysis to confirm whether the failure stays within the current working hypothesis.".to_string(),
+    ];
+    if let Some(value) = suspected_module {
+        items.push(format!("The suspected module '{value}' belongs to a critical platform, storage, or security component."));
+    }
+    if let Some(value) = bugcheck_code {
+        items.push(format!("Bugcheck {value} maps to known data-loss, memory-corruption, or storage-integrity risk."));
+    }
+    if category == "firmware" {
+        items.push("Firmware or BIOS evidence points to platform instability that requires engineering validation.".to_string());
+    }
+    items
+}
+
+fn first_hex_token(input: &str) -> Option<String> {
+    collect_hex_tokens(input, 1).into_iter().next()
+}
+
+fn collect_hex_tokens(input: &str, limit: usize) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for raw in input.split(|ch: char| !ch.is_ascii_hexdigit() && ch != 'x' && ch != 'X') {
+        let trimmed = raw.trim();
+        if trimmed.len() < 3 {
+            continue;
+        }
+        let candidate = if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+            trimmed.to_string()
+        } else if trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) && trimmed.len() >= 4 {
+            format!("0x{trimmed}")
+        } else {
+            continue;
+        };
+        if !tokens.contains(&candidate) {
+            tokens.push(candidate);
+        }
+        if tokens.len() >= limit {
+            break;
+        }
+    }
+    tokens
+}
+
+fn title_case_label(value: &str) -> String {
+    value
+        .split(['_', '-', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn import_host_crashes(limit: usize) -> Result<Vec<CrashRecord>, String> {

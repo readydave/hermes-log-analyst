@@ -323,6 +323,21 @@ pub fn get_crashes(limit: u32, host: Option<&str>) -> Result<Vec<CrashRecord>, S
     Ok(crashes)
 }
 
+pub fn get_crash_by_id(crash_id: &str) -> Result<Option<CrashRecord>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, os, source, crash_type, code, summary, suspected_component, raw_path, source_host, imported FROM crashes WHERE id = ?1 LIMIT 1",
+        )
+        .map_err(|e| format!("Failed to prepare crash-by-id query: {e}"))?;
+
+    match stmt.query_row(params![crash_id], row_to_crash) {
+        Ok(crash) => Ok(Some(crash)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("Failed to read crash by id: {error}")),
+    }
+}
+
 pub fn prune_events_before(cutoff: &str) -> Result<usize, String> {
     let conn = open_connection()?;
     let deleted = conn

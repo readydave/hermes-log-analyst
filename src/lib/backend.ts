@@ -113,6 +113,34 @@ export interface LlmAnalysisResult {
   warning: string | null;
 }
 
+export interface MinidumpAnalysisResult {
+  ok: boolean;
+  crashId: string;
+  crashType: string;
+  source: string;
+  dumpPath: string | null;
+  dumpExists: boolean;
+  dumpKind: string;
+  dumpSizeBytes: number | null;
+  dumpModifiedAt: string | null;
+  headerSignature: string | null;
+  headerVersion: string | null;
+  headerStreamCount: number | null;
+  headerTimestamp: string | null;
+  bugcheckCode: string | null;
+  bugcheckParameters: string[];
+  suspectedModule: string | null;
+  likelyCauseCategory: string;
+  confidence: number;
+  summary: string;
+  crashDetails: string[];
+  likelyCause: string;
+  verifyFirst: string[];
+  escalateIf: string[];
+  warnings: string[];
+  unavailableReason: string | null;
+}
+
 function createDefaultLlmProfile(): LlmConnectionProfile {
   return {
     id: "profile-ollama-local",
@@ -343,6 +371,21 @@ export async function getCrashRelatedEvents(
   });
 }
 
+export async function analyzeMinidump(
+  crashId: string,
+  windowMinutes = 15
+): Promise<MinidumpAnalysisResult> {
+  if (!isTauriRuntime()) {
+    throw new Error("Minidump analysis requires desktop runtime.");
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<MinidumpAnalysisResult>("analyze_minidump", {
+    crashId,
+    windowMinutes
+  });
+}
+
 export async function syncLocalEventsWindow(
   start: string,
   end: string,
@@ -379,6 +422,15 @@ export async function openExternalUrl(url: string): Promise<void> {
 
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("open_external_url", { url });
+}
+
+export async function openPathInShell(path: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("Opening local paths requires desktop runtime.");
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_path_in_shell", { path });
 }
 
 export async function getExportDirectory(): Promise<string | null> {

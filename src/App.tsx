@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  analyzeMinidump,
   importHostCrashes,
   exportEventsWithDialog,
   getCrashRelatedEvents,
@@ -34,7 +35,8 @@ import {
   listLlmNetworkInterfaces,
   getRemoteSettings,
   saveRemoteSettings,
-  restartElevated
+  restartElevated,
+  openPathInShell
 } from "./lib/backend";
 import type {
   IngestProfile,
@@ -45,6 +47,7 @@ import type {
   LlmNetworkInterface,
   LlmSettings,
   EventLoadEstimate,
+  MinidumpAnalysisResult,
   SyncOperationResult,
   RemoteSettings,
   RemoteConnectionProfile
@@ -52,7 +55,7 @@ import type {
 import { exportAsCsv, exportAsJson, exportAsText } from "./lib/export";
 import { applyFilters, defaultFilters } from "./lib/filters";
 import { importSessionEvents } from "./lib/import";
-import { buildGoogleQuery, buildLlmPrompt, redactSensitiveText } from "./lib/llmPrompt";
+import { buildCrashRcaPrompt, buildGoogleQuery, buildLlmPrompt, redactSensitiveText } from "./lib/llmPrompt";
 import { cn } from "./lib/cn";
 import { Button } from "./components/Button";
 import type {
@@ -241,6 +244,18 @@ interface PendingLoadEstimate {
 interface LlmGuardrailBlock {
   host: string;
   message: string;
+}
+
+type LlmAnalysisContextKind = "event" | "crash-rca";
+
+interface CrashSessionSummary {
+  coverageLabel: string;
+  severityMetrics: CountMetric[];
+  providerMetrics: CountMetric[];
+  logTypeMetrics: CountMetric[];
+  noisySourceMetrics: CountMetric[];
+  relevantExcerpts: string[];
+  readinessNote: string;
 }
 
 const workspaceTabs: WorkspaceTabDescriptor[] = [
@@ -897,6 +912,184 @@ function buildEventContextText(
   ].join("\n");
 }
 
+function isDumpBackedCrash(crash: CrashRecord | null): boolean {
+  if (!crash) return false;
+  return (
+    crash.os === "windows" &&
+    (crash.source.toLowerCase() === "minidump" || crash.source.toLowerCase() === "kerneldump")
+  );
+}
+
+function formatCrashEvidenceLine(event: NormalizedEvent, redact = false): string {
+  const safe = (value: string) => (redact ? redactSensitiveText(value) : value);
+  return [
+    safe(new Date(event.timestamp).toLocaleString()),
+    safe(event.logName),
+    safe(event.provider),
+    event.eventId ? `Event ID ${event.eventId}` : "Event ID N/A",
+    safe(event.severity),
+    safe(event.message)
+  ].join(" | ");
+}
+
+function severityPriority(severity: EventSeverity): number {
+  switch (severity) {
+    case "critical":
+      return 4;
+    case "error":
+      return 3;
+    case "warning":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function buildCrashIndicatorSummaryItems(
+  primaryEvents: NormalizedEvent[],
+  fallbackEvents: NormalizedEvent[]
+): string[] {
+  const source = primaryEvents.length > 0 ? primaryEvents : fallbackEvents;
+  return [...source]
+    .filter((event) => {
+      const provider = event.provider.toLowerCase();
+      const message = event.message.toLowerCase();
+      return !(
+        (provider.includes("kernel-power") && event.eventId === 41) ||
+        event.eventId === 1001 ||
+        provider.includes("bugcheck") ||
+        message.includes("rebooted without cleanly shutting down") ||
+        message.includes("system has rebooted without cleanly shutting down")
+      );
+    })
+    .sort((a, b) => {
+      const severityDelta = severityPriority(b.severity) - severityPriority(a.severity);
+      if (severityDelta !== 0) return severityDelta;
+      return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+    })
+    .slice(0, 3)
+    .map((event) => {
+      const eventIdPart = typeof event.eventId === "number" ? `Event ID ${event.eventId}` : "Event ID N/A";
+      const message = event.message.length > 100 ? `${event.message.slice(0, 99)}...` : event.message;
+      return `${event.provider} | ${eventIdPart} | ${event.severity} | ${message}`;
+    });
+}
+
+function buildMinidumpClipboardText(result: MinidumpAnalysisResult): string {
+  return [
+    "Hermes Minidump Analysis",
+    `Generated: ${new Date().toLocaleString()}`,
+    `Crash Type: ${result.crashType}`,
+    `Source: ${result.source}`,
+    `Dump Kind: ${result.dumpKind}`,
+    `Dump Path: ${result.dumpPath ?? "Unavailable"}`,
+    `Dump Exists: ${result.dumpExists ? "Yes" : "No"}`,
+    `Bugcheck Code: ${result.bugcheckCode ?? "Unavailable"}`,
+    `Suspected Module: ${result.suspectedModule ?? "Unknown"}`,
+    `Likely Cause Category: ${result.likelyCauseCategory}`,
+    `Confidence: ${result.confidence}%`,
+    "",
+    "Summary",
+    result.summary,
+    "",
+    "Crash Details",
+    ...result.crashDetails.map((item) => `- ${item}`),
+    "",
+    "Likely Cause",
+    result.likelyCause,
+    "",
+    "What To Verify First",
+    ...(result.verifyFirst.length > 0 ? result.verifyFirst.map((item) => `- ${item}`) : ["- Not provided"]),
+    "",
+    "Escalate If",
+    ...(result.escalateIf.length > 0 ? result.escalateIf.map((item) => `- ${item}`) : ["- Not provided"]),
+    "",
+    "Warnings",
+    ...(result.warnings.length > 0 ? result.warnings.map((item) => `- ${item}`) : ["- None"])
+  ].join("\n");
+}
+
+function buildCrashRcaOriginalContext(
+  crash: CrashRecord,
+  analysis: MinidumpAnalysisResult,
+  summary: CrashSessionSummary,
+  preCrashEvents: NormalizedEvent[],
+  correlatedEvents: NormalizedEvent[]
+): string {
+  const hermesIndicators = buildCrashIndicatorSummaryItems(preCrashEvents, correlatedEvents);
+  const topCorrelatedEventIds = rankMetrics(
+    correlatedEvents.reduce((map, event) => {
+      if (typeof event.eventId === "number") {
+        incrementMetric(map, String(event.eventId));
+      }
+      return map;
+    }, new Map<string, number>()),
+    6
+  );
+  return [
+    `Crash: ${crash.summary}`,
+    `Crash Type: ${crash.crashType}`,
+    `Crash Source: ${crash.source}`,
+    `Crash Timestamp: ${new Date(crash.timestamp).toLocaleString()}`,
+    `Crash Code: ${crash.code ?? "Unavailable"}`,
+    `Suspected Component: ${crash.suspectedComponent ?? "Unknown"}`,
+    `Source Host: ${crash.sourceHost}`,
+    "",
+    "Minidump Summary:",
+    analysis.summary,
+    "",
+    "Crash Details:",
+    ...analysis.crashDetails.map((item) => `- ${item}`),
+    "",
+    "Likely Cause:",
+    analysis.likelyCause,
+    "",
+    "Prepared Verify First:",
+    ...(analysis.verifyFirst.length > 0 ? analysis.verifyFirst.map((item) => `- ${item}`) : ["- None"]),
+    "",
+    "Prepared Escalate If:",
+    ...(analysis.escalateIf.length > 0 ? analysis.escalateIf.map((item) => `- ${item}`) : ["- None"]),
+    "",
+    `Loaded Session Coverage: ${summary.coverageLabel}`,
+    `Context Note: ${summary.readinessNote}`,
+    "Top Correlated Event IDs:",
+    ...(topCorrelatedEventIds.length > 0
+      ? topCorrelatedEventIds.map((metric) => `- ${metric.label}: ${metric.count}`)
+      : ["- None"]),
+    "",
+    "Hermes Pre-Crash Indicators:",
+    ...(hermesIndicators.length > 0 ? hermesIndicators.map((item) => `- ${item}`) : ["- None"]),
+    "",
+    "Severity Distribution:",
+    ...(summary.severityMetrics.length > 0
+      ? summary.severityMetrics.map((metric) => `- ${metric.label}: ${metric.count}`)
+      : ["- None"]),
+    "Top Providers:",
+    ...(summary.providerMetrics.length > 0
+      ? summary.providerMetrics.map((metric) => `- ${metric.label}: ${metric.count}`)
+      : ["- None"]),
+    "Top Log Types:",
+    ...(summary.logTypeMetrics.length > 0
+      ? summary.logTypeMetrics.map((metric) => `- ${metric.label}: ${metric.count}`)
+      : ["- None"]),
+    "Noisy Sources:",
+    ...(summary.noisySourceMetrics.length > 0
+      ? summary.noisySourceMetrics.map((metric) => `- ${metric.label}: ${metric.count}`)
+      : ["- None"]),
+    "",
+    `Pre-Crash Events Loaded: ${preCrashEvents.length}`,
+    ...(preCrashEvents.slice(0, 10).map((event) => `- ${formatCrashEvidenceLine(event)}`)),
+    "",
+    `Correlated Events Loaded: ${correlatedEvents.length}`,
+    ...(correlatedEvents.slice(0, 10).map((event) => `- ${formatCrashEvidenceLine(event)}`)),
+    "",
+    "Relevant Excerpts:",
+    ...(summary.relevantExcerpts.length > 0
+      ? summary.relevantExcerpts.map((entry) => `- ${entry}`)
+      : ["- None"])
+  ].join("\n");
+}
+
 interface LlmAnalysisGuide {
   summary: string;
   likelyCauses: string[];
@@ -907,6 +1100,7 @@ interface LlmAnalysisGuide {
   escalateIf: string[];
   confidence: string;
   missingData: string[];
+  howToGetMissingData: string[];
   cleanedRaw: string;
 }
 
@@ -920,19 +1114,293 @@ const llmGuideSectionMatchers: Array<{
     | "remediationOptions"
     | "escalateIf"
     | "confidence"
-    | "missingData";
+    | "missingData"
+    | "howToGetMissingData";
   regex: RegExp;
 }> = [
   { key: "summary", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?summary\b[:\-]*/i },
-  { key: "likelyCauses", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?likely causes?\b[:\-]*/i },
+  { key: "likelyCauses", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?(?:likely causes?|most likely rca)\b[:\-]*/i },
   { key: "riskLevel", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?risk level\b[:\-]*/i },
-  { key: "securityImpact", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?security impact\b[:\-]*/i },
+  { key: "securityImpact", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?(?:security impact|impact)\b[:\-]*/i },
   { key: "verifyFirst", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?verify first\b[:\-]*/i },
-  { key: "remediationOptions", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?remediation options?\b[:\-]*/i },
+  { key: "remediationOptions", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?(?:remediation options?|immediate actions)\b[:\-]*/i },
   { key: "escalateIf", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?escalate if\b[:\-]*/i },
   { key: "confidence", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?confidence\b[:\-]*/i },
-  { key: "missingData", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?missing data\b[:\-]*/i }
+  { key: "missingData", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?missing data\b[:\-]*/i },
+  { key: "howToGetMissingData", regex: /^(?:#+\s*)?(?:\d+[.)]\s*)?how to get missing data\b[:\-]*/i }
 ];
+
+function buildCrashRcaMissingDataRetrieval(missingData: string[]): string[] {
+  const lowerItems = missingData.map((item) => item.toLowerCase());
+  const steps: string[] = [];
+
+  if (lowerItems.some((item) => item.includes("bugcheck"))) {
+    steps.push(
+      "To retrieve the bugcheck code, first check Windows WER/BugCheck crash events in the System log. PowerShell: `Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001} | Select-Object TimeCreated, Id, ProviderName, Message -First 10`"
+    );
+  }
+
+  if (lowerItems.some((item) => item.includes("stack trace") || item.includes("instruction pointer") || item.includes("rip"))) {
+    steps.push(
+      "To retrieve a stack trace, open the dump in WinDbg and load symbols, then run `!analyze -v`, `kv`, and `lm`. This is typically an escalation/engineering step rather than first-line help desk analysis."
+    );
+  }
+
+  if (steps.length === 0) {
+    steps.push(
+      "If critical crash evidence is missing, review the nearest System/WER crash events first, then escalate to debugger-based dump analysis if Hermes still cannot prove the root cause."
+    );
+  }
+
+  return steps;
+}
+
+function normalizeConfidenceText(value: string): string {
+  const trimmed = value
+    .trim()
+    .replace(/\s*#+\s*why\b[:\-]?\s*/gi, ": ")
+    .replace(/\s+/g, " ");
+  if (!trimmed || trimmed === "Not specified.") {
+    return trimmed;
+  }
+
+  const match = trimmed.match(/^(\d{1,3}%)(?:\s*(?:why:|:|-)\s*)?(.*)$/i);
+  if (!match) {
+    return trimmed;
+  }
+
+  const [, percent, remainder] = match;
+  const detail = remainder.trim();
+  return detail ? `${percent}: ${detail}` : percent;
+}
+
+function sanitizeCrashRcaAction(item: string): string {
+  const lower = item.toLowerCase();
+  const mentionsKernelAsset =
+    lower.includes(".sys") ||
+    lower.includes("driver") ||
+    lower.includes("windows component") ||
+    lower.includes("system file");
+  const destructive =
+    lower.includes("uninstall") ||
+    lower.includes("delete") ||
+    lower.includes("remove") ||
+    lower.includes("force remove");
+
+  if (mentionsKernelAsset && destructive) {
+    return "Do not remove kernel drivers or Windows components from RCA output alone. Verify the version, recent changes, and vendor guidance first, then escalate if a rollback is required.";
+  }
+
+  if (lower.includes("do not reboot")) {
+    return "Preserve current state if safe, collect evidence, and follow the support workflow before disruptive changes.";
+  }
+
+  if (lower.includes("reboot")) {
+    return "Preserve the dump and current Hermes evidence first, then reboot only after targeted verification if the environment allows interruption.";
+  }
+
+  if (lower.includes("symbol-level rollback") || (lower.includes("symbols") && lower.includes("rollback"))) {
+    return "High-risk escalation-only: use symbol-backed debugging to confirm the fault domain first, then decide whether a vendor-supported rollback or patch is appropriate under change control.";
+  }
+
+  if (lower.includes("clean boot") && (lower.includes("hyper-v") || lower.includes("services disabled"))) {
+    return "Use controlled isolation testing only after preserving evidence: verify recent Hyper-V, virtual switch, VPN, or network-filter driver changes first, then disable non-essential related components one change at a time if the environment allows it.";
+  }
+
+  if (lower.includes("windows updates") && (lower.includes("hyper-v") || lower.includes("vmswitch"))) {
+    return "Review recent Windows, Hyper-V, virtual switch, VPN, or network-filter driver updates and apply relevant vendor-supported fixes for the suspected driver path.";
+  }
+
+  return item;
+}
+
+function sanitizeCrashVerifyFirstItem(item: string): string {
+  let value = item.trim();
+  if (/dump file exists and is readable|minidump .*readable|verify minidump .*readable|dump .*readable/i.test(value)) {
+    return "Verify the suspected driver/module file version, signer, and recent Windows Update or rollout history before making changes.";
+  }
+  value = value.replace(/system rebooted without shutdown\s*\(event 41\)[,;]?\s*/i, "");
+  value = value.replace(/dump file [^.;]+ available for analysis[,;]?\s*/i, "");
+  value = value.replace(/volmgr\s+event\s+16[12][^.;]*[,;]?\s*/i, "");
+  value = value.replace(/\s{2,}/g, " ").replace(/\s+([,;:.])/g, "$1").trim();
+  if (value.endsWith(",") || value.endsWith(";")) {
+    value = value.slice(0, -1).trim();
+  }
+  return value;
+}
+
+function normalizeCrashRiskLevelText(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "Not specified.") {
+    return trimmed;
+  }
+
+  const normalized = trimmed.replace(/\s+/g, " ");
+  if (/medium\s*-\s*high/i.test(normalized)) {
+    return normalized.replace(/medium\s*-\s*high/i, "High");
+  }
+  if (/low\s*-\s*medium/i.test(normalized)) {
+    return normalized.replace(/low\s*-\s*medium/i, "Medium");
+  }
+  return normalized;
+}
+
+function sanitizeCrashHowToGetMissingDataItem(item: string): string {
+  let value = item.trim();
+  value = value.replace(/Get-WinEvent\s+-FilterHashtable\s+@\{LogName='System';\s*Id=41\}/gi, "Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001}");
+  if (/event id 41|id=41|kernel-power/i.test(value) && /bugcheck|crash code/i.test(value)) {
+    return "Retrieve the bugcheck code from Windows WER/BugCheck crash events first, for example with `Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001}`. Use Event ID 41 only as crash confirmation context, not as the primary bugcheck source.";
+  }
+  if (/bluescreenview/i.test(value) || (/windbg/i.test(value) && /bugcheck/i.test(value))) {
+    return "Use WinDbg first for authoritative dump analysis: open the minidump, load symbols, and run `!analyze -v`. BlueScreenView is acceptable only as a lightweight quick-look, not as a substitute for debugger-backed analysis.";
+  }
+  return value;
+}
+
+function sanitizeCrashEscalateItem(item: string): string {
+  const lower = item.toLowerCase();
+  if (/(event id 1001|wer).*(memory corruption)|memory corruption.*(event id 1001|wer)/i.test(item)) {
+    return "Escalate if WER/System Event ID 1001 or WinDbg identifies a bugcheck or stack trace that points outside the current working `vmswitch.sys` hypothesis.";
+  }
+  if (lower.includes("production stability without further investigation")) {
+    return "Escalate if the environment requires rapid stability restoration and the current evidence is still only a working hypothesis.";
+  }
+  if (lower.includes("system continues to crash") || lower.includes("crash recurs")) {
+    return "Escalate if repeated crashes continue after version, signer, and recent update-history verification for the suspected driver path.";
+  }
+  return item;
+}
+
+function sanitizeCrashSummaryText(value: string): string {
+  let text = value.trim();
+  if (!text) return text;
+  text = text.replace(/(pnp|wudfrd) (driver )?(load failures?)/gi, "nearby driver-load instability");
+  text = text.replace(/\s{2,}/g, " ");
+  return text;
+}
+
+function sanitizeCrashLikelyCauseItem(item: string): string {
+  let value = ensureCrashHypothesisWording(item, true);
+  if (/supporting evidence:/i.test(value) && /wudfrd/i.test(value)) {
+    value = value.replace(/WUDFRd[^.;]*?(?=;|$)/i, "nearby WUDFRd-related driver-load instability");
+  }
+  return value;
+}
+
+function ensureCrashHypothesisWording(item: string, hasCriticalCrashGaps: boolean): string {
+  if (!hasCriticalCrashGaps) {
+    return item;
+  }
+
+  if (/working hypothesis|not a confirmed root cause|not yet confirmed/i.test(item)) {
+    return item;
+  }
+
+  if (/^-\s*/.test(item)) {
+    return item;
+  }
+
+  if (/most likely rca:/i.test(item)) {
+    return `${item} This remains a working hypothesis until the bugcheck code or stack trace confirms it.`;
+  }
+
+  if (/remaining uncertainty:/i.test(item)) {
+    return `${item} Treat this as a working hypothesis, not a confirmed root cause.`;
+  }
+
+  return item;
+}
+
+function normalizeLlmGuide(
+  guide: LlmAnalysisGuide,
+  contextKind: LlmAnalysisContextKind,
+  options?: {
+    hasHermesPreCrashEvidence?: boolean;
+    hermesIndicatorItems?: string[];
+  }
+): LlmAnalysisGuide {
+  if (contextKind !== "crash-rca") {
+    return guide;
+  }
+
+  const likelyCauses =
+    guide.likelyCauses.length > 0
+      ? guide.likelyCauses
+      : ["Most likely RCA: The response did not clearly identify a single cause from the available crash evidence."];
+
+  const riskLevel = guide.riskLevel !== "Not specified."
+    ? normalizeCrashRiskLevelText(guide.riskLevel)
+    : "Medium - A system crash occurred, but the currently loaded evidence does not fully prove the root cause.";
+
+  const securityImpact = guide.securityImpact !== "Not specified."
+    ? guide.securityImpact
+    : "No direct security impact confirmed from available crash evidence.";
+
+  const remediationOptions =
+    guide.remediationOptions.length > 0
+      ? guide.remediationOptions.map(sanitizeCrashRcaAction)
+      : [
+          "Capture the dump, preserve supporting logs, and verify the suspected module or driver version before making changes.",
+          "Use vendor-supported update or rollback guidance only after confirming the fault domain."
+        ];
+  const hasHermesPreCrashEvidence = options?.hasHermesPreCrashEvidence === true;
+  const hermesIndicatorItems = options?.hermesIndicatorItems ?? [];
+  const hasCriticalCrashGaps = guide.missingData.some((item) => /bugcheck|stack trace|instruction pointer|rip/i.test(item));
+  const hermesIndicatorLine =
+    hasHermesPreCrashEvidence && hermesIndicatorItems.length > 0
+      ? `Hermes found these pre-crash indicators: ${hermesIndicatorItems.join("; ")}`
+      : "";
+  const verifyFirstBase =
+    guide.verifyFirst.length > 0
+      ? guide.verifyFirst.filter((item) => {
+          if (!hasHermesPreCrashEvidence) return true;
+          return !/(event viewer|system log|review .*pre-crash .*warnings|review .*critical errors)/i.test(item);
+        }).map(sanitizeCrashVerifyFirstItem).filter(Boolean)
+      : [];
+  const verifyFirst =
+    hasHermesPreCrashEvidence && hermesIndicatorLine
+      ? [hermesIndicatorLine, ...verifyFirstBase.filter((item) => item !== hermesIndicatorLine)]
+      : verifyFirstBase.length > 0
+        ? verifyFirstBase
+        : ["Review the dump metadata, correlated events, and recent driver/software changes before remediation."];
+  const normalizedLikelyCauses = likelyCauses.map((item) => ensureCrashHypothesisWording(item, hasCriticalCrashGaps));
+  const sanitizedLikelyCauses = normalizedLikelyCauses.map(sanitizeCrashLikelyCauseItem);
+  const sanitizedSummary = sanitizeCrashSummaryText(guide.summary);
+
+  return {
+    ...guide,
+    summary: sanitizedSummary,
+    likelyCauses: sanitizedLikelyCauses,
+    riskLevel,
+    securityImpact,
+    remediationOptions,
+    verifyFirst,
+    escalateIf:
+      guide.escalateIf.length > 0
+        ? guide.escalateIf.map(sanitizeCrashEscalateItem)
+        : ["Escalate if the system continues crashing or the dump evidence is still inconclusive."],
+    confidence:
+      guide.confidence !== "Not specified."
+        ? normalizeConfidenceText(
+            /why:/i.test(guide.confidence)
+              ? guide.confidence
+              : `${guide.confidence}: Hermes has some supporting crash-context evidence, but the exact bugcheck code and deeper symbol-backed stack evidence are still missing. Treat this as a working hypothesis, not a confirmed root cause.`
+          )
+        : "40%: Hermes has partial crash-context evidence, but key proof points like the bugcheck code or deeper dump evidence are still missing. Treat this as a working hypothesis, not a confirmed root cause.",
+    missingData:
+      guide.missingData.length > 0
+        ? guide.missingData
+        : ["Exact bugcheck code or stronger dump evidence is still needed to prove the RCA."],
+    howToGetMissingData:
+      guide.howToGetMissingData.length > 0
+        ? guide.howToGetMissingData.map(sanitizeCrashHowToGetMissingDataItem)
+        : buildCrashRcaMissingDataRetrieval(
+            guide.missingData.length > 0
+              ? guide.missingData
+              : ["Exact bugcheck code or stronger dump evidence is still needed to prove the RCA."]
+          )
+  };
+}
 
 function stripLlmScratchpadNoise(raw: string): string {
   const noisyPrefix = /^(?:\*+\s*)?(?:wait|let'?s|lets|okay\b|i need to|i will|self-correction|rule \d+|date anomaly|security flag)\b/i;
@@ -968,7 +1436,8 @@ function parseLlmGuide(raw: string): LlmAnalysisGuide {
     remediationOptions: [] as string[],
     escalateIf: [] as string[],
     confidence: [] as string[],
-    missingData: [] as string[]
+    missingData: [] as string[],
+    howToGetMissingData: [] as string[]
   };
   const preface: string[] = [];
   let currentKey: keyof typeof buckets | null = null;
@@ -997,13 +1466,14 @@ function parseLlmGuide(raw: string): LlmAnalysisGuide {
   const summary = buckets.summary[0] ?? preface[0] ?? "No summary returned.";
   const riskLevel = buckets.riskLevel[0] ?? "Not specified.";
   const securityImpact = buckets.securityImpact[0] ?? "Not specified.";
-  const confidence = buckets.confidence[0] ?? "Not specified.";
+  const confidence = buckets.confidence.length > 0 ? buckets.confidence.join(" ") : "Not specified.";
 
   const likelyCauses = buckets.likelyCauses.slice(0, 3);
   const verifyFirst = buckets.verifyFirst.slice(0, 6);
   const remediationOptions = buckets.remediationOptions.slice(0, 6);
   const escalateIf = buckets.escalateIf.slice(0, 4);
   const missingData = buckets.missingData.slice(0, 6);
+  const howToGetMissingData = buckets.howToGetMissingData.slice(0, 6);
 
   return {
     summary,
@@ -1015,6 +1485,7 @@ function parseLlmGuide(raw: string): LlmAnalysisGuide {
     escalateIf,
     confidence,
     missingData,
+    howToGetMissingData,
     cleanedRaw
   };
 }
@@ -1024,12 +1495,29 @@ function formatGuideList(items: string[]): string {
   return items.map((item) => `- ${item}`).join("\n");
 }
 
+function guideLabelsForContext(contextKind: LlmAnalysisContextKind) {
+  if (contextKind === "crash-rca") {
+    return {
+      title: "Hermes Crash RCA",
+      section2: "Most Likely RCA",
+      section6: "Immediate Actions"
+    };
+  }
+  return {
+    title: "Hermes Troubleshooting Guide",
+    section2: "Likely Causes",
+    section6: "Remediation Options"
+  };
+}
+
 function buildGuidePlainText(
   guide: LlmAnalysisGuide,
-  result: LlmAnalysisResult
+  result: LlmAnalysisResult,
+  contextKind: LlmAnalysisContextKind
 ): string {
+  const labels = guideLabelsForContext(contextKind);
   return [
-    "Hermes Troubleshooting Guide",
+    labels.title,
     `Generated: ${new Date().toLocaleString()}`,
     `Provider: ${result.profileName}`,
     `Model: ${result.model}`,
@@ -1037,7 +1525,7 @@ function buildGuidePlainText(
     "1) Summary",
     guide.summary,
     "",
-    "2) Likely Causes",
+    `2) ${labels.section2}`,
     formatGuideList(guide.likelyCauses),
     "",
     "3) Risk Level",
@@ -1049,7 +1537,7 @@ function buildGuidePlainText(
     "5) Verify First",
     formatGuideList(guide.verifyFirst),
     "",
-    "6) Remediation Options",
+    `6) ${labels.section6}`,
     formatGuideList(guide.remediationOptions),
     "",
     "7) Escalate If",
@@ -1059,7 +1547,10 @@ function buildGuidePlainText(
     guide.confidence,
     "",
     "9) Missing Data",
-    formatGuideList(guide.missingData)
+    formatGuideList(guide.missingData),
+    "",
+    "10) How To Get Missing Data",
+    formatGuideList(guide.howToGetMissingData)
   ].join("\n");
 }
 
@@ -1072,6 +1563,15 @@ function escapeHtml(value: string): string {
 }
 
 function buildGuideHtml(guide: LlmAnalysisGuide, result: LlmAnalysisResult): string {
+  return buildGuideHtmlWithContext(guide, result, "event");
+}
+
+function buildGuideHtmlWithContext(
+  guide: LlmAnalysisGuide,
+  result: LlmAnalysisResult,
+  contextKind: LlmAnalysisContextKind
+): string {
+  const labels = guideLabelsForContext(contextKind);
   const list = (items: string[]) =>
     items.length === 0
       ? "<li>Not provided</li>"
@@ -1079,26 +1579,27 @@ function buildGuideHtml(guide: LlmAnalysisGuide, result: LlmAnalysisResult): str
   return [
     "<!doctype html>",
     "<html><head><meta charset=\"utf-8\"/>",
-    "<title>Hermes Troubleshooting Guide</title>",
+    `<title>${escapeHtml(labels.title)}</title>`,
     "<style>",
     "body{font-family:Segoe UI,Arial,sans-serif;line-height:1.45;color:#111827;margin:32px;}",
     "h1{margin:0 0 6px 0;font-size:24px;} h2{margin:18px 0 6px 0;font-size:16px;}",
     ".meta{color:#4b5563;font-size:12px;margin-bottom:14px;} ul{margin:6px 0 0 20px;}",
     ".card{border:1px solid #d1d5db;padding:12px 14px;border-radius:8px;margin-bottom:10px;}",
     "</style></head><body>",
-    "<h1>Hermes Troubleshooting Guide</h1>",
+    `<h1>${escapeHtml(labels.title)}</h1>`,
     `<div class="meta">Generated: ${escapeHtml(new Date().toLocaleString())}<br/>Provider: ${escapeHtml(
       result.profileName
     )}<br/>Model: ${escapeHtml(result.model)}</div>`,
     `<div class="card"><h2>1) Summary</h2><div>${escapeHtml(guide.summary)}</div></div>`,
-    `<div class="card"><h2>2) Likely Causes</h2><ul>${list(guide.likelyCauses)}</ul></div>`,
+    `<div class="card"><h2>2) ${escapeHtml(labels.section2)}</h2><ul>${list(guide.likelyCauses)}</ul></div>`,
     `<div class="card"><h2>3) Risk Level</h2><div>${escapeHtml(guide.riskLevel)}</div></div>`,
     `<div class="card"><h2>4) Security Impact</h2><div>${escapeHtml(guide.securityImpact)}</div></div>`,
     `<div class="card"><h2>5) Verify First</h2><ul>${list(guide.verifyFirst)}</ul></div>`,
-    `<div class="card"><h2>6) Remediation Options</h2><ul>${list(guide.remediationOptions)}</ul></div>`,
+    `<div class="card"><h2>6) ${escapeHtml(labels.section6)}</h2><ul>${list(guide.remediationOptions)}</ul></div>`,
     `<div class="card"><h2>7) Escalate If</h2><ul>${list(guide.escalateIf)}</ul></div>`,
     `<div class="card"><h2>8) Confidence</h2><div>${escapeHtml(guide.confidence)}</div></div>`,
     `<div class="card"><h2>9) Missing Data</h2><ul>${list(guide.missingData)}</ul></div>`,
+    `<div class="card"><h2>10) How To Get Missing Data</h2><ul>${list(guide.howToGetMissingData)}</ul></div>`,
     "</body></html>"
   ].join("");
 }
@@ -1346,6 +1847,15 @@ export default function App() {
   const [copyEventTextStatus, setCopyEventTextStatus] = useState<"idle" | "copied">("idle");
   const [messageViewMode, setMessageViewMode] = useState<MessageViewMode>("raw");
   const [llmWindowOpen, setLlmWindowOpen] = useState(false);
+  const [llmAnalysisContextKind, setLlmAnalysisContextKind] = useState<LlmAnalysisContextKind>("event");
+  const [llmAnalysisTitle, setLlmAnalysisTitle] = useState("LLM Analysis");
+  const [llmOriginalContextLabel, setLlmOriginalContextLabel] = useState("Original Event Context (local only, unredacted)");
+  const [llmRedactedContextLabel, setLlmRedactedContextLabel] = useState("Redacted Event Context Preview");
+  const [llmContextDescription, setLlmContextDescription] = useState(
+    "Review original vs redacted context side-by-side, then edit prompt before send. `Copy Event Text` remains unredacted."
+  );
+  const [llmOriginalContextDraft, setLlmOriginalContextDraft] = useState("");
+  const [llmBasePrompt, setLlmBasePrompt] = useState("");
   const [llmPromptDraft, setLlmPromptDraft] = useState("");
   const [llmPromptWasRedacted, setLlmPromptWasRedacted] = useState(false);
   const [llmPromptPreRedactionDraft, setLlmPromptPreRedactionDraft] = useState("");
@@ -1355,6 +1865,8 @@ export default function App() {
   const [llmGuardrailBlock, setLlmGuardrailBlock] = useState<LlmGuardrailBlock | null>(null);
   const [llmResponseViewMode, setLlmResponseViewMode] = useState<LlmResponseViewMode>("guide");
   const [isRunningLlmAnalysis, setIsRunningLlmAnalysis] = useState(false);
+  const [minidumpAnalysis, setMinidumpAnalysis] = useState<MinidumpAnalysisResult | null>(null);
+  const [isAnalyzingMinidump, setIsAnalyzingMinidump] = useState(false);
   const [exportStatus, setExportStatus] = useState<string>("");
   const tableContainerRef = useRef<HTMLElement | null>(null);
   const [tableScrollTop, setTableScrollTop] = useState(0);
@@ -1461,14 +1973,91 @@ export default function App() {
     () => (selected ? buildEventContextText(selected, hostOsVersion, false) : ""),
     [hostOsVersion, selected]
   );
-  const selectedEventRedactedContext = useMemo(
-    () => redactSensitiveText(selectedEventOriginalContext),
-    [selectedEventOriginalContext]
+  const llmRedactedContextPreview = useMemo(() => redactSensitiveText(llmOriginalContextDraft), [llmOriginalContextDraft]);
+  const selectedCrashHostEvents = useMemo(
+    () => {
+      const activeCrash = crashes.find((crash) => crash.id === selectedCrashId) ?? null;
+      return activeCrash
+        ? allEvents.filter(
+            (event) => event.sourceHost === activeCrash.sourceHost && event.os === activeCrash.os
+          )
+        : [];
+    },
+    [allEvents, crashes, selectedCrashId]
   );
+  const selectedCrashSessionSummary = useMemo<CrashSessionSummary>(() => {
+    const activeCrash = crashes.find((crash) => crash.id === selectedCrashId) ?? null;
+    const crashPreEvents = preCrashEvents;
+    const crashCorrelated = correlatedEvents;
+    if (!activeCrash) {
+      return {
+        coverageLabel: "No crash selected.",
+        severityMetrics: [],
+        providerMetrics: [],
+        logTypeMetrics: [],
+        noisySourceMetrics: [],
+        relevantExcerpts: [],
+        readinessNote: "Select a crash to prepare RCA context."
+      };
+    }
+
+    const severityMap = new Map<string, number>();
+    const providerMap = new Map<string, number>();
+    const logTypeMap = new Map<string, number>();
+    const noisyMap = new Map<string, number>();
+    let min = Number.POSITIVE_INFINITY;
+    let max = Number.NEGATIVE_INFINITY;
+
+    for (const event of selectedCrashHostEvents) {
+      incrementMetric(severityMap, event.severity);
+      incrementMetric(providerMap, event.provider);
+      incrementMetric(logTypeMap, event.logName);
+      if (event.severity !== "information") {
+        incrementMetric(noisyMap, `${event.provider} (${event.severity})`);
+      }
+      const time = Date.parse(event.timestamp);
+      if (Number.isFinite(time)) {
+        if (time < min) min = time;
+        if (time > max) max = time;
+      }
+    }
+
+    const coverageLabel =
+      selectedCrashHostEvents.length > 0 && Number.isFinite(min) && Number.isFinite(max)
+        ? `${formatLocalDate(min)} - ${formatLocalDate(max)} (${selectedCrashHostEvents.length.toLocaleString()} loaded host events)`
+        : "No loaded host events are currently available for this crash.";
+    const relevantExcerpts = [
+      ...crashPreEvents.slice(0, 6).map((event) => formatCrashEvidenceLine(event, false)),
+      ...crashCorrelated
+        .filter((event) => !crashPreEvents.some((entry) => entry.id === event.id))
+        .slice(0, 6)
+        .map((event) => formatCrashEvidenceLine(event, false))
+    ].slice(0, 8);
+    const readinessNote =
+      selectedCrashHostEvents.length === 0
+        ? "RCA will be shallow until host logs are loaded for this machine."
+        : crashPreEvents.length === 0
+          ? "Host session is loaded, but strict pre-crash events are not yet loaded."
+          : "Loaded host session and pre-crash evidence are available for RCA.";
+
+    return {
+      coverageLabel,
+      severityMetrics: rankMetrics(severityMap, 4),
+      providerMetrics: rankMetrics(providerMap, 6),
+      logTypeMetrics: rankMetrics(logTypeMap, 6),
+      noisySourceMetrics: rankMetrics(noisyMap, 6),
+      relevantExcerpts,
+      readinessNote
+    };
+  }, [correlatedEvents, crashes, preCrashEvents, selectedCrashHostEvents, selectedCrashId]);
   const selectedEventParsedFields = useMemo(() => parseStructuredMessage(selected), [selected]);
   const llmParsedGuide = useMemo(
-    () => parseLlmGuide(llmRunResult?.response ?? ""),
-    [llmRunResult?.response]
+    () =>
+      normalizeLlmGuide(parseLlmGuide(llmRunResult?.response ?? ""), llmAnalysisContextKind, {
+        hasHermesPreCrashEvidence: llmAnalysisContextKind === "crash-rca" && preCrashEvents.length > 0,
+        hermesIndicatorItems: buildCrashIndicatorSummaryItems(preCrashEvents, correlatedEvents)
+      }),
+    [correlatedEvents, llmAnalysisContextKind, llmRunResult?.response, preCrashEvents]
   );
   const exportCategoryOptions = useMemo(() => {
     const values = new Set<EventCategory>();
@@ -2120,6 +2709,7 @@ export default function App() {
   async function refreshCrashes(): Promise<void> {
     const records = await getCrashes(targetHostId !== "localhost" ? targetHostId : undefined);
     setCrashes(records);
+    setMinidumpAnalysis(null);
 
     if (records.length === 0) {
       setSelectedCrashId("");
@@ -2155,6 +2745,7 @@ export default function App() {
   async function onCrashSelectionChange(crashId: string): Promise<void> {
     setSelectedCrashId(crashId);
     setPreCrashEvents([]);
+    setMinidumpAnalysis(null);
     if (!crashId) {
       setCorrelatedEvents([]);
       setPreCrashFocusEnabled(false);
@@ -2236,6 +2827,52 @@ export default function App() {
   function clearPreCrashFocus(): void {
     setPreCrashFocusEnabled(false);
     setPreCrashEvents([]);
+  }
+
+  async function analyzeSelectedMinidumpNow(): Promise<void> {
+    if (!selectedCrash) {
+      setLastError("Select a crash before analyzing a minidump.");
+      return;
+    }
+    setLastError("");
+    setIsAnalyzingMinidump(true);
+    try {
+      const result = await analyzeMinidump(selectedCrash.id, 15);
+      setMinidumpAnalysis(result);
+      setExportStatus(
+        result.ok
+          ? "Minidump analysis complete."
+          : `Minidump analysis unavailable: ${result.unavailableReason ?? "No details provided."}`
+      );
+      window.setTimeout(() => setExportStatus(""), 2600);
+    } catch (error) {
+      setMinidumpAnalysis(null);
+      setLastError(error instanceof Error ? error.message : "Failed to analyze minidump.");
+    } finally {
+      setIsAnalyzingMinidump(false);
+    }
+  }
+
+  async function openSelectedDumpFolderNow(): Promise<void> {
+    if (!selectedCrash?.rawPath) return;
+    setLastError("");
+    try {
+      await openPathInShell(selectedCrash.rawPath);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to open dump folder.");
+    }
+  }
+
+  async function copyMinidumpSummaryNow(): Promise<void> {
+    if (!minidumpAnalysis) return;
+    setLastError("");
+    try {
+      await copyText(buildMinidumpClipboardText(minidumpAnalysis));
+      setExportStatus("Crash summary copied.");
+      window.setTimeout(() => setExportStatus(""), 2200);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Failed to copy crash summary.");
+    }
   }
 
   function updateFilter<K extends keyof EventFilters>(key: K, value: EventFilters[K]): void {
@@ -2321,14 +2958,27 @@ export default function App() {
     }
   }
 
-  function openLlmAnalysisWindow(): void {
-    if (!selected) return;
-    const prompt = buildLlmPrompt(selected, hostOsVersion, false);
+  function openLlmWindowWithContext(
+    kind: LlmAnalysisContextKind,
+    title: string,
+    description: string,
+    originalContextLabel: string,
+    redactedContextLabel: string,
+    originalContext: string,
+    prompt: string
+  ): void {
     const preferredProfileId =
       llmLocalProfiles.find((profile) => profile.id === llmSettings.defaultProfileId)?.id ??
       llmLocalProfiles[0]?.id ??
       "";
 
+    setLlmAnalysisContextKind(kind);
+    setLlmAnalysisTitle(title);
+    setLlmContextDescription(description);
+    setLlmOriginalContextLabel(originalContextLabel);
+    setLlmRedactedContextLabel(redactedContextLabel);
+    setLlmOriginalContextDraft(originalContext);
+    setLlmBasePrompt(prompt);
     setLlmPromptDraft(prompt);
     setLlmPromptWasRedacted(false);
     setLlmPromptPreRedactionDraft("");
@@ -2340,9 +2990,64 @@ export default function App() {
     setLlmWindowOpen(true);
   }
 
-  function rebuildPrompt(): void {
+  function openLlmAnalysisWindow(): void {
     if (!selected) return;
-    setLlmPromptDraft(buildLlmPrompt(selected, hostOsVersion, false));
+    const prompt = buildLlmPrompt(selected, hostOsVersion, false);
+    openLlmWindowWithContext(
+      "event",
+      "LLM Analysis",
+      "Review original vs redacted context side-by-side, then edit prompt before send. `Copy Event Text` remains unredacted.",
+      "Original Event Context (local only, unredacted)",
+      "Redacted Event Context Preview",
+      selectedEventOriginalContext,
+      prompt
+    );
+  }
+
+  function openCrashRcaWindow(): void {
+    if (!selectedCrash || !minidumpAnalysis) return;
+    const originalContext = buildCrashRcaOriginalContext(
+      selectedCrash,
+      minidumpAnalysis,
+      selectedCrashSessionSummary,
+      preCrashEvents,
+      correlatedEvents
+    );
+    const prompt = buildCrashRcaPrompt(
+      {
+        crash: selectedCrash,
+        hostOsVersion,
+        minidumpSummary: minidumpAnalysis.summary,
+        minidumpDetails: minidumpAnalysis.crashDetails,
+        likelyCause: minidumpAnalysis.likelyCause,
+        verifyFirst: minidumpAnalysis.verifyFirst,
+        escalateIf: minidumpAnalysis.escalateIf,
+        preCrashEvents,
+        correlatedEvents,
+        sessionCoverage: selectedCrashSessionSummary.coverageLabel,
+        severityMetrics: selectedCrashSessionSummary.severityMetrics,
+        providerMetrics: selectedCrashSessionSummary.providerMetrics,
+        logTypeMetrics: selectedCrashSessionSummary.logTypeMetrics,
+        noisySourceMetrics: selectedCrashSessionSummary.noisySourceMetrics,
+        relevantExcerpts: selectedCrashSessionSummary.relevantExcerpts,
+        contextReadinessNote: selectedCrashSessionSummary.readinessNote
+      },
+      false
+    );
+
+    openLlmWindowWithContext(
+      "crash-rca",
+      "Crash RCA",
+      "Review the assembled crash RCA packet, redact if needed, then run analysis against the selected LLM profile.",
+      "Original Crash RCA Context (local only, unredacted)",
+      "Redacted Crash RCA Context Preview",
+      originalContext,
+      prompt
+    );
+  }
+
+  function rebuildPrompt(): void {
+    setLlmPromptDraft(llmBasePrompt);
     setLlmPromptWasRedacted(false);
     setLlmPromptPreRedactionDraft("");
     setLlmRunError("");
@@ -2355,8 +3060,8 @@ export default function App() {
     if (llmPromptWasRedacted) {
       if (llmPromptPreRedactionDraft.trim()) {
         setLlmPromptDraft(llmPromptPreRedactionDraft);
-      } else if (selected) {
-        setLlmPromptDraft(buildLlmPrompt(selected, hostOsVersion, false));
+      } else if (llmBasePrompt.trim()) {
+        setLlmPromptDraft(llmBasePrompt);
       }
       setLlmPromptWasRedacted(false);
       setLlmPromptPreRedactionDraft("");
@@ -2394,7 +3099,6 @@ export default function App() {
   }
 
   async function runLlmAnalysisNow(options?: { allowUntrustedRawOnce?: boolean }): Promise<void> {
-    if (!selected) return;
     if (!llmRunProfileId) {
       setLlmRunError("No local LLM profile is selected.");
       setLlmGuardrailBlock(null);
@@ -2466,7 +3170,7 @@ export default function App() {
     if (!llmRunResult) return;
     setLastError("");
     try {
-      await copyText(buildGuidePlainText(llmParsedGuide, llmRunResult));
+      await copyText(buildGuidePlainText(llmParsedGuide, llmRunResult, llmAnalysisContextKind));
       setExportStatus("Troubleshooting guide copied.");
       window.setTimeout(() => setExportStatus(""), 2000);
     } catch (error) {
@@ -2479,7 +3183,10 @@ export default function App() {
     setLastError("");
     try {
       const filename = `troubleshooting-guide-${formatExportTimestamp()}.txt`;
-      const location = await saveTextWithDialog(filename, buildGuidePlainText(llmParsedGuide, llmRunResult));
+      const location = await saveTextWithDialog(
+        filename,
+        buildGuidePlainText(llmParsedGuide, llmRunResult, llmAnalysisContextKind)
+      );
       if (!location) {
         setExportStatus("Export canceled.");
         window.setTimeout(() => setExportStatus(""), 2000);
@@ -2497,7 +3204,10 @@ export default function App() {
     setLastError("");
     try {
       const filename = `troubleshooting-guide-${formatExportTimestamp()}.html`;
-      const location = await saveTextWithDialog(filename, buildGuideHtml(llmParsedGuide, llmRunResult));
+      const location = await saveTextWithDialog(
+        filename,
+        buildGuideHtmlWithContext(llmParsedGuide, llmRunResult, llmAnalysisContextKind)
+      );
       if (!location) {
         setExportStatus("Export canceled.");
         window.setTimeout(() => setExportStatus(""), 2000);
@@ -4422,6 +5132,121 @@ export default function App() {
                 Select a crash and click Investigate Pre-Crash to load matching events below.
               </div>
             )}
+            {selectedCrash && isDumpBackedCrash(selectedCrash) && (
+              <div className="space-y-3 rounded-xl border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold">Minidump Analysis</div>
+                    <div className="text-xs text-muted">
+                      Support-triage view for the selected dump-backed crash. This is metadata-and-evidence analysis, not full debugger symbolication.
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      onClick={() => void analyzeSelectedMinidumpNow()}
+                      disabled={isAnalyzingMinidump}
+                    >
+                      {isAnalyzingMinidump ? "Analyzing..." : "Analyze Minidump"}
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => void openSelectedDumpFolderNow()}
+                      disabled={!selectedCrash.rawPath}
+                    >
+                      Open Dump Folder
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => void copyMinidumpSummaryNow()}
+                      disabled={!minidumpAnalysis}
+                    >
+                      Copy Crash Summary
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={openCrashRcaWindow}
+                      disabled={!minidumpAnalysis?.ok}
+                    >
+                      Run RCA
+                    </Button>
+                  </div>
+                </div>
+                {!minidumpAnalysis && (
+                  <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                    No dump analysis has been run yet. Analyze the selected minidump, then use Run RCA to open the LLM workflow with crash/session context.
+                  </div>
+                )}
+                {minidumpAnalysis && !minidumpAnalysis.ok && (
+                  <div className="rounded-lg border border-warning/40 bg-[var(--sev-warning)] px-3 py-2 text-xs text-text">
+                    <div className="font-semibold">Minidump analysis unavailable</div>
+                    <div className="mt-1">{minidumpAnalysis.unavailableReason ?? "No reason was provided."}</div>
+                  </div>
+                )}
+                {minidumpAnalysis && (
+                  <div className="grid gap-3 lg:grid-cols-[1.15fr_1fr]">
+                    <div className="space-y-3">
+                      <section className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-muted">Summary</div>
+                        <p className="mt-1 text-sm text-text">{minidumpAnalysis.summary}</p>
+                      </section>
+                      <section className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-muted">Crash Details</div>
+                        <ul className="mt-2 ml-5 list-disc space-y-1 text-sm text-text">
+                          {minidumpAnalysis.crashDetails.map((item, index) => (
+                            <li key={`minidump-detail-${index}`}>{item}</li>
+                          ))}
+                        </ul>
+                      </section>
+                    </div>
+                    <div className="space-y-3">
+                      <section className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-muted">Likely Cause</div>
+                        <p className="mt-1 text-sm text-text">{minidumpAnalysis.likelyCause}</p>
+                        <div className="mt-2 text-xs text-muted">
+                          Category: {minidumpAnalysis.likelyCauseCategory} | Confidence: {minidumpAnalysis.confidence}%
+                        </div>
+                      </section>
+                      <section className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-muted">What To Verify First</div>
+                        <ul className="mt-2 ml-5 list-disc space-y-1 text-sm text-text">
+                          {minidumpAnalysis.verifyFirst.map((item, index) => (
+                            <li key={`minidump-verify-${index}`}>{item}</li>
+                          ))}
+                        </ul>
+                      </section>
+                      <section className="rounded-lg border border-panel-border bg-panel px-3 py-2">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-muted">Escalate If</div>
+                        <ul className="mt-2 ml-5 list-disc space-y-1 text-sm text-text">
+                          {minidumpAnalysis.escalateIf.map((item, index) => (
+                            <li key={`minidump-escalate-${index}`}>{item}</li>
+                          ))}
+                        </ul>
+                      </section>
+                      <section className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                        <div className="font-semibold text-text">RCA Context Readiness</div>
+                        <div className="mt-1">{selectedCrashSessionSummary.readinessNote}</div>
+                        <div className="mt-1">Loaded session coverage: {selectedCrashSessionSummary.coverageLabel}</div>
+                        <div className="mt-1">
+                          Pre-crash events: {preCrashEvents.length.toLocaleString()} | Correlated events: {correlatedEvents.length.toLocaleString()}
+                        </div>
+                      </section>
+                      {minidumpAnalysis.warnings.length > 0 && (
+                        <section className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                          <div className="font-semibold text-text">Warnings</div>
+                          <ul className="mt-2 ml-5 list-disc space-y-1">
+                            {minidumpAnalysis.warnings.map((item, index) => (
+                              <li key={`minidump-warning-${index}`}>{item}</li>
+                            ))}
+                          </ul>
+                        </section>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
             {selectedCrash && correlatedEvents.length > 0 && (
               <div className="flex flex-wrap gap-2 border-t border-panel-border pt-3">
                 <div className="w-full text-sm font-semibold">Top Correlated Events (+/-15m)</div>
@@ -4946,15 +5771,13 @@ export default function App() {
           </footer>
         )}
 
-        {llmWindowOpen && selected && (
+        {llmWindowOpen && (
           <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/35 px-4 py-6">
             <div className="flex max-h-[calc(100vh-3rem)] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-panel-border bg-[var(--panel-solid)] shadow-xl">
               <div className="flex items-center justify-between border-b border-panel-border px-4 py-3">
                 <div>
-                  <div className="text-sm font-semibold">LLM Analysis</div>
-                  <div className="text-xs text-muted">
-                    Review original vs redacted context side-by-side, then edit prompt before send. `Copy Event Text` remains unredacted.
-                  </div>
+                  <div className="text-sm font-semibold">{llmAnalysisTitle}</div>
+                  <div className="text-xs text-muted">{llmContextDescription}</div>
                 </div>
                 <Button size="sm" onClick={() => setLlmWindowOpen(false)}>
                   Close
@@ -4963,18 +5786,18 @@ export default function App() {
               <div className="grid gap-3 overflow-y-auto p-4">
                 <div className="grid gap-2 md:grid-cols-2">
                   <label className="text-xs text-muted">
-                    Original Event Context (local only, unredacted)
+                    {llmOriginalContextLabel}
                     <textarea
                       className={cn(inputClass, "min-h-40 resize-y font-mono text-xs")}
-                      value={selectedEventOriginalContext}
+                      value={llmOriginalContextDraft}
                       readOnly
                     />
                   </label>
                   <label className="text-xs text-muted">
-                    Redacted Event Context Preview
+                    {llmRedactedContextLabel}
                     <textarea
                       className={cn(inputClass, "min-h-40 resize-y font-mono text-xs")}
-                      value={selectedEventRedactedContext}
+                      value={llmRedactedContextPreview}
                       readOnly
                     />
                   </label>
@@ -5158,7 +5981,9 @@ export default function App() {
                           <p className="mt-1">{llmParsedGuide.summary}</p>
                         </section>
                         <section>
-                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">2) Likely Causes</div>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">
+                            2) {guideLabelsForContext(llmAnalysisContextKind).section2}
+                          </div>
                           {llmParsedGuide.likelyCauses.length > 0 ? (
                             <ul className="mt-1 ml-5 list-disc space-y-1">
                               {llmParsedGuide.likelyCauses.map((item, index) => (
@@ -5190,7 +6015,9 @@ export default function App() {
                           )}
                         </section>
                         <section>
-                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">6) Remediation Options</div>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">
+                            6) {guideLabelsForContext(llmAnalysisContextKind).section6}
+                          </div>
                           {llmParsedGuide.remediationOptions.length > 0 ? (
                             <ul className="mt-1 ml-5 list-disc space-y-1">
                               {llmParsedGuide.remediationOptions.map((item, index) => (
@@ -5223,6 +6050,18 @@ export default function App() {
                             <ul className="mt-1 ml-5 list-disc space-y-1">
                               {llmParsedGuide.missingData.map((item, index) => (
                                 <li key={`guide-missing-${index}`}>{item}</li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="mt-1 text-muted">Not provided.</p>
+                          )}
+                        </section>
+                        <section>
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted">10) How To Get Missing Data</div>
+                          {llmParsedGuide.howToGetMissingData.length > 0 ? (
+                            <ul className="mt-1 ml-5 list-disc space-y-1">
+                              {llmParsedGuide.howToGetMissingData.map((item, index) => (
+                                <li key={`guide-retrieve-${index}`}>{item}</li>
                               ))}
                             </ul>
                           ) : (

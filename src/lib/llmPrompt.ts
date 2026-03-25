@@ -1,4 +1,4 @@
-import type { NormalizedEvent } from "../types/events";
+import type { CrashRecord, NormalizedEvent } from "../types/events";
 
 const REDACTION = "<sensitive info redacted>";
 
@@ -150,4 +150,242 @@ export function buildGoogleQuery(event: NormalizedEvent): string {
   ];
 
   return encodeURIComponent(tokens.join(" ").trim());
+}
+
+export interface CrashRcaSessionMetric {
+  label: string;
+  count: number;
+}
+
+export interface CrashRcaPromptInput {
+  crash: CrashRecord;
+  hostOsVersion?: string;
+  minidumpSummary: string;
+  minidumpDetails: string[];
+  likelyCause: string;
+  verifyFirst: string[];
+  escalateIf: string[];
+  preCrashEvents: NormalizedEvent[];
+  correlatedEvents: NormalizedEvent[];
+  sessionCoverage: string;
+  severityMetrics: CrashRcaSessionMetric[];
+  providerMetrics: CrashRcaSessionMetric[];
+  logTypeMetrics: CrashRcaSessionMetric[];
+  noisySourceMetrics: CrashRcaSessionMetric[];
+  relevantExcerpts: string[];
+  contextReadinessNote?: string;
+}
+
+function severityWeight(severity: NormalizedEvent["severity"]): number {
+  switch (severity) {
+    case "critical":
+      return 4;
+    case "error":
+      return 3;
+    case "warning":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function truncateText(value: string, max = 140): string {
+  return value.length > max ? `${value.slice(0, max - 1)}...` : value;
+}
+
+function formatCrashIndicatorLine(event: NormalizedEvent, redact = true): string {
+  const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
+  const eventIdPart = typeof event.eventId === "number" ? `Event ID ${event.eventId}` : "Event ID N/A";
+  return [
+    protect(new Date(event.timestamp).toLocaleString()),
+    protect(event.provider),
+    eventIdPart,
+    protect(event.severity),
+    protect(truncateText(event.message))
+  ].join(" | ");
+}
+
+function isCrashConfirmationContextEvent(event: NormalizedEvent): boolean {
+  const provider = event.provider.toLowerCase();
+  const message = event.message.toLowerCase();
+  return (
+    (provider.includes("kernel-power") && event.eventId === 41) ||
+    (provider.includes("volmgr") && (event.eventId === 161 || event.eventId === 162)) ||
+    event.eventId === 1001 ||
+    provider.includes("bugcheck") ||
+    message.includes("rebooted without cleanly shutting down") ||
+    message.includes("system has rebooted without cleanly shutting down") ||
+    message.includes("dump file creation succeeded")
+  );
+}
+
+function buildCrashIndicatorLines(
+  primaryEvents: NormalizedEvent[],
+  fallbackEvents: NormalizedEvent[],
+  redact = true
+): string[] {
+  const source = primaryEvents.length > 0 ? primaryEvents : fallbackEvents;
+  return [...source]
+    .filter((event) => !isCrashConfirmationContextEvent(event))
+    .sort((a, b) => {
+      const severityDelta = severityWeight(b.severity) - severityWeight(a.severity);
+      if (severityDelta !== 0) return severityDelta;
+      return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+    })
+    .slice(0, 4)
+    .map((event) => `- ${formatCrashIndicatorLine(event, redact)}`);
+}
+
+function buildTopCrashEventIdLines(events: NormalizedEvent[], redact = true): string[] {
+  const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
+  const counts = new Map<number, number>();
+  for (const event of events) {
+    if (typeof event.eventId === "number") {
+      counts.set(event.eventId, (counts.get(event.eventId) ?? 0) + 1);
+    }
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+    .slice(0, 6)
+    .map(([eventId, count]) => `- ${protect(String(eventId))}: ${count}`);
+}
+
+export function buildCrashRcaPrompt(input: CrashRcaPromptInput, redact = true): string {
+  const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
+  const osLabelValue =
+    input.crash.os === "windows" ? "Windows" : input.crash.os === "macos" ? "macOS" : "Linux";
+  const hermesIndicatorLines = buildCrashIndicatorLines(input.preCrashEvents, input.correlatedEvents, redact);
+  const topEventIdLines = buildTopCrashEventIdLines(input.correlatedEvents, redact);
+  const summaryLines = [
+    `Crash summary: ${protect(input.crash.summary)}`,
+    `Crash type: ${protect(input.crash.crashType)}`,
+    `Crash source: ${protect(input.crash.source)}`,
+    `Crash timestamp: ${protect(input.crash.timestamp)}`,
+    `Source host: ${protect(input.crash.sourceHost)}`,
+    `Crash code: ${protect(input.crash.code ?? "Unavailable")}`,
+    `Suspected component: ${protect(input.crash.suspectedComponent ?? "Unknown")}`
+  ];
+
+  const metricLines = (label: string, metrics: CrashRcaSessionMetric[]) => [
+    `${label}:`,
+    ...(metrics.length > 0
+      ? metrics.map((metric) => `- ${protect(metric.label)}: ${metric.count}`)
+      : ["- None loaded"])
+  ];
+
+  const excerptLines =
+    input.relevantExcerpts.length > 0
+      ? input.relevantExcerpts.map((entry) => `- ${protect(entry)}`)
+      : ["- No raw event excerpts were selected."];
+
+  const verifyLines =
+    input.verifyFirst.length > 0
+      ? input.verifyFirst.map((entry) => `- ${protect(entry)}`)
+      : ["- No verification guidance prepared."];
+
+  const escalateLines =
+    input.escalateIf.length > 0
+      ? input.escalateIf.map((entry) => `- ${protect(entry)}`)
+      : ["- Escalate if crash evidence remains inconclusive."];
+
+  return [
+    `Act as a senior ${osLabelValue} crash triage and root-cause analysis specialist.`,
+    `You are assisting support with a selected ${osLabelValue} crash using a parsed dump summary and the currently loaded host session.`,
+    "Return FINAL answer only.",
+    "Do not include chain-of-thought, self-talk, or internal reasoning.",
+    "Keep the response concise, concrete, and support-oriented.",
+    "",
+    "Rules:",
+    "1) Treat all host-identifying values as private.",
+    `2) Preserve "${REDACTION}" placeholders exactly if present.`,
+    "3) Prefer evidence-backed reasoning over speculation.",
+    "4) Distinguish clearly between observed evidence, inference, and missing data.",
+    "5) Suggest safe read-only checks before changes.",
+    "6) If evidence is weak, say so directly.",
+    "7) Do not recommend uninstalling, deleting, or removing kernel drivers, system files, or core Windows components.",
+    "8) If a high-risk action might eventually be needed, label it high-risk and escalation-only, not as a first-line support step.",
+    "9) Every section in the template below must be filled. Do not leave sections blank or say only 'Not provided'.",
+    "10) If Hermes already has pre-crash or correlated evidence loaded, do not tell the operator to re-check the same logs in Event Viewer.",
+    "11) When Hermes already has pre-crash indicators loaded, the first Verify First bullet must begin exactly with 'Hermes found these pre-crash indicators:' and summarize the strongest loaded indicators.",
+    "12) Only tell the operator to check Event Viewer/System logs when Hermes does not currently have the required crash evidence loaded.",
+    "13) Treat Kernel-Power Event ID 41 and similar reboot/crash-confirmation events as crash context, not as pre-crash cause evidence.",
+    "14) Treat volmgr dump-generation events and dump-file creation success as crash context, not as pre-crash cause evidence.",
+    "15) Do not list dump-file availability as a pre-crash indicator.",
+    "16) If bugcheck code or stack trace is missing, describe the RCA as a working hypothesis and keep confidence moderate rather than high.",
+    "17) Prefer evidence preservation and targeted verification before recommending a reboot or broader disruptive actions.",
+    "18) For missing bugcheck code, prefer Windows WER/BugCheck events (such as System Event ID 1001) or direct dump analysis. Do not use Kernel-Power Event ID 41 as the primary bugcheck source.",
+    "19) Output exactly one risk level: Low, Medium, High, or Critical. Never return combined labels like 'Medium - High'.",
+    "20) Avoid broad environment changes like 'clean boot with Hyper-V disabled' unless clearly labeled as controlled isolation testing after evidence preservation.",
+    "21) In Verify First, prefer version, signer, and recent update/install history checks for the suspected driver or module over redundant dump-readability checks if Hermes already analyzed the dump.",
+    "22) If nearby WUDFRd/PnP warnings are present, describe them as adjacent driver-load instability that may be related, not as direct proof that WUDFRd caused the crash.",
+    "23) In How To Get Missing Data, prefer WinDbg as the primary tool for authoritative dump analysis. BlueScreenView may be mentioned only as a lightweight quick-look tool.",
+    "24) In Escalate If, include broader criteria such as WinDbg or WER/Event ID 1001 pointing outside the current hypothesis, repeated crashes after version/update verification, or symbol-backed analysis implicating a different driver path.",
+    "",
+    "Crash Packet:",
+    ...summaryLines,
+    `Host OS version: ${protect(input.hostOsVersion ?? "Unknown")}`,
+    `Loaded session coverage: ${protect(input.sessionCoverage)}`,
+    `Pre-crash loaded events: ${input.preCrashEvents.length}`,
+    `Correlated events (+/-15m): ${input.correlatedEvents.length}`,
+    input.contextReadinessNote ? `Context note: ${protect(input.contextReadinessNote)}` : "",
+    "",
+    "Minidump Triage Summary:",
+    `- ${protect(input.minidumpSummary)}`,
+    ...input.minidumpDetails.map((entry) => `- ${protect(entry)}`),
+    `Likely cause note: ${protect(input.likelyCause)}`,
+    "",
+    ...metricLines("Severity distribution", input.severityMetrics),
+    ...metricLines("Top providers", input.providerMetrics),
+    ...metricLines("Top log types", input.logTypeMetrics),
+    ...metricLines("Noisy sources", input.noisySourceMetrics),
+    "Top correlated Event IDs:",
+    ...(topEventIdLines.length > 0 ? topEventIdLines : ["- None loaded"]),
+    "",
+    "Hermes pre-crash indicators:",
+    ...(hermesIndicatorLines.length > 0
+      ? hermesIndicatorLines
+      : ["- No pre-crash indicators are currently loaded in Hermes. If bugcheck or power-loss evidence is needed, tell the operator to load a wider Hermes System log window first."]),
+    "",
+    "Relevant raw excerpts:",
+    ...excerptLines,
+    "",
+    "Prepared verification items:",
+    ...verifyLines,
+    "",
+    "Prepared escalation items:",
+    ...escalateLines,
+    "",
+    "Return output in this exact Markdown template:",
+    "## Summary",
+    "- <1-2 line root-cause summary with the likely cause clearly stated>",
+    "## Likely Causes",
+    "- Most likely RCA: <single best-supported cause hypothesis>",
+    "- Supporting evidence: <top evidence from dump/logs>",
+    "- Remaining uncertainty: <what is still not proven>",
+    "## Risk Level",
+    "- <Low|Medium|High|Critical> - <one-line operational rationale>",
+    "## Security Impact",
+    "- <state direct security impact, or say 'No direct security impact confirmed from available crash evidence.'>",
+    "## Verify First",
+    "- <read-only check 1>",
+    "- <read-only check 2>",
+    "## Remediation Options",
+    "- <safest operator action>",
+    "- <next recommended action>",
+    "- <optional high-risk action only if clearly labeled escalation-only>",
+    "## Escalate If",
+    "- <criteria 1>",
+    "- <criteria 2>",
+    "## Confidence",
+    "- <0-100%>",
+    "- Why: <1-2 short sentences explaining why the confidence is at that level based on observed evidence vs. missing data>",
+    "## Missing Data",
+    "- <missing item 1>",
+    "- <missing item 2>",
+    "## How To Get Missing Data",
+    "- <operator-friendly step to retrieve bugcheck code if missing>",
+    "- <operator-friendly step to retrieve stack trace if missing, including debugger/symbol note when applicable>"
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
 }
