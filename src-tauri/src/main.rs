@@ -1274,7 +1274,7 @@ fn get_local_events_window(
 }
 
 #[tauri::command]
-async fn import_host_crashes(target_id: Option<String>, limit: Option<u32>) -> Result<usize, String> {
+async fn import_host_crashes(_target_id: Option<String>, limit: Option<u32>) -> Result<usize, String> {
     let max = limit.unwrap_or(200).clamp(1, 2000) as usize;
 
     tauri::async_runtime::spawn_blocking(move || {

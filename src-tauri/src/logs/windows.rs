@@ -621,8 +621,8 @@ fn last_error() -> u32 {
 
 pub fn collect_remote_windows_events(
     profile: &RemoteConnectionProfile,
-    start: Option<DateTime<Utc>>,
-    end: Option<DateTime<Utc>>,
+    _start: Option<DateTime<Utc>>,
+    _end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
     channels: Option<&[String]>,
 ) -> CollectionResult {
@@ -729,8 +729,6 @@ let mut cred_setup = String::new();
                     _ => "Information",
                 };
                 
-                let category = map_category(log_name);
-
                 let mut ev = NormalizedEvent::new(
                     SupportedOs::Windows,
                     log_name,
@@ -751,7 +749,7 @@ let mut cred_setup = String::new();
                 result.events.push(ev);
             }
         }
-        Ok(single) => {
+        Ok(_) => {
             // Unlikely, but if only one event matches, it might return a single object, not array.
             result.warnings.push("Only one event matched. Need to handle singleton parsing.".to_string());
         }
