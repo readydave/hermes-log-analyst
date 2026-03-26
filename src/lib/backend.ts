@@ -99,6 +99,7 @@ export interface LlmConnectionTestResult {
   statusCode: number | null;
   message: string;
   detectedModels: string[];
+  preferredModel: string | null;
 }
 
 export interface LlmAnalysisResult {
@@ -248,7 +249,8 @@ export async function testLlmProfileConnection(
       baseUrl: profile.baseUrl,
       statusCode: null,
       message: "Connection test requires desktop runtime.",
-      detectedModels: []
+      detectedModels: [],
+      preferredModel: null
     };
   }
 

@@ -267,6 +267,7 @@ struct LlmConnectionTestResult {
     status_code: Option<u16>,
     message: String,
     detected_models: Vec<String>,
+    preferred_model: Option<String>,
 }
 
 fn normalize_base_url(value: &str) -> String {
@@ -318,6 +319,126 @@ fn parse_model_ids(value: &Value) -> Vec<String> {
     models
 }
 
+fn reorder_models_with_preferred(
+    models: Vec<String>,
+    preferred_model: Option<String>,
+) -> (Vec<String>, Option<String>) {
+    let preferred = preferred_model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(preferred) = preferred else {
+        return (models, None);
+    };
+
+    let mut reordered = models
+        .into_iter()
+        .filter(|value| value != &preferred)
+        .collect::<Vec<_>>();
+    reordered.insert(0, preferred.clone());
+    (reordered, Some(preferred))
+}
+
+fn fetch_ollama_loaded_models(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+) -> Result<Vec<String>, String> {
+    let endpoint = join_url(base_url, "/api/ps");
+    let response = client
+        .get(endpoint)
+        .send()
+        .map_err(|error| format!("Failed requesting Ollama loaded model list: {error}"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Ollama loaded model request failed (HTTP {}).",
+            status.as_u16()
+        ));
+    }
+    let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
+    Ok(parse_model_ids(&parsed))
+}
+
+fn lmstudio_models_endpoint(base_url: &str) -> String {
+    let base = normalize_base_url(base_url);
+    let root = base
+        .strip_suffix("/v1")
+        .or_else(|| base.strip_suffix("/v1/"))
+        .unwrap_or(base.as_str())
+        .trim_end_matches('/');
+    join_url(root, "/api/v0/models")
+}
+
+fn fetch_lmstudio_preferred_model(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    parsed_models: Option<&Value>,
+) -> Option<String> {
+    parse_preferred_model_from_entries(parsed_models.unwrap_or(&Value::Null)).or_else(|| {
+        let endpoint = lmstudio_models_endpoint(base_url);
+        client
+            .get(endpoint)
+            .send()
+            .ok()
+            .filter(|response| response.status().is_success())
+            .and_then(|response| response.text().ok())
+            .and_then(|body| serde_json::from_str::<Value>(body.as_str()).ok())
+            .and_then(|parsed| parse_preferred_model_from_entries(&parsed))
+    })
+}
+
+fn parse_preferred_model_from_entries(value: &Value) -> Option<String> {
+    let arrays = [
+        value.get("models").and_then(Value::as_array),
+        value.get("data").and_then(Value::as_array),
+    ];
+
+    for entries in arrays.into_iter().flatten() {
+        for entry in entries {
+            let loaded = entry
+                .get("loaded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || entry
+                    .get("isLoaded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || entry
+                    .get("active")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || entry
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(|value| matches!(value.to_ascii_lowercase().as_str(), "loaded" | "active" | "ready"))
+                    .unwrap_or(false)
+                || entry
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(|value| matches!(value.to_ascii_lowercase().as_str(), "loaded" | "active" | "ready"))
+                    .unwrap_or(false);
+
+            if !loaded {
+                continue;
+            }
+
+            if let Some(name) = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("model").and_then(Value::as_str))
+                .or_else(|| entry.get("id").and_then(Value::as_str))
+            {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn summarize_http_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -340,6 +461,7 @@ fn default_test_result(profile: &LlmConnectionProfile) -> LlmConnectionTestResul
         status_code: None,
         message: "Connection not tested.".to_string(),
         detected_models: Vec::new(),
+        preferred_model: None,
     }
 }
 
@@ -360,10 +482,15 @@ fn test_ollama_connection(
                     status_code: Some(status),
                     message: format!("Ollama endpoint responded with HTTP {status}."),
                     detected_models: Vec::new(),
+                    preferred_model: None,
                 };
             }
             let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
             let models = parse_model_ids(&parsed);
+            let preferred_model = fetch_ollama_loaded_models(client, base_url)
+                .ok()
+                .and_then(|loaded| loaded.into_iter().next());
+            let (models, preferred_model) = reorder_models_with_preferred(models, preferred_model);
             LlmConnectionTestResult {
                 ok: true,
                 provider: "ollama".to_string(),
@@ -375,6 +502,7 @@ fn test_ollama_connection(
                     format!("Connected to Ollama. Found {} model(s).", models.len())
                 },
                 detected_models: models,
+                preferred_model,
             }
         }
         Err(error) => LlmConnectionTestResult {
@@ -384,6 +512,7 @@ fn test_ollama_connection(
             status_code: None,
             message: format!("Failed to connect to Ollama endpoint: {error}"),
             detected_models: Vec::new(),
+            preferred_model: None,
         },
     }
 }
@@ -420,10 +549,17 @@ fn test_openai_compatible_connection(
                         provider = provider
                     ),
                     detected_models: Vec::new(),
+                    preferred_model: None,
                 };
             }
             let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
             let models = parse_model_ids(&parsed);
+            let preferred_model = if provider == "lmstudio" {
+                fetch_lmstudio_preferred_model(client, base_url, Some(&parsed))
+            } else {
+                None
+            };
+            let (models, preferred_model) = reorder_models_with_preferred(models, preferred_model);
             LlmConnectionTestResult {
                 ok: true,
                 provider: provider.to_string(),
@@ -439,6 +575,7 @@ fn test_openai_compatible_connection(
                     )
                 },
                 detected_models: models,
+                preferred_model,
             }
         }
         Err(error) => LlmConnectionTestResult {
@@ -448,6 +585,7 @@ fn test_openai_compatible_connection(
             status_code: None,
             message: format!("Failed to connect to {provider} endpoint: {error}", provider = provider),
             detected_models: Vec::new(),
+            preferred_model: None,
         },
     }
 }
@@ -465,6 +603,7 @@ fn test_gemini_connection(
             status_code: None,
             message: "Gemini API key is not configured in keychain.".to_string(),
             detected_models: Vec::new(),
+            preferred_model: None,
         };
     };
 
@@ -481,6 +620,7 @@ fn test_gemini_connection(
                     status_code: Some(status),
                     message: format!("Gemini endpoint responded with HTTP {status}."),
                     detected_models: Vec::new(),
+                    preferred_model: None,
                 };
             }
             let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
@@ -496,6 +636,7 @@ fn test_gemini_connection(
                     format!("Connected to Gemini. Found {} model(s).", models.len())
                 },
                 detected_models: models,
+                preferred_model: None,
             }
         }
         Err(error) => LlmConnectionTestResult {
@@ -505,6 +646,7 @@ fn test_gemini_connection(
             status_code: None,
             message: format!("Failed to connect to Gemini endpoint: {error}"),
             detected_models: Vec::new(),
+            preferred_model: None,
         },
     }
 }
@@ -522,6 +664,7 @@ fn test_claude_connection(
             status_code: None,
             message: "Claude API key is not configured in keychain.".to_string(),
             detected_models: Vec::new(),
+            preferred_model: None,
         };
     };
 
@@ -543,6 +686,7 @@ fn test_claude_connection(
                     status_code: Some(status),
                     message: format!("Claude endpoint responded with HTTP {status}."),
                     detected_models: Vec::new(),
+                    preferred_model: None,
                 };
             }
             let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
@@ -558,6 +702,7 @@ fn test_claude_connection(
                     format!("Connected to Claude. Found {} model(s).", models.len())
                 },
                 detected_models: models,
+                preferred_model: None,
             }
         }
         Err(error) => LlmConnectionTestResult {
@@ -567,6 +712,7 @@ fn test_claude_connection(
             status_code: None,
             message: format!("Failed to connect to Claude endpoint: {error}"),
             detected_models: Vec::new(),
+            preferred_model: None,
         },
     }
 }
@@ -629,6 +775,7 @@ fn test_llm_profile_connection_sync(
             status_code: None,
             message: "Unsupported provider type.".to_string(),
             detected_models: Vec::new(),
+            preferred_model: None,
         },
     }
 }
@@ -715,12 +862,27 @@ fn resolve_model_for_profile(
     client: &reqwest::blocking::Client,
     api_key: Option<&str>,
 ) -> Result<String, String> {
+    let provider = profile.provider.trim().to_ascii_lowercase();
+    let scope = profile.scope.trim().to_ascii_lowercase();
     let configured = profile.model.trim();
+
+    if matches!(provider.as_str(), "ollama" | "lmstudio") && matches!(scope.as_str(), "local" | "lan") {
+        let preferred_active = match provider.as_str() {
+            "ollama" => fetch_ollama_loaded_models(client, profile.base_url.as_str())
+                .ok()
+                .and_then(|loaded| loaded.into_iter().next()),
+            "lmstudio" => fetch_lmstudio_preferred_model(client, profile.base_url.as_str(), None),
+            _ => None,
+        };
+        if let Some(active) = preferred_active {
+            return Ok(active);
+        }
+    }
+
     if !configured.is_empty() {
         return Ok(configured.to_string());
     }
 
-    let provider = profile.provider.trim().to_ascii_lowercase();
     let discovered = match provider.as_str() {
         "ollama" => fetch_ollama_models(client, profile.base_url.as_str())?,
         "lmstudio" | "openai_compatible" => fetch_openai_compatible_models(

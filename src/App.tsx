@@ -3150,11 +3150,15 @@ export default function App() {
     setIsRunningLlmAnalysis(true);
     try {
       const result = await analyzeWithLocalLlm(outboundPrompt, llmRunProfileId);
-      setLlmRunResult(result);
+      const effectiveResult =
+        options?.allowUntrustedRawOnce && result.warning?.includes("not listed in trusted LAN hosts")
+          ? { ...result, warning: null }
+          : result;
+      setLlmRunResult(effectiveResult);
       setExportStatus(
-        result.fallbackUsed
-          ? `LLM analysis complete via fallback profile (${result.profileName}).`
-          : `LLM analysis complete (${result.profileName}).`
+        effectiveResult.fallbackUsed
+          ? `LLM analysis complete via fallback profile (${effectiveResult.profileName}).`
+          : `LLM analysis complete (${effectiveResult.profileName}).`
       );
       window.setTimeout(() => setExportStatus(""), 3500);
     } catch (error) {
@@ -3525,14 +3529,21 @@ export default function App() {
       setLlmTestResult(result);
       if (result.ok && result.detectedModels.length > 0) {
         const currentModel = profile.model.trim();
-        const autoModel = result.detectedModels[0];
+        const preferredModel = result.preferredModel?.trim() || "";
+        const autoModel = preferredModel || result.detectedModels[0];
         if (!currentModel) {
           updateLlmProfile(profile.id, { model: autoModel });
-          setExportStatus(`${result.message} Auto-selected model: ${autoModel}.`);
+          setExportStatus(
+            preferredModel
+              ? `${result.message} Auto-selected active model: ${autoModel}.`
+              : `${result.message} Auto-selected model: ${autoModel}.`
+          );
         } else if (!result.detectedModels.includes(currentModel)) {
           updateLlmProfile(profile.id, { model: autoModel });
           setExportStatus(
-            `${result.message} Model '${currentModel}' was not found on this endpoint. Auto-selected: ${autoModel}.`
+            preferredModel
+              ? `${result.message} Model '${currentModel}' was not found on this endpoint. Auto-selected active model: ${autoModel}.`
+              : `${result.message} Model '${currentModel}' was not found on this endpoint. Auto-selected: ${autoModel}.`
           );
         } else {
           setExportStatus(result.message);
