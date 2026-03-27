@@ -239,6 +239,54 @@ Acceptance criteria:
 - `npm install`
 - `npm run tauri dev`
 
+## Linux Validation Prompt (Garuda)
+
+Use this exact prompt in the next Codex session on the Garuda machine after pulling the latest `main`:
+
+```text
+Read HANDOFF.md and complete the "Platform Validation Template (Live Data Only)" for this Garuda Linux machine.
+Use real host log collection only; do not use imported or dummy data.
+
+Validate all of the following:
+1. Preflight
+- `npm install`
+- `npm run build`
+- `npm run tauri info`
+- note any missing toolchain/runtime dependencies
+
+2. Live log collection
+- launch with `npm run tauri dev`
+- use `Refresh Logs` and `Load Events`
+- confirm non-zero live events from the local Linux host
+- confirm filtering and sorting work on live data
+- note any `journalctl` / permissions / elevation warnings
+
+3. Core workflows
+- refresh collection
+- explicit date-range load
+- crash import / crash correlation behavior
+- selected-event Google search and prompt-copy actions
+- CSV and JSON export
+
+4. LLM/provider readiness
+- test local Ollama if present
+- test local LM Studio if present
+- test LAN discovery if allowed on this network
+- verify that detected local/LAN providers auto-select the currently loaded/available model when possible
+- record exact provider/model behavior, warnings, and mismatches
+
+5. Packaging/readiness
+- run `npm run tauri build` if toolchain allows
+- record Linux artifacts produced
+- note AppImage / package / launcher issues
+
+Append results directly under the validation template in HANDOFF.md with concrete outcomes, blocker details, and exact commands or errors where useful.
+If something fails, state whether it is:
+- Linux-specific
+- cross-platform
+- environment/toolchain-specific
+```
+
 ## Platform Validation Template (Live Data Only)
 
 Use this template when validating on each machine (Windows/macOS/Garuda). Do not use imported or dummy data for this pass.
