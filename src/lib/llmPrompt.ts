@@ -254,6 +254,33 @@ export function buildCrashRcaPrompt(input: CrashRcaPromptInput, redact = true): 
   const protect = (value: string) => (redact ? redactSensitiveText(value) : value);
   const osLabelValue =
     input.crash.os === "windows" ? "Windows" : input.crash.os === "macos" ? "macOS" : "Linux";
+  const dumpLabel =
+    input.crash.os === "linux"
+      ? "Core Dump"
+      : input.crash.source.toLowerCase() === "kerneldump"
+        ? "Kernel Dump"
+        : "Minidump";
+  const primaryCrashCodeLabel = input.crash.os === "windows" ? "bugcheck code" : input.crash.os === "linux" ? "signal" : "crash code";
+  const platformLogViewer = input.crash.os === "windows" ? "Event Viewer" : "the platform log viewer";
+  const platformLogName = input.crash.os === "windows" ? "Event Viewer/System logs" : "platform system logs";
+  const platformMissingCodeGuidance =
+    input.crash.os === "windows"
+      ? "For missing bugcheck code, prefer Windows WER/BugCheck events (such as System Event ID 1001) or direct dump analysis. Do not use Kernel-Power Event ID 41 as the primary bugcheck source."
+      : input.crash.os === "linux"
+        ? "For missing signal or crash code, prefer `journalctl` near the crash time and `coredumpctl info` before broader speculation."
+        : "For missing crash code, prefer platform-native crash logs and dump metadata before broader speculation.";
+  const platformDebuggerGuidance =
+    input.crash.os === "windows"
+      ? "In How To Get Missing Data, prefer WinDbg as the primary tool for authoritative dump analysis. BlueScreenView may be mentioned only as a lightweight quick-look tool."
+      : input.crash.os === "linux"
+        ? "In How To Get Missing Data, prefer `coredumpctl info` and `coredumpctl gdb` as the primary tools for authoritative core-dump analysis."
+        : "In How To Get Missing Data, prefer platform-native debugger-backed dump analysis rather than speculative remediation.";
+  const platformEscalationGuidance =
+    input.crash.os === "windows"
+      ? "In Escalate If, include broader criteria such as WinDbg or WER/Event ID 1001 pointing outside the current hypothesis, repeated crashes after version/update verification, or symbol-backed analysis implicating a different driver path."
+      : input.crash.os === "linux"
+        ? "In Escalate If, include broader criteria such as repeated crashes after package/library verification or debugger-backed core-dump analysis implicating a different binary/library path."
+        : "In Escalate If, include broader criteria such as repeated crashes after version verification or debugger-backed dump analysis implicating a different component.";
   const hermesIndicatorLines = buildCrashIndicatorLines(input.preCrashEvents, input.correlatedEvents, redact);
   const topEventIdLines = buildTopCrashEventIdLines(input.correlatedEvents, redact);
   const summaryLines = [
@@ -305,21 +332,23 @@ export function buildCrashRcaPrompt(input: CrashRcaPromptInput, redact = true): 
     "7) Do not recommend uninstalling, deleting, or removing kernel drivers, system files, or core Windows components.",
     "8) If a high-risk action might eventually be needed, label it high-risk and escalation-only, not as a first-line support step.",
     "9) Every section in the template below must be filled. Do not leave sections blank or say only 'Not provided'.",
-    "10) If Hermes already has pre-crash or correlated evidence loaded, do not tell the operator to re-check the same logs in Event Viewer.",
+    `10) If Hermes already has pre-crash or correlated evidence loaded, do not tell the operator to re-check the same logs in ${platformLogViewer}.`,
     "11) When Hermes already has pre-crash indicators loaded, the first Verify First bullet must begin exactly with 'Hermes found these pre-crash indicators:' and summarize the strongest loaded indicators.",
-    "12) Only tell the operator to check Event Viewer/System logs when Hermes does not currently have the required crash evidence loaded.",
-    "13) Treat Kernel-Power Event ID 41 and similar reboot/crash-confirmation events as crash context, not as pre-crash cause evidence.",
-    "14) Treat volmgr dump-generation events and dump-file creation success as crash context, not as pre-crash cause evidence.",
+    `12) Only tell the operator to check ${platformLogName} when Hermes does not currently have the required crash evidence loaded.`,
+    "13) Treat reboot/crash-confirmation events as crash context, not as pre-crash cause evidence.",
+    "14) Treat dump-generation events and dump-file creation success as crash context, not as pre-crash cause evidence.",
     "15) Do not list dump-file availability as a pre-crash indicator.",
-    "16) If bugcheck code or stack trace is missing, describe the RCA as a working hypothesis and keep confidence moderate rather than high.",
+    `16) If the ${primaryCrashCodeLabel} or stack trace is missing, describe the RCA as a working hypothesis and keep confidence moderate rather than high.`,
     "17) Prefer evidence preservation and targeted verification before recommending a reboot or broader disruptive actions.",
-    "18) For missing bugcheck code, prefer Windows WER/BugCheck events (such as System Event ID 1001) or direct dump analysis. Do not use Kernel-Power Event ID 41 as the primary bugcheck source.",
+    `18) ${platformMissingCodeGuidance}`,
     "19) Output exactly one risk level: Low, Medium, High, or Critical. Never return combined labels like 'Medium - High'.",
     "20) Avoid broad environment changes like 'clean boot with Hyper-V disabled' unless clearly labeled as controlled isolation testing after evidence preservation.",
-    "21) In Verify First, prefer version, signer, and recent update/install history checks for the suspected driver or module over redundant dump-readability checks if Hermes already analyzed the dump.",
-    "22) If nearby WUDFRd/PnP warnings are present, describe them as adjacent driver-load instability that may be related, not as direct proof that WUDFRd caused the crash.",
-    "23) In How To Get Missing Data, prefer WinDbg as the primary tool for authoritative dump analysis. BlueScreenView may be mentioned only as a lightweight quick-look tool.",
-    "24) In Escalate If, include broader criteria such as WinDbg or WER/Event ID 1001 pointing outside the current hypothesis, repeated crashes after version/update verification, or symbol-backed analysis implicating a different driver path.",
+    "21) In Verify First, prefer version, package/signer provenance, and recent update/install history checks for the suspected driver or module over redundant dump-readability checks if Hermes already analyzed the dump.",
+    ...(input.crash.os === "windows"
+      ? ["22) If nearby WUDFRd/PnP warnings are present, describe them as adjacent driver-load instability that may be related, not as direct proof that WUDFRd caused the crash."]
+      : []),
+    `23) ${platformDebuggerGuidance}`,
+    `24) ${platformEscalationGuidance}`,
     "",
     "Crash Packet:",
     ...summaryLines,
@@ -329,7 +358,7 @@ export function buildCrashRcaPrompt(input: CrashRcaPromptInput, redact = true): 
     `Correlated events (+/-15m): ${input.correlatedEvents.length}`,
     input.contextReadinessNote ? `Context note: ${protect(input.contextReadinessNote)}` : "",
     "",
-    "Minidump Triage Summary:",
+    `${dumpLabel} Triage Summary:`,
     `- ${protect(input.minidumpSummary)}`,
     ...input.minidumpDetails.map((entry) => `- ${protect(entry)}`),
     `Likely cause note: ${protect(input.likelyCause)}`,
@@ -383,8 +412,14 @@ export function buildCrashRcaPrompt(input: CrashRcaPromptInput, redact = true): 
     "- <missing item 1>",
     "- <missing item 2>",
     "## How To Get Missing Data",
-    "- <operator-friendly step to retrieve bugcheck code if missing>",
-    "- <operator-friendly step to retrieve stack trace if missing, including debugger/symbol note when applicable>"
+    input.crash.os === "windows"
+      ? "- <operator-friendly step to retrieve bugcheck code if missing>"
+      : input.crash.os === "linux"
+        ? "- <operator-friendly step to retrieve the signal or crash code if missing>"
+        : "- <operator-friendly step to retrieve the primary crash code if missing>",
+    input.crash.os === "linux"
+      ? "- <operator-friendly step to retrieve a backtrace or module context, including debugger/symbol note when applicable>"
+      : "- <operator-friendly step to retrieve stack trace if missing, including debugger/symbol note when applicable>"
   ]
     .filter((line) => line !== "")
     .join("\n");

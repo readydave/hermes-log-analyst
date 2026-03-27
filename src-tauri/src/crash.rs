@@ -1002,3 +1002,338 @@ fn find_prefixed_value<'a>(lines: &'a [String], prefixes: &[&str]) -> Option<&'a
     }
     None
 }
+
+/// Infer signal from Linux log events (e.g., SIGSEGV, SIGABRT)
+fn infer_signal_from_events(events: &[NormalizedEvent]) -> Option<String> {
+    for event in events {
+        let message = event.message.as_str();
+        if message.contains("SIGSEGV") || message.contains("signal 11") {
+            return Some("SIGSEGV".to_string());
+        } else if message.contains("SIGABRT") || message.contains("signal 6") {
+            return Some("SIGABRT".to_string());
+        } else if message.contains("SIGBUS") || message.contains("signal 7") {
+            return Some("SIGBUS".to_string());
+        } else if message.contains("SIGFPE") || message.contains("signal 8") {
+            return Some("SIGFPE".to_string());
+        }
+    }
+    None
+}
+
+/// Analyze Linux minidump/core dump crashes
+pub fn analyze_linux_minidump(
+    crash: &CrashRecord,
+    related_events: &[NormalizedEvent],
+) -> Result<MinidumpAnalysisResult, String> {
+    // For Linux, we support Core Dumps (application crashes)
+    let dump_kind = if crash.source.eq_ignore_ascii_case("CoreDump")
+        || crash.crash_type.eq_ignore_ascii_case("Core Dump")
+    {
+        "core_dump".to_string()
+    } else {
+        "unsupported".to_string()
+    };
+
+    if !crash.os.eq_ignore_ascii_case("linux") || dump_kind == "unsupported" {
+        return Ok(unavailable_minidump_analysis(
+            crash,
+            dump_kind,
+            "Selected crash is not a supported Linux core dump.".to_string(),
+        ));
+    }
+
+    let warnings = Vec::new();
+    let dump_path = crash.raw_path.clone();
+
+    // Determine if the dump file exists and get metadata
+    let (dump_exists, metadata_opt, unavailable_reason) = match &dump_path {
+        Some(raw_path) => {
+            let path = PathBuf::from(raw_path);
+            match fs::metadata(&path) {
+                Ok(metadata) => (true, Some(metadata), None),
+                Err(error) => (
+                    false,
+                    None,
+                    Some(format!("Dump file is unavailable: {error}")),
+                ),
+            }
+        }
+        None => (
+            false,
+            None,
+            Some("Crash record does not include a dump file path.".to_string()),
+        ),
+    };
+
+    // Infer signal from events if not already in the crash record
+    let signal_code = crash
+        .code
+        .clone()
+        .or_else(|| infer_signal_from_events(related_events));
+
+    // For Linux, we can't read ELF core dump headers like Windows minidumps,
+    // but we can still provide analysis based on logs and metadata
+    let suspected_component = crash
+        .suspected_component
+        .clone()
+        .or_else(|| infer_suspected_module(related_events));
+
+    let likely_cause_category =
+        infer_likely_cause_category(signal_code.as_deref(), suspected_component.as_deref(), related_events);
+    let likely_cause = build_likely_cause_text(
+        likely_cause_category.as_str(),
+        suspected_component.as_deref(),
+        signal_code.as_deref(),
+        related_events,
+    );
+
+    // Linux core dumps typically have lower confidence without detailed analysis tools
+    let confidence = estimate_confidence(
+        signal_code.as_deref(),
+        suspected_component.as_deref(),
+        false, // No header info for ELF core dumps
+        related_events,
+    );
+
+    let dump_modified_at = metadata_opt
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(system_time_to_rfc3339);
+
+    // Build summary based on whether we have the dump file
+    let summary = if !dump_exists && unavailable_reason.is_some() {
+        format!(
+            "Linux core dump analysis is partially available. {}",
+            unavailable_reason.as_ref().unwrap()
+        )
+    } else {
+        build_minidump_summary(
+            crash,
+            dump_kind.as_str(),
+            signal_code.as_deref(),
+            suspected_component.as_deref(),
+            likely_cause_category.as_str(),
+            related_events.len(),
+        )
+    };
+
+    // Build crash details based on available information
+    let mut crash_details = vec![
+        format!("Crash type: {}", crash.crash_type),
+        format!("Source: {}", crash.source),
+        format!("Timestamp: {}", crash.timestamp),
+    ];
+
+    if dump_exists {
+        if let Some(metadata) = &metadata_opt {
+            crash_details.push(format!("Dump size: {} bytes", metadata.len()));
+        }
+    } else if let Some(reason) = &unavailable_reason {
+        crash_details.push(format!("Dump unavailable: {reason}"));
+    }
+
+    // Add signal and component info if available
+    if let Some(signal) = &signal_code {
+        crash_details.push(format!("Signal code: {signal}"));
+    }
+    if let Some(component) = &suspected_component {
+        crash_details.push(format!("Suspected component: {component}"));
+    }
+
+    // Build verify and escalate suggestions
+    let mut verify_first = vec![
+        "Review related system logs for pre-crash conditions.".to_string(),
+    ];
+    if !dump_exists {
+        verify_first.push("Confirm the dump path exists and is readable on the local machine.".to_string());
+    }
+
+    let mut escalate_if = vec![
+        "The system continues to crash with similar signals.".to_string(),
+    ];
+    if !dump_exists {
+        escalate_if.push("Support needs access to the core dump file for detailed analysis.".to_string());
+    }
+
+    Ok(MinidumpAnalysisResult {
+        ok: true,
+        crash_id: crash.id.clone(),
+        crash_type: crash.crash_type.clone(),
+        source: crash.source.clone(),
+        dump_path,
+        dump_exists,
+        dump_kind,
+        dump_size_bytes: metadata_opt.as_ref().map(|m| m.len()),
+        dump_modified_at,
+        header_signature: None, // ELF core dumps don't have the same structure
+        header_version: None,
+        header_stream_count: None,
+        header_timestamp: None,
+        bugcheck_code: signal_code,
+        bugcheck_parameters: Vec::new(),
+        suspected_module: suspected_component,
+        likely_cause_category,
+        confidence,
+        summary,
+        crash_details,
+        likely_cause,
+        verify_first,
+        escalate_if,
+        warnings,
+        unavailable_reason,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_first_hex_token() {
+        assert_eq!(first_hex_token("BugCheck 0xC0000005"), Some("0xC0000005".to_string()));
+        assert_eq!(first_hex_token("Stop code: 0xA"), Some("0xA".to_string()));
+        assert_eq!(first_hex_token("No hex here!"), None);
+    }
+
+    #[test]
+    fn test_infer_bugcheck_code() {
+        let events = vec![
+            NormalizedEvent {
+                id: "1".to_string(),
+                timestamp: "2024-03-27T10:00:05Z".to_string(),
+                os: "windows".to_string(),
+                log_name: "system".to_string(),
+                category: "bugcheck".to_string(),
+                provider: "kernel".to_string(),
+                event_id: Some(100),
+                severity: "info".to_string(),
+                message: "BugCheck 0xC0000005, ...".to_string(),
+                source_host: "host-001".to_string(),
+                imported: true,
+            },
+        ];
+
+        let code = infer_bugcheck_code(&events);
+        assert_eq!(code, Some("0xC0000005".to_string()));
+    }
+
+    #[test]
+    fn test_infer_module_name() {
+        let events = vec![
+            NormalizedEvent {
+                id: "1".to_string(),
+                timestamp: "2024-03-27T10:00:05Z".to_string(),
+                os: "windows".to_string(),
+                log_name: "system".to_string(),
+                category: "bugcheck".to_string(),
+                provider: "kernel".to_string(),
+                event_id: Some(100),
+                severity: "info".to_string(),
+                message: "Probably caused by : nvlddmkm.sys".to_string(),
+                source_host: "host-001".to_string(),
+                imported: true,
+            },
+        ];
+
+        let module = infer_suspected_module(&events);
+        assert_eq!(module, Some("nvlddmkm.sys".to_string()));
+    }
+
+    #[test]
+    fn test_analyze_linux_minidump_with_core_dump() {
+        let crash = CrashRecord {
+            id: "crash-001".to_string(),
+            timestamp: "2024-03-27T10:00:00Z".to_string(),
+            os: "linux".to_string(),
+            source: "CoreDump".to_string(),
+            crash_type: "Core Dump".to_string(),
+            code: Some("SIGSEGV".to_string()),
+            summary: "Segmentation fault".to_string(),
+            suspected_component: Some("libfoo.so".to_string()),
+            raw_path: Some("/var/crash/core.123456".to_string()),
+            source_host: "host-001".to_string(),
+            imported: true,
+        };
+
+        let related_events = vec![
+            NormalizedEvent {
+                id: "event-001".to_string(),
+                timestamp: "2024-03-27T10:00:05Z".to_string(),
+                os: "linux".to_string(),
+                log_name: "system".to_string(),
+                category: "process".to_string(),
+                provider: "kernel".to_string(),
+                event_id: Some(100),
+                severity: "info".to_string(),
+                message: "Process 123456 received signal SIGSEGV from application libfoo.so".to_string(),
+                source_host: "host-001".to_string(),
+                imported: true,
+            }
+        ];
+
+        let result = analyze_linux_minidump(&crash, &related_events).unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.crash_id, "crash-001");
+        assert_eq!(result.source, "CoreDump");
+    }
+
+    #[test]
+    fn test_analyze_linux_minidump_without_dump_file() {
+        let crash = CrashRecord {
+            id: "crash-002".to_string(),
+            timestamp: "2024-03-27T10:00:00Z".to_string(),
+            os: "linux".to_string(),
+            source: "CoreDump".to_string(),
+            crash_type: "Core Dump".to_string(),
+            code: Some("SIGABRT".to_string()),
+            summary: "Abnormal termination".to_string(),
+            suspected_component: None,
+            raw_path: None, // No dump file path
+            source_host: "host-001".to_string(),
+            imported: true,
+        };
+
+        let related_events = vec![];
+
+        let result = analyze_linux_minidump(&crash, &related_events).unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.crash_id, "crash-002");
+    }
+
+    #[test]
+    fn test_infer_signal_from_events() {
+        let events = vec![
+            NormalizedEvent {
+                id: "event-001".to_string(),
+                timestamp: "2024-03-27T10:00:05Z".to_string(),
+                os: "linux".to_string(),
+                log_name: "system".to_string(),
+                category: "process".to_string(),
+                provider: "kernel".to_string(),
+                event_id: Some(100),
+                severity: "info".to_string(),
+                message: "Process 123456 received signal SIGSEGV from application libfoo.so".to_string(),
+                source_host: "host-001".to_string(),
+                imported: true,
+            },
+            NormalizedEvent {
+                id: "event-002".to_string(),
+                timestamp: "2024-03-27T10:00:06Z".to_string(),
+                os: "linux".to_string(),
+                log_name: "system".to_string(),
+                category: "process".to_string(),
+                provider: "kernel".to_string(),
+                event_id: Some(101),
+                severity: "info".to_string(),
+                message: "Application crashed with signal 11".to_string(),
+                source_host: "host-001".to_string(),
+                imported: true,
+            }
+        ];
+
+        let signal = infer_signal_from_events(&events);
+        assert!(signal.is_some());
+    }
+}

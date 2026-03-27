@@ -29,8 +29,8 @@ export interface RemoteConnectionProfile {
   os: string;
   protocol: string;
   username: string;
-  ssh_key_path: string | null;
-  auth_type: string;
+  sshKeyPath: string | null;
+  authType: string;
 }
 
 export interface RemoteSettings {

@@ -12,3 +12,6 @@ tmp/pdfs/
 
 # Local convenience launchers
 scripts/hermes-start.cmd
+
+# Local runtime data
+src-tauri/hermes.db

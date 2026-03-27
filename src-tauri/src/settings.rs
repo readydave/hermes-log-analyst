@@ -104,7 +104,9 @@ pub struct RemoteConnectionProfile {
     pub os: String,
     pub protocol: String,
     pub username: String,
+    #[serde(alias = "ssh_key_path")]
     pub ssh_key_path: Option<String>,
+    #[serde(alias = "auth_type")]
     pub auth_type: String, // "key_only" or "password"
 }
 
@@ -118,6 +120,62 @@ impl Default for RemoteSettings {
     fn default() -> Self {
         Self { profiles: Vec::new() }
     }
+}
+
+fn sanitize_remote_auth_type(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "password" => "password".to_string(),
+        "key_only" | "key" | "" => "key".to_string(),
+        _ => "key".to_string(),
+    }
+}
+
+fn sanitize_remote_protocol(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "winrm" => "winrm".to_string(),
+        _ => "ssh".to_string(),
+    }
+}
+
+fn sanitize_remote_os(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "windows" => "windows".to_string(),
+        "macos" => "macos".to_string(),
+        _ => "linux".to_string(),
+    }
+}
+
+fn sanitize_remote_settings(settings: RemoteSettings) -> RemoteSettings {
+    let mut seen_ids = HashSet::new();
+    let profiles = settings
+        .profiles
+        .into_iter()
+        .filter_map(|mut profile| {
+            let id = profile.id.trim().to_string();
+            if id.is_empty() || !seen_ids.insert(id.to_ascii_lowercase()) {
+                return None;
+            }
+
+            profile.id = id;
+            profile.name = if profile.name.trim().is_empty() {
+                "Remote Host".to_string()
+            } else {
+                profile.name.trim().to_string()
+            };
+            profile.host = profile.host.trim().to_string();
+            profile.os = sanitize_remote_os(profile.os.as_str());
+            profile.protocol = sanitize_remote_protocol(profile.protocol.as_str());
+            profile.username = profile.username.trim().to_string();
+            profile.auth_type = sanitize_remote_auth_type(profile.auth_type.as_str());
+            profile.ssh_key_path = profile
+                .ssh_key_path
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            Some(profile)
+        })
+        .collect();
+
+    RemoteSettings { profiles }
 }
 
 fn settings_dir() -> Result<PathBuf, String> {
@@ -316,16 +374,17 @@ pub fn load_remote_settings() -> RemoteSettings {
     let Ok(parsed) = serde_json::from_str::<RemoteSettings>(raw.as_str()) else {
         return RemoteSettings::default();
     };
-    parsed
+    sanitize_remote_settings(parsed)
 }
 
 pub fn save_remote_settings(settings: RemoteSettings) -> Result<RemoteSettings, String> {
+    let sanitized = sanitize_remote_settings(settings);
     let path = remote_settings_path()?;
-    let payload = serde_json::to_string_pretty(&settings)
+    let payload = serde_json::to_string_pretty(&sanitized)
         .map_err(|error| format!("Failed to serialize remote settings: {error}"))?;
     fs::write(path, payload.as_bytes())
         .map_err(|error| format!("Failed to save remote settings: {error}"))?;
-    Ok(settings)
+    Ok(sanitized)
 }
 
 fn sanitize_trusted_hosts(values: Vec<String>) -> Vec<String> {

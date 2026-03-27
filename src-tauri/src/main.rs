@@ -7,8 +7,8 @@ mod settings;
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use crash::{
-    analyze_windows_minidump, import_host_crashes as collect_host_crashes, CrashRecord,
-    MinidumpAnalysisResult,
+    analyze_linux_minidump, analyze_windows_minidump, import_host_crashes as collect_host_crashes,
+    CrashRecord, MinidumpAnalysisResult,
 };
 use db::{
     cleanup_duplicate_events, correlate_crash_events,
@@ -1476,8 +1476,15 @@ fn analyze_minidump(
         .ok_or_else(|| "Selected crash was not found.".to_string())?;
     let related = correlate_crash_events(crash_id.as_str(), window_minutes.unwrap_or(15).clamp(1, 180), 250)
         .map_err(|error| command_error("storage", "Failed to load related events for minidump analysis", error))?;
-    analyze_windows_minidump(&crash, related.as_slice())
-        .map_err(|error| command_error("crash", "Failed to analyze minidump", error))
+
+    // Select the appropriate analyzer based on OS
+    let result = if crash.os.eq_ignore_ascii_case("linux") {
+        analyze_linux_minidump(&crash, related.as_slice())
+    } else {
+        analyze_windows_minidump(&crash, related.as_slice())
+    };
+
+    result.map_err(|error| command_error("crash", "Failed to analyze minidump", error))
 }
 
 #[tauri::command]
@@ -2547,5 +2554,297 @@ fn main() {
             format!("Error while running Tauri application: {error}"),
         );
         panic!("error while running tauri application: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::thread;
+    use uuid::Uuid;
+
+    fn spawn_mock_json_server(responses: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock HTTP server");
+        let address = listener.local_addr().expect("mock server address");
+        let handle = thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().expect("accept mock HTTP connection");
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write mock HTTP response");
+                stream.flush().expect("flush mock HTTP response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn test_http_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("build test HTTP client")
+    }
+
+    #[test]
+    fn llm_connection_handles_reachable_ollama_with_no_models() {
+        let (base_url, handle) =
+            spawn_mock_json_server(vec![r#"{"models":[]}"#, r#"{"models":[]}"#]);
+        let result = test_ollama_connection(&test_http_client(), base_url.as_str());
+        handle.join().expect("join mock Ollama server");
+
+        assert!(result.ok);
+        assert!(result.detected_models.is_empty());
+        assert_eq!(
+            result.message,
+            "Connected to Ollama, but no local models were reported."
+        );
+        assert!(result.preferred_model.is_none());
+    }
+
+    #[test]
+    fn llm_connection_handles_reachable_lmstudio_with_no_models() {
+        let (base_url, handle) = spawn_mock_json_server(vec![r#"{"data":[]}"#, r#"{"data":[]}"#]);
+        let result =
+            test_openai_compatible_connection("lmstudio", &test_http_client(), base_url.as_str(), None);
+        handle.join().expect("join mock LM Studio server");
+
+        assert!(result.ok);
+        assert!(result.detected_models.is_empty());
+        assert_eq!(result.message, "Connected to lmstudio. No models were returned.");
+        assert!(result.preferred_model.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TempXdgDataHome {
+        _guard: MutexGuard<'static, ()>,
+        original: Option<OsString>,
+        root: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TempXdgDataHome {
+        fn new(label: &str) -> Self {
+            let guard = env_lock().lock().expect("lock XDG_DATA_HOME test guard");
+            let root = std::env::temp_dir().join(format!(
+                "hermes-log-analyst-{label}-{}",
+                Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).expect("create temporary XDG_DATA_HOME");
+            let original = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("XDG_DATA_HOME", &root);
+            Self {
+                _guard: guard,
+                original,
+                root,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TempXdgDataHome {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn system_has_coredumps() -> bool {
+        let Ok(output) = Command::new("coredumpctl")
+            .args(["list", "--no-pager"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+
+        String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with("TIME")
+                && !trimmed.starts_with("No coredumps found")
+                && !trimmed.starts_with("No journal files were found")
+                && !trimmed.starts_with("Hint:")
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    #[ignore = "live Linux host validation"]
+    fn linux_live_collects_and_loads_local_events() {
+        let _temp_data_home = TempXdgDataHome::new("linux-live-events");
+        let now = Utc::now();
+        let start = now - chrono::Duration::hours(24);
+
+        let outcome = collect_host_events_range_with_windows_channels(
+            Some(start),
+            Some(now),
+            Some(500),
+            None,
+            false,
+        );
+
+        assert!(
+            !outcome.events.is_empty(),
+            "Expected live Linux log collection to return events. Warnings: {:?} Errors: {:?}",
+            outcome.warnings,
+            outcome.errors
+        );
+
+        save_local_events(outcome.events.as_slice()).expect("save collected Linux events");
+        let loaded = read_local_events_range(
+            start.to_rfc3339().as_str(),
+            now.to_rfc3339().as_str(),
+            500,
+            Some("localhost"),
+        )
+        .expect("read saved Linux event range");
+
+        assert!(
+            !loaded.is_empty(),
+            "Expected saved Linux event range to be readable from SQLite."
+        );
+        assert!(
+            loaded.iter().all(|event| event.source_host == "localhost"),
+            "Expected live Linux validation events to round-trip as localhost events."
+        );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    #[ignore = "live Linux host validation"]
+    fn linux_live_imports_and_analyzes_core_dumps_when_present() {
+        let _temp_data_home = TempXdgDataHome::new("linux-live-crashes");
+        let has_coredumps = system_has_coredumps();
+        let crashes = collect_host_crashes(200).expect("collect live Linux crashes");
+
+        if has_coredumps {
+            assert!(
+                !crashes.is_empty(),
+                "Expected live Linux crash import to return crash records when coredumpctl has entries."
+            );
+        }
+
+        save_crashes(&crashes).expect("save imported Linux crashes");
+        let loaded = read_crashes(250, Some("localhost")).expect("read saved Linux crashes");
+
+        if !has_coredumps {
+            return;
+        }
+
+        let crash = loaded
+            .iter()
+            .find(|entry| {
+                entry.os.eq_ignore_ascii_case("linux")
+                    && entry.crash_type.eq_ignore_ascii_case("Core Dump")
+            })
+            .or_else(|| {
+                crashes.iter().find(|entry| {
+                    entry.os.eq_ignore_ascii_case("linux")
+                        && entry.crash_type.eq_ignore_ascii_case("Core Dump")
+                })
+            })
+            .expect("find a Linux Core Dump crash record");
+
+        let analysis = analyze_linux_minidump(crash, &[]).expect("analyze Linux core dump");
+        assert!(analysis.ok, "Expected Linux core-dump analysis to succeed.");
+        assert_eq!(analysis.dump_kind, "core_dump");
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    #[ignore = "live Linux host validation"]
+    fn linux_live_local_llm_connection_and_analysis_when_available() {
+        let mut profiles = vec![
+            LlmConnectionProfile {
+                id: "linux-live-ollama".to_string(),
+                name: "Linux Live Ollama".to_string(),
+                provider: "ollama".to_string(),
+                scope: "local".to_string(),
+                base_url: "http://127.0.0.1:11434".to_string(),
+                model: String::new(),
+                enabled: true,
+                api_key_configured: false,
+            },
+            LlmConnectionProfile {
+                id: "linux-live-lmstudio".to_string(),
+                name: "Linux Live LM Studio".to_string(),
+                provider: "lmstudio".to_string(),
+                scope: "local".to_string(),
+                base_url: "http://127.0.0.1:1234".to_string(),
+                model: String::new(),
+                enabled: true,
+                api_key_configured: false,
+            },
+        ];
+
+        let (profile, connection) = profiles
+            .drain(..)
+            .find_map(|profile| {
+                let result = test_llm_profile_connection_sync(profile.clone(), None);
+                if result.ok && !result.detected_models.is_empty() {
+                    Some((profile, result))
+                } else {
+                    None
+                }
+            })
+            .expect("find a reachable local LLM profile with at least one model");
+
+        let selected_model = connection
+            .preferred_model
+            .clone()
+            .or_else(|| connection.detected_models.first().cloned())
+            .expect("select discovered local LLM model");
+
+        let settings = LlmSettings {
+            allow_lan_discovery: false,
+            never_send_raw_event_to_untrusted: true,
+            trusted_hosts: Vec::new(),
+            profiles: vec![LlmConnectionProfile {
+                model: selected_model,
+                ..profile.clone()
+            }],
+            default_profile_id: profile.id.clone(),
+            backup_profile_id: String::new(),
+            preferred_lan_interface_id: String::new(),
+        };
+
+        let result = analyze_with_local_llm_sync(
+            settings,
+            "Reply in one short sentence: Linux live validation ping.".to_string(),
+            Some(profile.id.clone()),
+        )
+        .expect("run live local LLM analysis");
+
+        assert!(result.ok);
+        assert!(
+            !result.response.trim().is_empty(),
+            "Expected local LLM analysis to return non-empty text."
+        );
     }
 }

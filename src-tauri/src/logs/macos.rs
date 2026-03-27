@@ -408,6 +408,20 @@ pub fn collect_remote_macos_events(
     max_events: Option<u32>,
     _channels: Option<&[String]>,
 ) -> CollectionResult {
+    let max = max_events.unwrap_or(2000).min(10000) as usize;
+    if max == 0 {
+        return CollectionResult::default();
+    }
+
+    if profile.auth_type.eq_ignore_ascii_case("password") {
+        let mut result = CollectionResult::default();
+        result.errors.push(format!(
+            "Remote SSH password authentication is not implemented for {}. Use SSH key-based auth instead.",
+            profile.host
+        ));
+        return result;
+    }
+
     let mut args = vec!["show".to_string(), "--style".to_string(), "ndjson".to_string()];
     
     if let Some(start_time) = start {
@@ -444,7 +458,9 @@ pub fn collect_remote_macos_events(
 
     let mut command = std::process::Command::new("ssh");
     command.args(&ssh_args);
-    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     let mut result = CollectionResult::default();
     let mut child = match command.spawn() {
@@ -463,7 +479,6 @@ pub fn collect_remote_macos_events(
         }
     };
 
-    let max = max_events.unwrap_or(2000) as usize;
     let reader = std::io::BufReader::new(stdout);
     let mut parse_failures = 0usize;
     let mut read_failures = 0usize;
@@ -497,6 +512,84 @@ pub fn collect_remote_macos_events(
         result.warnings.push(format!("Skipped {parse_failures} non-JSON or malformed macOS entries remotely."));
     }
 
-    let _ = child.wait();
-    result
+    let stderr_text = {
+        let mut text = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        text
+    };
+
+    match child.wait() {
+        Ok(status) if status.success() => {
+            if result.events.is_empty() && !stderr_text.trim().is_empty() {
+                let stderr_summary = summarize_stderr(stderr_text.as_str());
+                let message = if stderr_looks_like_permission_issue(stderr_text.as_str()) {
+                    if stderr_summary.is_empty() {
+                        format!(
+                            "Remote macOS log collection on {} requires additional privileges.",
+                            profile.host
+                        )
+                    } else {
+                        format!(
+                            "Remote macOS log collection on {} requires additional privileges. {}",
+                            profile.host, stderr_summary
+                        )
+                    }
+                } else if stderr_summary.is_empty() {
+                    format!(
+                        "Remote macOS log collection on {} completed without events.",
+                        profile.host
+                    )
+                } else {
+                    format!(
+                        "Remote macOS log collection on {} completed without events. {}",
+                        profile.host, stderr_summary
+                    )
+                };
+
+                if stderr_looks_like_permission_issue(stderr_text.as_str()) {
+                    result.errors.push(message);
+                } else {
+                    result.warnings.push(message);
+                }
+            }
+            result
+        }
+        Ok(status) => {
+            let stderr_summary = summarize_stderr(stderr_text.as_str());
+            let message = if stderr_looks_like_permission_issue(stderr_text.as_str()) {
+                if stderr_summary.is_empty() {
+                    format!(
+                        "Remote macOS log collection on {} requires additional privileges.",
+                        profile.host
+                    )
+                } else {
+                    format!(
+                        "Remote macOS log collection on {} requires additional privileges. {}",
+                        profile.host, stderr_summary
+                    )
+                }
+            } else if stderr_summary.is_empty() {
+                format!("ssh exited with status {}", status)
+            } else {
+                format!("ssh exited with status {}. {}", status, stderr_summary)
+            };
+            if result.events.is_empty() {
+                result.errors.push(message);
+            } else {
+                result.warnings.push(message);
+            }
+            result
+        }
+        Err(error) => {
+            let message = format!("Failed to wait for remote macOS log collector process: {error}");
+            if result.events.is_empty() {
+                result.errors.push(message);
+            } else {
+                result.warnings.push(message);
+            }
+            result
+        }
+    }
 }

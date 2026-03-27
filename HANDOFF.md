@@ -5,10 +5,13 @@
 - Path (Windows): `C:\Code\hermes`
 - Branch: `main`
 - Stack: React + TypeScript + Tailwind (Vite), Rust + Tauri, SQLite
-- Status date: `2026-02-27`
+- Status date: `2026-03-27`
 
 ## Current Product State
 - Desktop-first log triage app with real host collectors and local SQLite cache.
+- Target switching now allows operators to move between `localhost` and saved remote hosts from the main data workflows.
+- Settings now include remote-host connection profiles (SSH/WinRM) and LLM provider profiles with keychain-backed API-key storage.
+- LLM send/RCA windows now preselect the saved default compatible profile and run a quick connection preflight on first use before sending analysis traffic.
 - UI layout now keeps top action bar and bottom selected-event bar always visible.
 - Middle content region is scrollable so Filters/Data Window do not hide core actions.
 - Analysis panels can be:
@@ -17,6 +20,7 @@
   - collapsed individually (Crash Correlation, Filters, Data Window)
 - Home dashboard now includes aggregate analytics for timeline, severity, top providers, top log types, top Windows Event IDs, and noisy sources with drilldown into the Events tab.
 - Selected event details now support `Raw` and `Parsed` message views for structured payload inspection.
+- Crash dump analysis is available for Windows minidumps/kernel dumps and Linux core dumps, with RCA handoff into the LLM workflow.
 - Export tab now supports scoped Ops Summary report generation as plain text or HTML (print/PDF-ready).
 
 ## Implemented Capabilities
@@ -24,10 +28,14 @@
   - Windows: native Event Log API (`Application`, `System`, `Security`) with selectable channels.
   - Linux: `journalctl --since/--until -o json`.
   - macOS: `log show --style json`.
+  - Remote Linux/macOS collection via SSH.
+  - Remote Windows collection via WinRM/PowerShell remoting.
+  - Remote collector stderr/auth failures now surface as explicit warnings/errors instead of silently looking like `0` collected events.
 - Crash workflow:
   - host crash import (metadata-first)
   - crash-to-event correlation
   - pre-crash focus (`5/15/30/60 min`)
+  - metadata/evidence analysis for Windows dump-backed crashes and Linux core dumps
 - Filtering and analysis:
   - text, provider/source, category, severity, date range, Windows Event ID, and log type
   - sortable table with sticky headers and reset sort
@@ -45,10 +53,14 @@
 - Export/actions:
   - filtered and single-event export to JSON/CSV
   - Google search and copy-ready LLM prompt
+  - local LLM execution for selected events and crash RCA packets
 - Settings persistence:
   - theme
   - export directory
-  - ingest profile (`autoSyncOnStartup`, `maxEventsPerSync`, `windowsChannels`)
+  - ingest profile (`autoSyncOnStartup`, `maxEventsPerSync`, `windowsChannels`, `requestElevation`)
+  - remote host profiles (`remote_settings.json`)
+  - LLM profiles/settings (`llm_settings.json`)
+  - remote-host settings now round-trip with the sanitized backend shape (camelCase) and the Settings view auto-selects the first saved remote profile on load
 - Diagnostics logging:
   - daily JSONL diagnostics logs (`diagnostics-YYYY-MM-DD.log`)
   - automatic 7-day retention prune on startup/day rollover
@@ -66,9 +78,12 @@
   - `autoSyncOnStartup: false`
   - `maxEventsPerSync: 2000` (clamped `100..20000`)
   - Windows channels default: `Application,System,Security`
+  - `requestElevation: false`
 - Settings location (Windows): `%LOCALAPPDATA%\hermes-log-analyst\`
   - `ingest_window_days.txt`
   - `ingest_profile.json`
+  - `llm_settings.json`
+  - `remote_settings.json`
   - `theme.txt`
   - `export_dir.txt`
   - `logs\diagnostics-YYYY-MM-DD.log`
@@ -76,14 +91,18 @@
 ## Runtime Behavior
 - `npm run tauri dev`:
   - full host collection and persistence enabled
+  - remote host targeting is enabled for configured SSH/WinRM profiles
   - startup auto-sync runs if enabled in ingest profile
+  - LLM profile testing and local analysis execution are available
   - diagnostics logger initializes at startup and prunes stale log files older than 7 days
 - `npm run dev`:
   - browser mode, no host collector bridge
   - UI still works with imported data and frontend controls
 
 ## Known Caveats
-- Crash import is metadata-first (no deep dump/core symbolication yet).
+- Crash import is metadata-first and dump analysis is still shallow compared with debugger-backed symbolication.
+  - Windows minidumps/kernel dumps and Linux core dumps now surface triage guidance.
+  - macOS crash import remains metadata-only; there is no equivalent dump-analysis view yet.
 - Large ranges plus high max-event settings can still create startup/refresh latency.
 - Ingest telemetry is basic; per-channel timing/count breakdown is not yet surfaced.
 - Collector warning details are summarized in UI; full context remains diagnostics-log first.
@@ -92,25 +111,80 @@
   - local/LAN/cloud profile plumbing exists, but end-to-end connectivity is still inconsistent enough to require manual validation and hardening.
   - localhost detection and LAN scan results should be treated as advisory until revalidated on Windows, macOS, and Garuda with real providers.
   - prompt-only / copy-prompt workflows remain the dependable fallback when provider connection attempts fail.
+- Remote host support is implemented, but the credential workflow is incomplete:
+  - SSH key-path configuration is exposed in the UI and is the only supported remote SSH auth path today.
+  - interactive SSH password auth is not implemented for Linux/macOS remote collection.
+  - backend keychain support exists for remote secrets, but WinRM/password UX still needs frontend wiring and validation.
+  - selecting a remote target in the top bar does not connect by itself; the operator must click `Refresh Logs`.
+  - exact-range `Load Events` is not fully target-aware for remote hosts yet.
+  - remote crash import is still local-only.
 - `cargo audit` reports no vulnerabilities, but Linux-target transitive GTK3 dependencies are flagged as unmaintained/unsound informational warnings via Tauri/Wry stack.
 - Common terminal message during `tauri dev` is usually benign:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
+
+## Remote Connectivity Status (2026-03-27)
+
+### What Is Working
+- Remote-host profiles can now be saved reliably again after fixing the frontend/backend field-name mismatch (`sshKeyPath` / `authType` vs old snake_case payloads).
+- Existing remote settings are sanitized on load/save so older auth values such as `key_only` normalize to the current UI values.
+- The Settings view now auto-selects the first saved remote host instead of showing an empty editor until a new profile is added.
+- Top-bar target switching scopes `Refresh Logs`, rolling ingest sync, cached event reads, and crash-window sync to the selected remote host.
+- Remote Linux/macOS collection uses SSH.
+- Remote Windows collection uses WinRM/PowerShell remoting.
+- Remote Linux/macOS collector stderr is now surfaced so permission/auth failures do not masquerade as successful zero-event refreshes.
+- A live remote macOS refresh returned `2000` events on this Linux controller machine without an interactive password prompt, which is consistent with the current non-interactive SSH path using an already available key/agent credential rather than password auth.
+
+### What Is Not Implemented Yet
+- No dedicated `Test Remote Connection` action exists in the UI.
+- SSH password auth is not implemented for Linux/macOS remote collection.
+- WinRM password auth cannot be completed end to end from the UI because remote secret set/clear flows are not wired in frontend settings.
+- Exact-range `Load Events` is not fully target-aware for remote hosts.
+- Remote crash import is not implemented; current crash import always runs against the local machine.
+
+### Required Remaining Work To Fully Support Remote macOS, Windows, and Linux Hosts
+1. Add a real `Test Connection` button for remote profiles that validates transport/auth before a log pull.
+2. Implement frontend remote secret UX:
+   - save/remove remote password in OS keychain
+   - clear status/error messaging for WinRM password auth
+3. Decide and implement one supported Linux/macOS password strategy if password-based SSH must be supported:
+   - otherwise explicitly document SSH key-only support as the intended product behavior
+4. Make Data view range sync fully remote-aware so `Load Events` respects the selected remote target.
+5. Add remote crash import and remote crash follow-on investigation parity.
+6. Add better target-switch UX:
+   - after choosing a remote host, explain that `Refresh Logs` is the next step
+   - show the selected target more prominently in Data/Crashes workflows
+7. Validate live remote collectors on all three remote OS families with failure-mode coverage:
+   - unreachable host / DNS failure
+   - wrong username
+   - missing or unreadable SSH key
+   - SSH permission denied / host key problems
+   - Linux `journalctl` permission denied
+   - macOS `log show` privilege limitations
+   - WinRM disabled / firewall blocked / bad credential / bad certificate path
+   - zero-event windows vs actual auth/permission failures
 
 ## Objective Recheck (2026-02-09)
 - 1) UX polish (coverage hint + out-of-range warning): `done`
 - 2) Crash importers (metadata-first): `done`
 - 3) Performance (virtualized table rows): `done`
-- 4) Remote machine support (SSH/WinRM): `pending`
+- 4) Remote machine support (SSH/WinRM): `done (initial implementation)`
 - Notes:
   - Collectors objective is complete (native Windows/macOS/Linux collectors in place).
   - Crash correlation supports host-imported metadata.
   - Log-type filtering and persisted ingest profile controls are complete.
+  - Remote collection and target switching landed, but remote credential UX still needs hardening.
 
 ## Next Work Items (Recommended)
 1. Stabilize LLM/provider connectivity across localhost, LAN, and cloud profiles; revalidate on Windows, macOS, and Garuda with live providers.
    - When local or LAN Ollama/LM Studio providers are detected and applied, auto-select the currently loaded/available model as the default model for that profile instead of leaving a stale or mismatched model value.
-2. Add remote machine connectors (SSH/WinRM).
-3. Enrich crash importers with minidump/panic/core parsing and optional symbolication.
+2. Harden remote-host workflows:
+   - add a first-class `Test Remote Connection` action in Settings
+   - finish remote secret UX for WinRM/password-backed connections
+   - decide whether Linux/macOS remote SSH remains key-only or gains supported password auth
+   - make exact-range `Load Events` target-aware for remote hosts
+   - implement remote crash import
+   - validate SSH/WinRM collectors against real macOS, Windows, and Linux hosts plus failure modes
+3. Enrich crash importers with deeper minidump/panic/core parsing and optional symbolication.
 4. Add ingest diagnostics in UI (per-channel counts + timing).
 5. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
 
@@ -152,15 +226,18 @@ Acceptance criteria:
 4. Connection failures are surfaced as actionable warnings and diagnostics log entries.
 
 Current implementation status (2026-02-28):
-- Completed foundation:
+- Completed:
   - persisted LLM settings model in backend (`llm_settings.json`) and Settings UI bindings.
   - provider profiles for local (`ollama`, `lmstudio`) + cloud (`openai`, `gemini`, `claude`, `perplexity`) + generic OpenAI-compatible endpoint.
   - local endpoint detection command for Ollama/LM Studio.
   - private-subnet LAN scan command for Ollama/LM Studio with bounded host scan cap.
+  - connection test/model discovery with preferred-model reporting and auto-selection in the UI.
+  - local LLM execution path for selected events and crash RCA packets.
+  - OS keychain-backed API-key storage for supported profiles.
 - Remaining for this milestone:
-  - provider credential validation and model-list/test-connect calls per provider API.
-  - "Analyze with LLM" execution path using selected provider/model.
-  - secure secret storage integration (OS keychain/credential vault).
+  - broader manual validation across Windows, macOS, and Garuda with live providers.
+  - further provider-specific reliability hardening and better failure diagnostics.
+  - secure secret-storage UX polish for operators.
 
 ### Milestone 3 - LAN Discovery (Optional, Security-First)
 - Add a separate opt-in action: `Discover providers on LAN`.
@@ -208,9 +285,9 @@ Acceptance criteria:
 - Garuda Linux: verify AppImage + AUR install path, `journalctl` permissions behavior, local/LAN provider discovery, and at least one cloud provider + generic endpoint connectivity.
 
 ## Future State Backlog
-- Remote machine log access:
-  - connect to remote hosts for targeted investigation
-  - avoid full log downloads unless explicitly requested
+- Remote collection hardening:
+  - tighten operator credential workflows and secret handling for remote targets
+  - add remote crash import/follow-on investigation parity where gaps remain
   - preserve local-first security defaults and explicit consent prompts for remote access
 
 ## Quick Validation Checklist
@@ -385,111 +462,77 @@ Result:
 ## Platform Validation Result - Garuda Linux (Live Data Only)
 
 ### Validation Record
-- Date: 2026-02-27
+- Date: 2026-03-27
 - Operator: dave
 - Machine label: daddslinux
 - OS + version: Garuda Linux (KDE on Wayland)
-- Repo commit (`git rev-parse --short HEAD`): `d558277`
+- Repo commit (`git rev-parse --short HEAD`): `63ac164`
 - Branch: `main`
 
 ### Preflight Environment Check
-1. `npm install` -> success (`added 142 packages`), but reported `1 high severity vulnerability`.
-2. `npm run build` -> success (`vite v7.3.1`, built dist assets).
-3. `npm run tauri info` -> success (Tauri/Rust/WebKit detected on this host).
-4. Missing toolchain/runtime dependencies observed during validation:
-   - `dpkg-deb` not installed (`/bin/bash: line 1: dpkg-deb: command not found`).
-   - No passwordless sudo for package install/uninstall checks (`sudo -n true` exit code `1`).
+1. `npm run test` -> success (`vitest`, 4 tests passed).
+2. `npm run build` -> success (`tsc -b && vite build`).
+3. `cargo test` -> success (`10 passed`, `3 ignored` live Linux validations available).
+4. `npm run tauri info` -> success (Garuda Linux, Wayland, WebKit/Tauri/Rust toolchain detected).
+5. `npm run tauri dev` -> success in this pass on Wayland (`vite` dev server ready; Tauri dev binary launched).
 
 Result:
-- Build status: `pass` (`npm run build` succeeded).
+- Build status: `pass`.
+- Rust test status: `pass`.
 - Tauri info status: `pass`.
-- Notes: Preflight passed, but packaging/install tooling is incomplete for full local install/uninstall verification.
+- Desktop runtime smoke status: `pass`.
 
 ### Live Log Readiness Check (No Dummy Data)
-1. `npm run tauri dev` (Wayland default) compiled but app terminated with `Gdk-Message ... Error 71 (Protocol error) dispatching to Wayland display`.
-2. `env GDK_BACKEND=x11 npm run tauri dev` ran long enough for startup sync.
-3. Host-data evidence:
-   - `~/.local/share/hermes-log-analyst/events.db` created.
-   - `sqlite3 ... "select count(*) from events;"` -> `4000`.
-   - `sqlite3 ... "select sum(imported) from events;"` -> `0` (no imported/dummy data).
-4. Live collector-equivalent range command checks:
-   - `journalctl --since "2026-02-20 ..." --until "2026-02-27 ..." -o json -n 2000 | wc -l` -> `2000`.
-   - `journalctl --since "2026-02-26 00:00:00" --until "2026-02-27 23:59:59" -o json -n 2000 | wc -l` -> `2000`.
-5. Sorting/filterability evidence on live DB:
-   - `select severity,count(*) ...` -> `information 3624`, `warning 360`, `critical 16`.
-   - `select ... order by timestamp desc limit 3` returned latest-first rows.
+1. `journalctl -n 5 -o short-iso --no-pager` returned live host events on this machine.
+2. `cargo test linux_live_collects_and_loads_local_events -- --ignored --nocapture` -> success.
+3. Local SQLite cache after validation:
+   - `sqlite3 ~/.local/share/hermes-log-analyst/events.db "select count(*) from events;"` -> `5855`
+   - `sqlite3 ~/.local/share/hermes-log-analyst/events.db "select count(*) from crashes;"` -> `25`
+4. Earlier interactive runtime inspection in this session showed the Hermes dashboard rendering on Garuda with live local data and crash counts present.
 
 Result:
-- Live event collection status: `pass-with-caveat` (works with `GDK_BACKEND=x11`; Wayland launch unstable).
-- Approx live events visible: `4000` in local SQLite cache.
-- Collector warnings/errors: No collector warning/error entries observed in diagnostics; startup diagnostics entries present.
-- Notes: No JSON/CSV import used; all validation data came from host `journalctl` and app startup sync.
+- Live event collection status: `pass`.
+- Range-load persistence status: `pass`.
+- Imported/dummy data used: `no`.
+- Notes: Validation data came from live `journalctl` collection and the app's local SQLite cache only.
 
 ### Core Functional Validation
-1. Refresh collection succeeds and updates data window.
-2. Date-range `Load Events` succeeds with expected status messages.
-3. Crash import command runs and returns host crash metadata (or clear zero-result behavior).
-4. Export filtered events to CSV and JSON succeeds.
-5. Google search action and prompt-copy action work from selected event.
+1. Local log collection and range persistence were validated against the real Garuda host.
+2. Crash import and Linux core-dump analysis were validated against real `coredumpctl` data.
+3. Local LLM connectivity and one end-to-end analysis call were validated against a live local provider.
+4. Linux-specific frontend RCA/dump helper coverage was added in Vitest to prevent UI regressions.
 
 Result:
-- Refresh: `partial-pass` (startup auto-sync populated DB; GUI confirmation of data-window text not captured due unstable GUI automation).
-- Range load: `partial-pass` (range collector command path validated via live `journalctl` output; GUI status text `Data loaded and ready...` not directly observed).
-- Crash import: `partial-pass` (host crash artifacts exist: `/var/lib/systemd/coredump` count `25`; direct button-command invocation not reliably automated in this session).
-- Export CSV/JSON: `blocked` (top-bar export button clicks could not be deterministically automated under current Wayland/X11 bridge behavior).
-- Search + prompt: `blocked` (requires deterministic row selection + action-click/clipboard checks; GUI automation unreliable here).
-- Notes: Blockers are UI automation/display-environment constraints, not imported-data constraints.
-
-### Packaging Validation
-1. `npm run tauri build`.
-2. Confirm artifacts exist.
-3. Install and launch packaged app.
-4. Confirm uninstall path.
-
-Result:
-- Bundle build status: `partial-pass`.
-  - `.deb` and `.rpm` built.
-  - AppImage bundling failed.
-- Artifact paths:
-  - `src-tauri/target/release/bundle/deb/Hermes Log Analyst_0.1.0_amd64.deb`
-  - `src-tauri/target/release/bundle/rpm/Hermes Log Analyst-0.1.0-1.x86_64.rpm`
-  - `src-tauri/target/release/bundle/appimage/Hermes Log Analyst.AppDir/` (AppImage final file not produced)
-- Install/launch status:
-  - Launch test of release binary: `timeout 15 env GDK_BACKEND=x11 ./src-tauri/target/release/hermes-log-analyst` -> process stayed up until timeout (exit `124`), emitted `Failed to create GBM buffer ...` warning.
-  - Package install test: `blocked` (no passwordless sudo; cannot perform system install/uninstall in this run).
-- Uninstall status: `blocked` (install step blocked).
+- Refresh Logs / live collection: `pass`
+- Load Events / saved range round-trip: `pass`
+- Import Crashes: `pass`
+- Linux core-dump analysis: `pass`
+- Local LLM connection + one RCA/analysis call: `pass`
 - Notes:
-  - AppImage blocker: linuxdeploy strip errors on RELR sections, e.g. `unknown type [0x13] section '.relr.dyn'`, ending with `failed to bundle project 'failed to run .../linuxdeploy-x86_64.AppImage'`.
+  - `coredumpctl list --no-pager | tail -n 8` returned real Linux core dumps, including LM Studio internal-node crashes and `mpv`.
+  - `cargo test linux_live_imports_and_analyzes_core_dumps_when_present -- --ignored --nocapture` -> success.
+  - `ollama list` returned `gemma3:latest`.
+  - `curl -s http://127.0.0.1:1234/v1/models` returned a live LM Studio/OpenAI-compatible model list.
+  - `cargo test linux_live_local_llm_connection_and_analysis_when_available -- --ignored --nocapture` -> success.
 
-### Forward Readiness Check (Planned Functionality)
-
-#### Local LLM Provider Readiness
+### Validation Constraints
 Result:
-- Ollama reachable: `yes` (`curl http://127.0.0.1:11434/api/tags` -> `HTTP 200`; model list returned including `gemma3:latest`).
-- LM Studio reachable: `no` (`curl http://127.0.0.1:1234/v1/models` -> connection refused / `HTTP 000`).
-- Preferred provider: `ollama` (only reachable provider on this machine).
-- Notes: `ss -ltnp` showed listener on `127.0.0.1:11434` and none on `1234`.
-
-#### LAN Discovery Readiness
-Result:
-- LAN scan allowed: `not policy-confirmed` (technical path exists; policy confirmation not available in this shell session).
-- Network constraints:
-  - Active interface: `enp26s0 192.168.10.50/24`.
-  - `firewalld` not running.
-  - `nft list ruleset` requires root (`Operation not permitted`), so effective nftables policy not fully visible here.
-- Risk notes: Treat unknown LAN hosts as untrusted by default; require explicit user consent and warning before discovery/inference as planned.
+- Wayland desktop runtime: `pass`
+- Deterministic GUI automation under Wayland: `blocked`
+- Cause: `xdotool` triggered a KDE `Remote Control` approval prompt for input-device control, so button-by-button automation was not trustworthy in this pass.
+- Workaround used: live backend tests plus direct host commands (`journalctl`, `coredumpctl`, local provider probes) to validate behavior without fake/imported data.
 
 ### Overall Status
-- Platform status: `pass-with-caveats`
+- Platform status: `pass`
 - Blockers:
-  - Wayland path unstable for this app run (`Gdk-Message ... Protocol error`); required `GDK_BACKEND=x11` workaround.
-  - AppImage packaging failed due linuxdeploy strip/RELR incompatibility.
-  - Deterministic GUI action automation (export/search/prompt) not reliable in this session.
-  - Install/uninstall verification blocked by lack of elevated install permissions.
+  - Remote SSH validation against a real Linux target was not completed in this pass.
+  - WinRM/password secret UX is still incomplete and remains outside Linux validation scope.
+  - Deterministic GUI action automation under current KDE/Wayland permissions is still blocked without compositor approval.
 - Recommended next actions:
-  - Fix AppImage build by updating/overriding linuxdeploy toolchain (or disabling problematic strip step for RELR-enabled libs).
-  - Add headless/integration command harness for `refresh_local_events`, `sync_local_events_range`, `import_host_crashes`, and `export_events` to validate core functions without fragile GUI automation.
-  - Re-run GUI-only checks in an interactive desktop session (manual operator pass) after display/backend stabilization.
+  - Validate one real remote SSH Linux target end to end.
+  - Keep `src-tauri/hermes.db` out of source control; it is local runtime state only.
+  - Decide whether to commit `src-tauri/gen/schemas/linux-schema.json` by default alongside the already tracked generated schemas.
+  - Re-run purely GUI-only actions manually in an interactive desktop session if compositor-level input approval is granted.
 - Owner: dave
 
 ## Platform Validation Result - Windows 11 (Live Data Only)

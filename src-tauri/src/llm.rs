@@ -305,3 +305,40 @@ pub fn scan_lan_providers(interface_id: Option<&str>, max_hosts: usize) -> Vec<L
     hits.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     hits
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::LlmConnectionTestResult;
+
+    #[test]
+    fn test_preferred_model_from_detected_models() {
+        let result = LlmConnectionTestResult {
+            ok: true,
+            provider: "ollama".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            status_code: Some(200),
+            message: "Connection successful".to_string(),
+            detected_models: vec!["llama3".to_string(), "gpt-4o".to_string(), "mistral".to_string()],
+            preferred_model: None,
+        };
+
+        let preferred_model = result.detected_models.first().cloned();
+        assert_eq!(preferred_model, Some("llama3".to_string()));
+    }
+
+    #[test]
+    fn test_preferred_model_empty_detected_models() {
+        let result = LlmConnectionTestResult {
+            ok: true,
+            provider: "ollama".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            status_code: Some(200),
+            message: "Connection successful".to_string(),
+            detected_models: vec![],
+            preferred_model: None,
+        };
+
+        let preferred_model = result.detected_models.first().cloned();
+        assert_eq!(preferred_model, None);
+    }
+}

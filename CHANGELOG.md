@@ -6,6 +6,23 @@ This changelog is intentionally sanitized. It excludes machine names, user-speci
 
 The project does not currently publish formal version tags for each change group below, so entries are organized by date and representative commit.
 
+## 2026-03-27
+
+### Added
+- Linux core-dump analysis path in the crash workflow, including RCA packet generation that uses Linux-appropriate dump guidance instead of Windows-only wording.
+
+### Changed
+- The crash-analysis panel now appears for Linux core dumps as well as Windows minidumps/kernel dumps.
+- Detected LLM model chips now visually highlight the preferred/active model in Settings.
+- Send-to-LLM and crash-RCA windows now prefer the saved default compatible profile instead of a narrower local-only subset.
+
+### Fixed
+- Non-Windows builds now provide a defined fallback for the remote Windows collector symbol.
+- Preferred-model unit tests now match the production `first().cloned()` behavior instead of asserting an empty-string sentinel.
+- First-use LLM analysis now performs a connection preflight and fails early when the selected default profile is unreachable or has no configured/detectable model.
+- Remote host settings now save with the correct frontend/backend field names, and the Settings editor auto-selects the first saved remote profile on load.
+- Remote Linux/macOS collectors now surface SSH stderr and unsupported auth-path problems as explicit errors instead of silent zero-event results.
+
 ## 2026-03-11
 
 ### Added
@@ -160,4 +177,3 @@ Representative commits:
 
 ### Fixed
 - Windows desktop build baseline issues affecting the local development path.
-

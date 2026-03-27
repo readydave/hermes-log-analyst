@@ -1,4 +1,4 @@
-use super::{CollectionEstimate, CollectionResult, NormalizedEvent, SupportedOs};
+use super::{CollectionEstimate, CollectionResult};
 use crate::settings::RemoteConnectionProfile;
 #[cfg(target_os = "windows")]
 use chrono::SecondsFormat;
@@ -83,6 +83,17 @@ pub fn estimate_events_range_with_channels(
     _channels: Option<&[String]>,
 ) -> CollectionEstimate {
     CollectionEstimate::default()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn collect_remote_windows_events(
+    _profile: &RemoteConnectionProfile,
+    _start: Option<DateTime<Utc>>,
+    _end: Option<DateTime<Utc>>,
+    _max_events: Option<u32>,
+    _channels: Option<&[String]>,
+) -> CollectionResult {
+    CollectionResult::default()
 }
 
 #[cfg(target_os = "windows")]
@@ -619,6 +630,7 @@ fn last_error() -> u32 {
 }
 
 
+#[cfg(target_os = "windows")]
 pub fn collect_remote_windows_events(
     profile: &RemoteConnectionProfile,
     _start: Option<DateTime<Utc>>,
@@ -672,6 +684,12 @@ let mut cred_setup = String::new();
                 profile.username.replace("'", "''")
             );
             cred_arg = "-Credential $Cred".to_string();
+        } else {
+            result.errors.push(format!(
+                "WinRM password authentication for {} requires a stored remote secret, but no secret is configured in the OS keychain.",
+                profile.host
+            ));
+            return result;
         }
     }
 

@@ -414,7 +414,25 @@ pub fn collect_remote_linux_events(
     max_events: Option<u32>,
     _channels: Option<&[String]>,
 ) -> CollectionResult {
-    let mut args = vec!["-o".to_string(), "json".to_string()];
+    let max = max_events.unwrap_or(2000).min(10000) as usize;
+    if max == 0 {
+        return CollectionResult::default();
+    }
+
+    if profile.auth_type.eq_ignore_ascii_case("password") {
+        let mut result = CollectionResult::default();
+        result.errors.push(format!(
+            "Remote SSH password authentication is not implemented for {}. Use SSH key-based auth instead.",
+            profile.host
+        ));
+        return result;
+    }
+
+    let mut args = vec![
+        "--no-pager".to_string(),
+        "-o".to_string(),
+        "json".to_string(),
+    ];
     
     if let Some(start_time) = start {
         args.push("--since".to_string());
@@ -425,6 +443,9 @@ pub fn collect_remote_linux_events(
         args.push("--until".to_string());
         args.push(format_journal_time(end_time));
     }
+
+    args.push("-n".to_string());
+    args.push(max.to_string());
     
     // Remote SSH fetching typically won't allow interactive sudo easily without setup.
     // If request_elevation is true (from ingest profile, passed via channels/etc conceptually), 
@@ -454,7 +475,9 @@ pub fn collect_remote_linux_events(
 
     let mut command = std::process::Command::new("ssh");
     command.args(&ssh_args);
-    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     let mut result = CollectionResult::default();
     let mut child = match command.spawn() {
@@ -473,7 +496,6 @@ pub fn collect_remote_linux_events(
         }
     };
 
-    let max = max_events.unwrap_or(2000) as usize;
     let reader = std::io::BufReader::new(stdout);
     let mut parse_failures = 0usize;
     let mut read_failures = 0usize;
@@ -508,13 +530,73 @@ pub fn collect_remote_linux_events(
         result.warnings.push(format!("Skipped {parse_failures} non-JSON or malformed journal entries remotely."));
     }
 
+    let stderr_text = {
+        let mut text = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        text
+    };
+
     match child.wait() {
-        Ok(status) if status.success() => result,
+        Ok(status) if status.success() => {
+            if result.events.is_empty() && !stderr_text.trim().is_empty() {
+                let stderr_summary = summarize_stderr(stderr_text.as_str());
+                let message = if stderr_looks_like_permission_issue(stderr_text.as_str()) {
+                    if stderr_summary.is_empty() {
+                        format!(
+                            "Remote journalctl on {} requires journal-reader privileges or passwordless sudo.",
+                            profile.host
+                        )
+                    } else {
+                        format!(
+                            "Remote journalctl on {} requires journal-reader privileges or passwordless sudo. {}",
+                            profile.host, stderr_summary
+                        )
+                    }
+                } else if stderr_summary.is_empty() {
+                    format!(
+                        "Remote journalctl on {} completed without events.",
+                        profile.host
+                    )
+                } else {
+                    format!(
+                        "Remote journalctl on {} completed without events. {}",
+                        profile.host, stderr_summary
+                    )
+                };
+
+                if stderr_looks_like_permission_issue(stderr_text.as_str()) {
+                    result.errors.push(message);
+                } else {
+                    result.warnings.push(message);
+                }
+            }
+            result
+        }
         Ok(status) => {
-            let message = format!("ssh exited with status {}", status);
-            // Ignore 255 if events populated (batchmode disconnect)
-            if !status.success() && result.events.is_empty() {
+            let stderr_summary = summarize_stderr(stderr_text.as_str());
+            let message = if stderr_looks_like_permission_issue(stderr_text.as_str()) {
+                if stderr_summary.is_empty() {
+                    format!(
+                        "Remote Linux log collection on {} requires journal-reader privileges or passwordless sudo.",
+                        profile.host
+                    )
+                } else {
+                    format!(
+                        "Remote Linux log collection on {} requires journal-reader privileges or passwordless sudo. {}",
+                        profile.host, stderr_summary
+                    )
+                }
+            } else if stderr_summary.is_empty() {
+                format!("ssh exited with status {}", status)
+            } else {
+                format!("ssh exited with status {}. {}", status, stderr_summary)
+            };
+            if result.events.is_empty() {
                 result.errors.push(message);
+            } else {
+                result.warnings.push(message);
             }
             result
         }

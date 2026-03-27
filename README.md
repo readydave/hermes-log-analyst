@@ -1,19 +1,25 @@
 # Hermes Log Analyst (HLA)
 
-Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing local system events on macOS, Linux, and Windows.
+Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing host and remote system events on macOS, Linux, and Windows.
 
 ## Current capabilities
 
 - OS-aware local event collection defaults to host OS.
-- Event normalization across platforms with local SQLite caching.
+- Event normalization across platforms with local SQLite caching and per-row `source_host` tracking.
 - Real host collectors:
   - Windows: native Event Log API (wevtapi) for Application/System/Security.
   - Linux: `journalctl --since/--until -o json`.
   - macOS: `log show --style json` with start/end range.
+- Remote host collection:
+  - Linux and macOS via SSH.
+  - Windows via WinRM/PowerShell remoting.
+  - Saved remote-host profiles and target switching across data-loading views.
+  - Current supported remote SSH path is key-based auth; interactive SSH password auth is not implemented.
 - Crash workflow:
   - Host crash metadata import (Windows WER + dumps, macOS DiagnosticReports, Linux apport/coredump).
   - Crash correlation against local event timeline.
   - Pre-crash investigation window (5/15/30/60 min) for focused event triage.
+  - Metadata-and-evidence dump analysis for Windows minidumps/kernel dumps and Linux core dumps.
 - Filters:
   - Text, provider/source, severity, category, date range, Windows Event ID, and log type.
 - Data Window:
@@ -28,8 +34,12 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - Auto-sync on startup.
   - Max events per sync.
   - Windows channel selection.
-- LLM settings and discovery (foundation):
+- LLM settings, execution, and discovery:
   - Provider profiles for `ollama`, `lmstudio`, `openai`, `gemini`, `claude`, `perplexity`, and generic `openai-compatible`.
+  - API-key storage in the OS keychain for supported cloud/generic profiles.
+  - Connection testing with detected model lists and preferred/active-model auto-selection.
+  - Saved default LLM profile is preselected in send/RCA windows, with a connection preflight before first analysis use.
+  - Local LLM analysis for selected events and crash RCA packets.
   - Local provider detection for Ollama/LM Studio endpoints.
   - Optional LAN scan for Ollama/LM Studio endpoints on detected private subnets.
   - Preferred provider, trusted-host list, and untrusted-payload guardrail controls.
@@ -47,6 +57,7 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
   - Fixed top and bottom bars with scrollable middle content region.
   - Collector warning banner shown when sync/backfill completes with recoverable collector issues.
   - Home dashboard analytics for timeline, severity, providers, log types, Windows Event IDs, and noisy-source drilldown.
+  - Target-host selection for switching between `localhost` and saved remote profiles.
   - Selected-event `Raw` / `Parsed` message view for structured payload inspection.
 - Export and actions:
   - Export filtered/single events to JSON, CSV, or TXT.
@@ -60,14 +71,15 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing loc
 - Startup can either:
   - load existing cached data only (default), or
   - auto-sync host logs when enabled in settings.
-- `Refresh Logs` pulls the configured ingest window using saved collection profile.
-- `Load Events` in Data Window pulls the selected date range and applies a range-focused view.
+- Selecting a target host in the top bar does not connect immediately; it only changes the active target context.
+- `Refresh Logs` pulls the configured ingest window for `localhost` or the selected remote target using the saved collection profile.
+- `Load Events` in Data Window is fully supported for `localhost`; remote exact-range loading still needs hardening and should not yet be treated as complete remote parity.
 
 ## Launch modes and data source behavior
 
 - `npm run tauri dev` (desktop runtime):
   - Uses real host collectors and SQLite cache.
-  - Supports ingest profile persistence, crash import, and range sync commands.
+  - Supports ingest profile persistence, remote-host targeting, crash import, dump analysis, LLM execution, and range sync commands.
 - `npm run dev` (browser mode):
   - No OS log collection APIs are available.
   - The UI can still be explored with imported JSON/CSV and settings interactions.
@@ -124,10 +136,21 @@ Use these defaults for fast startup with useful breadth:
 - LLM/provider connectivity is not considered release-stable yet:
   - localhost/LAN/cloud profile configuration exists, but end-to-end connection reliability still needs hardening and full cross-platform validation.
   - treat `Copy LLM Prompt` / prompt-only workflows as the fallback path when provider connectivity is unreliable.
+- Remote host collection is implemented, but the credential UX is still rough:
+  - SSH key-path workflows are wired in the Settings UI.
+  - SSH password auth is not implemented for Linux/macOS remote collection.
+  - WinRM/password secret management exists in the backend, but needs a cleaner frontend flow and broader validation.
+  - there is no dedicated `Test Remote Connection` action yet; use `Target Host -> Refresh Logs` as the current live validation path.
+  - remote crash import is not implemented yet.
 - If no events appear for a chosen date range, confirm:
   - `Load Events` completed for that exact range.
   - Filters (date/log type/severity/category/text) are not excluding results.
   - Ingest profile settings are not overly restrictive for your use case.
+- If a remote host refresh returns zero events or fails:
+  - Linux/macOS SSH targets must already be reachable non-interactively (for example via key file or ssh-agent).
+  - Linux remote users must have permission to read `journalctl`.
+  - macOS remote users only see what `log show` permits for that account.
+  - Windows WinRM/password auth still requires backend secret wiring from the frontend before it is operator-ready.
 - During `tauri dev`, this message is typically benign if app behavior is otherwise normal:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
 
@@ -142,5 +165,10 @@ Use these defaults for fast startup with useful breadth:
   - harden local/LAN/cloud endpoint testing and profile application behavior.
   - complete manual validation on Windows, macOS, and Garuda before treating provider flows as production-ready.
 - Deeper crash artifact parsing and optional symbolication pipeline.
-- Remote machine log access (future state): connect to remote host collectors for investigation without mandatory full download.
+- Remote collection hardening:
+  - add a real `Test Remote Connection` action in Settings.
+  - tighten credential UX and validation for SSH/WinRM targets.
+  - decide whether Linux/macOS SSH remains key-only or gains supported password auth.
+  - make remote exact-range `Load Events` target-aware.
+  - expand remote crash import and follow-on investigation workflows.
 - Continue Garuda Linux (Arch-based) packaging/compatibility hardening (AppImage path and install validation).
