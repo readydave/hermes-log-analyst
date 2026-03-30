@@ -16,7 +16,10 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing hos
     - SSH for direct remote-log access when Remote Login is enabled
     - Jamf Pro for managed-device lookup and provider-backed evidence collection
     - Microsoft Intune for managed-device lookup and queued/polling evidence collection
-  - Windows via WinRM/PowerShell remoting.
+  - Windows via:
+    - WinRM for direct PowerShell-remoting collection
+    - Remote Event Log + WMI/DCOM (`RPC/DCOM`) as the first non-WinRM direct fallback
+    - Microsoft Intune for managed-device lookup and queued/polling evidence collection
   - Saved remote-host profiles and target switching across data-loading views.
   - Dedicated remote `Test Connection` flow in Settings for validating transport/provider readiness before a log pull.
   - Current supported remote SSH path is key-based auth; interactive SSH password auth is not implemented.
@@ -145,9 +148,10 @@ Use these defaults for fast startup with useful breadth:
   - SSH key-path workflows are wired in the Settings UI.
   - SSH password auth is not implemented for Linux/macOS remote collection.
   - Jamf Pro and Intune provider tokens can be stored in the OS keychain from Settings.
-  - WinRM/password secret management exists in the backend, but needs a cleaner frontend flow and broader validation.
+  - Windows `WinRM` / `RPC/DCOM` password workflows are now wired to per-profile OS-keychain secret storage.
   - remote crash import is not implemented yet.
   - Jamf Pro / Intune macOS collection currently returns managed-device troubleshooting evidence rather than a true remote `log show` slice.
+  - Windows Intune collection currently returns managed-device troubleshooting evidence rather than live Event Log transport.
 - If no events appear for a chosen date range, confirm:
   - `Load Events` completed for that exact range.
   - Filters (date/log type/severity/category/text) are not excluding results.
@@ -157,7 +161,8 @@ Use these defaults for fast startup with useful breadth:
   - Linux remote users must have permission to read `journalctl`.
   - macOS SSH users only see what `log show` permits for that account.
   - Jamf Pro and Intune macOS targets must exist as uniquely resolvable managed devices for the configured provider account.
-  - Windows WinRM/password auth still requires backend secret wiring from the frontend before it is operator-ready.
+  - Windows `RPC/DCOM` depends on Remote Event Log Management plus WMI/DCOM firewall access on the target.
+  - Windows Intune targets must exist as uniquely resolvable managed devices for the configured provider account.
 - During `tauri dev`, this message is typically benign if app behavior is otherwise normal:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
 
@@ -174,7 +179,8 @@ Use these defaults for fast startup with useful breadth:
 - Deeper crash artifact parsing and optional symbolication pipeline.
 - Remote collection hardening:
   - deepen managed macOS provider collection from inventory/evidence summaries into true remote script-based log gathering.
-  - tighten credential UX and validation for SSH/WinRM targets.
+  - deepen Windows Intune collection beyond inventory/evidence summaries into a richer managed diagnostics payload.
+  - continue tightening credential UX and validation for SSH/WinRM/RPC targets.
   - decide whether Linux/macOS SSH remains key-only or gains supported password auth.
   - make remote exact-range `Load Events` target-aware.
   - expand remote crash import and follow-on investigation workflows.

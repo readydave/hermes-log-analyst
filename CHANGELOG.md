@@ -9,9 +9,13 @@ The project does not currently publish formal version tags for each change group
 ## 2026-03-30
 
 ### Added
+- Windows remote-host protocol expansion in Settings with profile-level support for `WinRM`, `Remote Event Log (RPC/DCOM)`, and `Intune`.
 - macOS remote-host protocol expansion in Settings with profile-level support for `SSH`, `Jamf Pro`, and `Intune`.
 - Separate managed-provider account settings for Jamf Pro and Microsoft Intune with OS-keychain-backed token storage.
 - Real `Test Connection` support for remote profiles:
+  - Windows WinRM live transport/log-read smoke test
+  - Windows RPC/DCOM Event Log + WMI summary smoke test
+  - Windows Intune authentication + device resolution test
   - macOS SSH transport/log-read smoke test
   - Jamf Pro authentication + device resolution test
   - Intune authentication + device resolution test
@@ -22,9 +26,13 @@ The project does not currently publish formal version tags for each change group
 
 ### Changed
 - `Refresh Logs` now adapts its operator messaging for managed macOS targets instead of implying every remote connection behaves like a live SSH session.
+- `Refresh Logs` now adapts operator messaging for Windows direct transports (`WinRM`, `RPC/DCOM`) and Windows Intune managed collection.
 - Remote settings now persist both host profiles and provider-account metadata in a sanitized backend shape while keeping provider secrets out of settings files.
 
 ### Fixed
+- Windows remote-host settings now have a first-class per-profile keychain password workflow for `WinRM` and `RPC/DCOM`.
+- Windows WinRM remote collection now honors time range, channel selection, max-event caps, singleton responses, and appends compact remote system-summary events.
+- Windows RPC/DCOM remote collection now provides a first non-WinRM fallback using remote Event Log queries plus WMI/DCOM system-summary metadata.
 - macOS remote-connection setup no longer forces operators into SSH-only workflows when a managed-device path is more appropriate.
 - Remote configuration now has a first-class path for validating provider-backed macOS profiles before attempting collection.
 

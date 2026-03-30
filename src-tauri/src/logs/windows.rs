@@ -1,8 +1,13 @@
 use super::{CollectionEstimate, CollectionResult, NormalizedEvent, SupportedOs};
+use crate::remote_windows::{
+    build_summary_events, parse_remote_summary_json, summary_hints_from_events,
+};
 use crate::settings::RemoteConnectionProfile;
 #[cfg(target_os = "windows")]
 use chrono::SecondsFormat;
 use chrono::{DateTime, Utc};
+#[cfg(target_os = "windows")]
+use serde_json::Value;
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsStr;
@@ -204,7 +209,7 @@ fn collect_channel_events(
 
     let _query_handle = EvtHandle(handle);
     let mut events = Vec::new();
-    
+
     if max == 0 {
         return Ok(events);
     }
@@ -592,6 +597,317 @@ fn extract_event_data(xml: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
+fn normalize_remote_windows_channels(channels: Option<&[String]>) -> Vec<String> {
+    normalize_channels(channels)
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn build_winrm_collection_script(
+    profile: &RemoteConnectionProfile,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max: u32,
+    channels: &[String],
+) -> Option<String> {
+    let log_names = channels
+        .iter()
+        .map(|channel| format!("'{}'", channel.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let start_value = start
+        .map(|value| format!("[datetime]'{}'", value.to_rfc3339()))
+        .unwrap_or_else(|| "$null".to_string());
+    let end_value = end
+        .map(|value| format!("[datetime]'{}'", value.to_rfc3339()))
+        .unwrap_or_else(|| "$null".to_string());
+
+    let script_block = format!(
+        r#"$Max = {max};
+$LogNames = @({log_names});
+$Start = {start_value};
+$End = {end_value};
+$PerLogMax = [Math]::Max([int][Math]::Ceiling($Max / [Math]::Max($LogNames.Count, 1)), 1);
+$Warnings = @();
+$Collected = foreach ($log in $LogNames) {{
+  $fh = @{{ LogName = $log }};
+  if ($Start) {{ $fh.StartTime = $Start }}
+  if ($End) {{ $fh.EndTime = $End }}
+  try {{
+    Get-WinEvent -FilterHashtable $fh -MaxEvents $PerLogMax -ErrorAction Stop |
+      Select-Object Id, LogName, ProviderName, LevelDisplayName, Message, TimeCreated
+  }} catch {{
+    $Warnings += "Windows '$($log)' channel: $($_.Exception.Message)"
+  }}
+}};
+$Events = @($Collected | Sort-Object TimeCreated -Descending | Select-Object -First $Max | ForEach-Object {{
+  [PSCustomObject]@{{
+    Id = $_.Id
+    LogName = $_.LogName
+    ProviderName = $_.ProviderName
+    LevelDisplayName = $_.LevelDisplayName
+    Message = $_.Message
+    TimeCreated = if ($_.TimeCreated) {{ $_.TimeCreated.ToString('o') }} else {{ $null }}
+  }}
+}});
+$os = $null;
+$cs = $null;
+$hotfixes = @();
+try {{ $os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop }} catch {{}}
+try {{ $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop }} catch {{}}
+try {{ $hotfixes = @(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 3 HotFixID, InstalledOn) }} catch {{}}
+$summary = if ($os -or $cs) {{
+  [PSCustomObject]@{{
+    HostName = if ($os) {{ $os.CSName }} else {{ $env:COMPUTERNAME }}
+    DomainOrWorkgroup = if ($cs) {{ $cs.Domain }} else {{ $null }}
+    OSCaption = if ($os) {{ $os.Caption }} else {{ $null }}
+    OSVersion = if ($os) {{ $os.Version }} else {{ $null }}
+    BuildNumber = if ($os) {{ $os.BuildNumber }} else {{ $null }}
+    Manufacturer = if ($cs) {{ $cs.Manufacturer }} else {{ $null }}
+    Model = if ($cs) {{ $cs.Model }} else {{ $null }}
+    LastBoot = if ($os -and $os.LastBootUpTime) {{ ([Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime)).ToString('o') }} else {{ $null }}
+    UptimeSeconds = if ($os -and $os.LastBootUpTime) {{ [int64](([datetime]::UtcNow) - [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime).ToUniversalTime()).TotalSeconds }} else {{ $null }}
+    RecentHotfixes = $hotfixes
+  }}
+}} else {{ $null }};
+[PSCustomObject]@{{
+  events = $Events
+  warnings = $Warnings
+  summary = $summary
+}} | ConvertTo-Json -Depth 6 -Compress"#,
+    );
+
+    let mut cred_setup = String::new();
+    let mut cred_arg = String::new();
+    if profile.auth_type.eq_ignore_ascii_case("password") && !profile.username.trim().is_empty() {
+        let secret = crate::settings::get_remote_profile_secret(profile.id.as_str())
+            .ok()
+            .flatten()?;
+        cred_setup = format!(
+            "$SecPwd = ConvertTo-SecureString '{}' -AsPlainText -Force; $Cred = New-Object System.Management.Automation.PSCredential ('{}', $SecPwd); ",
+            secret.replace('\'', "''"),
+            profile.username.trim().replace('\'', "''")
+        );
+        cred_arg = "-Credential $Cred".to_string();
+    }
+
+    Some(format!(
+        "{}$sb = [scriptblock]::Create('{}'); Invoke-Command -ComputerName '{}' {} -ScriptBlock $sb",
+        cred_setup,
+        script_block.replace('\'', "''"),
+        profile.host.replace('\'', "''"),
+        cred_arg
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn build_rpc_wevtutil_args(
+    profile: &RemoteConnectionProfile,
+    channel: &str,
+    query: Option<&str>,
+    limit: usize,
+) -> Option<Vec<String>> {
+    let mut args = vec![
+        "qe".to_string(),
+        channel.to_string(),
+        format!("/r:{}", profile.host.trim()),
+        "/rd:true".to_string(),
+        "/f:xml".to_string(),
+        format!("/c:{limit}"),
+    ];
+    if let Some(query) = query {
+        args.push(format!("/q:{query}"));
+    }
+    if profile.auth_type.eq_ignore_ascii_case("password") && !profile.username.trim().is_empty() {
+        let secret = crate::settings::get_remote_profile_secret(profile.id.as_str())
+            .ok()
+            .flatten()?;
+        args.push(format!("/u:{}", profile.username.trim()));
+        args.push(format!("/p:{secret}"));
+    }
+    Some(args)
+}
+
+#[cfg(target_os = "windows")]
+fn build_rpc_wmi_summary_script(profile: &RemoteConnectionProfile) -> Option<String> {
+    let mut credential_setup = String::new();
+    let mut credential_arg = String::new();
+    if profile.auth_type.eq_ignore_ascii_case("password") && !profile.username.trim().is_empty() {
+        let secret = crate::settings::get_remote_profile_secret(profile.id.as_str())
+            .ok()
+            .flatten()?;
+        credential_setup = format!(
+            "$SecPwd = ConvertTo-SecureString '{}' -AsPlainText -Force; $Cred = New-Object System.Management.Automation.PSCredential ('{}', $SecPwd); ",
+            secret.replace('\'', "''"),
+            profile.username.trim().replace('\'', "''")
+        );
+        credential_arg = "-Credential $Cred ".to_string();
+    }
+
+    Some(format!(
+        "{}$os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName '{}' {}-ErrorAction Stop; \
+$cs = Get-WmiObject -Class Win32_ComputerSystem -ComputerName '{}' {}-ErrorAction Stop; \
+$hotfixes = @(); try {{ $hotfixes = @(Get-WmiObject -Class Win32_QuickFixEngineering -ComputerName '{}' {}-ErrorAction Stop | Sort-Object InstalledOn -Descending | Select-Object -First 3 HotFixID, InstalledOn) }} catch {{}}; \
+[PSCustomObject]@{{ \
+HostName = $os.CSName; \
+DomainOrWorkgroup = $cs.Domain; \
+OSCaption = $os.Caption; \
+OSVersion = $os.Version; \
+BuildNumber = $os.BuildNumber; \
+Manufacturer = $cs.Manufacturer; \
+Model = $cs.Model; \
+LastBoot = if ($os.LastBootUpTime) {{ ([Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime)).ToString('o') }} else {{ $null }}; \
+UptimeSeconds = if ($os.LastBootUpTime) {{ [int64](([datetime]::UtcNow) - [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime).ToUniversalTime()).TotalSeconds }} else {{ $null }}; \
+RecentHotfixes = $hotfixes \
+}} | ConvertTo-Json -Depth 5 -Compress",
+        credential_setup,
+        profile.host.replace('\'', "''"),
+        credential_arg,
+        profile.host.replace('\'', "''"),
+        credential_arg,
+        profile.host.replace('\'', "''"),
+        credential_arg
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn parse_winrm_warning_list(value: &Value) -> Vec<String> {
+    value
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn parse_winrm_events(value: &Value, source_host: &str) -> Vec<NormalizedEvent> {
+    let events_value = value.get("events").unwrap_or(value);
+    let items = match events_value {
+        Value::Array(entries) => entries.clone(),
+        Value::Object(_) => vec![events_value.clone()],
+        _ => Vec::new(),
+    };
+
+    let mut events = Vec::new();
+    for item in items {
+        let log_name = item
+            .get("LogName")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let provider = item
+            .get("ProviderName")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = item
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or("No event message.");
+        let level = item
+            .get("LevelDisplayName")
+            .and_then(Value::as_str)
+            .unwrap_or("Information");
+        let event_id = item
+            .get("Id")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        let time = item
+            .get("TimeCreated")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let severity = match level.to_ascii_lowercase().as_str() {
+            "critical" => "critical",
+            "error" => "error",
+            "warning" => "warning",
+            _ => "information",
+        };
+
+        let mut event = NormalizedEvent::new(
+            SupportedOs::Windows,
+            log_name,
+            map_category(log_name),
+            provider,
+            event_id,
+            severity,
+            sanitize_message(message),
+            source_host,
+        );
+        if !time.is_empty() {
+            event.timestamp = time.to_string();
+        }
+        event.assign_stable_id();
+        events.push(event);
+    }
+    events
+}
+
+#[cfg(target_os = "windows")]
+fn extract_remote_event_fragments(xml: &str) -> Vec<String> {
+    let mut cursor = xml;
+    let mut fragments = Vec::new();
+    while let Some(start) = cursor.find("<Event") {
+        let after_start = &cursor[start..];
+        let Some(end) = after_start.find("</Event>") else {
+            break;
+        };
+        let fragment_end = start + end + "</Event>".len();
+        fragments.push(cursor[start..fragment_end].to_string());
+        cursor = &cursor[fragment_end..];
+    }
+    fragments
+}
+
+#[cfg(target_os = "windows")]
+fn render_remote_xml_fragment(
+    xml: &str,
+    fallback_channel: &str,
+    source_host: &str,
+) -> Option<NormalizedEvent> {
+    let provider =
+        extract_xml_attr(xml, "Provider", "Name").unwrap_or_else(|| "Unknown Provider".to_string());
+    let log_name =
+        extract_xml_tag_value(xml, "Channel").unwrap_or_else(|| fallback_channel.to_string());
+    let event_id =
+        extract_xml_tag_value(xml, "EventID").and_then(|value| value.parse::<u32>().ok());
+    let level = extract_xml_tag_value(xml, "Level").and_then(|value| value.parse::<u32>().ok());
+    let severity = map_severity(level);
+    let category = map_category(&log_name);
+    let message = extract_event_data(xml).unwrap_or_else(|| {
+        "Rendered Windows message unavailable over RPC/DCOM collection.".to_string()
+    });
+
+    let mut event = NormalizedEvent::new(
+        SupportedOs::Windows,
+        log_name.as_str(),
+        category,
+        provider.as_str(),
+        event_id,
+        severity,
+        sanitize_message(message.as_str()),
+        source_host,
+    );
+    if let Some(timestamp) = extract_xml_attr(xml, "TimeCreated", "SystemTime") {
+        event.timestamp = timestamp;
+    }
+    event.assign_stable_id();
+    Some(event)
+}
+
+#[cfg(target_os = "windows")]
+fn sort_and_cap_remote_events(events: &mut Vec<NormalizedEvent>, max: usize) {
+    events.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    events.truncate(max);
+}
+
+#[cfg(target_os = "windows")]
 fn extract_segment_attr(segment: &str, attr: &str) -> Option<String> {
     let double = format!("{attr}=\"");
     if let Some(start) = segment.find(&double) {
@@ -629,152 +945,221 @@ fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
 
-
 #[cfg(target_os = "windows")]
 pub fn collect_remote_windows_events(
     profile: &RemoteConnectionProfile,
-    _start: Option<DateTime<Utc>>,
-    _end: Option<DateTime<Utc>>,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max_events: Option<u32>,
+    channels: Option<&[String]>,
+) -> CollectionResult {
+    if profile.protocol.eq_ignore_ascii_case("rpc") {
+        collect_remote_windows_events_rpc(profile, start, end, max_events, channels)
+    } else {
+        collect_remote_windows_events_winrm(profile, start, end, max_events, channels)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_remote_windows_events_winrm(
+    profile: &RemoteConnectionProfile,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
     max_events: Option<u32>,
     channels: Option<&[String]>,
 ) -> CollectionResult {
     let mut result = CollectionResult::default();
-    let max = max_events.unwrap_or(2000);
-    
-    let default_channels = vec!["Application".to_string(), "System".to_string(), "Security".to_string()];
-    let channel_list = channels
-        .map(|c| c.to_vec())
-        .unwrap_or(default_channels)
-        .iter()
-        .map(|c| format!("'{}'", c))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    // A simpler filter payload using XPath could be used, but since we map heavily, simple parameters work.
-    let script_block = format!(
-        r#"$Max = {};
-          $LogNames = @({});
-          $Events = Get-WinEvent -LogName $LogNames -MaxEvents $Max -ErrorAction SilentlyContinue;
-          $Result = @();
-          foreach ($e in $Events) {{
-             $Result += [PSCustomObject]@{{
-                 Id = $e.Id
-                 LogName = $e.LogName
-                 ProviderName = $e.ProviderName
-                 LevelDisplayName = $e.LevelDisplayName
-                 Message = $e.Message
-                 TimeCreated = $e.TimeCreated.ToString('o')
-             }}
-          }}
-          $Result | ConvertTo-Json -Depth 2 -Compress"#,
-        max,
-        channel_list
-    );
-
-    // If we need explicit password, we'd build a PSCredential here. 
-    // For now, assume domain auth context (No explicit password flag needed, just ComputerName) unless specified.
-let mut cred_setup = String::new();
-    let mut cred_arg = String::new();
-    
-    if profile.auth_type == "password" && !profile.username.is_empty() {
-        if let Ok(Some(secret)) = crate::settings::get_remote_profile_secret(&profile.id) {
-            cred_setup = format!(
-                "$SecPwd = ConvertTo-SecureString '{}' -AsPlainText -Force; $Cred = New-Object System.Management.Automation.PSCredential ('{}', $SecPwd); ",
-                secret.replace("'", "''"),
-                profile.username.replace("'", "''")
-            );
-            cred_arg = "-Credential $Cred".to_string();
-        } else {
-            result.errors.push(format!(
-                "WinRM password authentication for {} requires a stored remote secret, but no secret is configured in the OS keychain.",
-                profile.host
-            ));
-            return result;
-        }
-    }
-
-    let wrapper_script = format!(
-        "{}$sb = [scriptblock]::Create('{}'); Invoke-Command -ComputerName '{}' {} -ScriptBlock $sb",
-        cred_setup,
-        script_block.replace("'", "''"),
-        profile.host.replace("'", "''"),
-        cred_arg
-    );
+    let max = max_events.unwrap_or(2000).clamp(1, 20000);
+    let selected_channels = normalize_remote_windows_channels(channels);
+    let Some(wrapper_script) =
+        build_winrm_collection_script(profile, start, end, max, selected_channels.as_slice())
+    else {
+        result
+            .errors
+            .push(format!("WinRM password authentication for {} requires a stored remote secret in the OS keychain.", profile.host));
+        return result;
+    };
 
     let output = match std::process::Command::new("powershell")
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
-        .arg(&wrapper_script)
-        .output() 
+        .arg(wrapper_script)
+        .output()
     {
         Ok(out) => out,
-        Err(e) => {
-            result.errors.push(format!("Failed to execute powershell: {}", e));
+        Err(error) => {
+            result.errors.push(format!(
+                "Failed to execute PowerShell for WinRM collection: {error}"
+            ));
             return result;
         }
     };
 
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if err.to_ascii_lowercase().contains("access is denied") {
-            result.warnings.push(format!("Access Denied connecting to {}. Verify credentials/WinRM.", profile.host));
+            result.warnings.push(format!(
+                "WinRM reached {}, but the account was denied access. {}",
+                profile.host, err
+            ));
         } else {
-            result.errors.push(format!("WinRM error on {}: {}", profile.host, err));
+            result
+                .errors
+                .push(format!("WinRM error on {}: {}", profile.host, err));
         }
         return result;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim().is_empty() {
-        return result; // No events
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return result;
     }
 
-    match serde_json::from_str::<serde_json::Value>(&stdout) {
-        Ok(serde_json::Value::Array(arr)) => {
-            for item in arr {
-                let log_name = item.get("LogName").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let provider = item.get("ProviderName").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let message = item.get("Message").and_then(|v| v.as_str()).unwrap_or("No message.");
-                let level = item.get("LevelDisplayName").and_then(|v| v.as_str()).unwrap_or("Information");
-                let event_id = item.get("Id").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let time = item.get("TimeCreated").and_then(|v| v.as_str()).unwrap_or("");
+    let Ok(parsed) = serde_json::from_str::<Value>(stdout.as_str()) else {
+        result
+            .errors
+            .push("Failed to parse WinRM JSON output.".to_string());
+        return result;
+    };
 
-                let severity = match level.to_ascii_lowercase().as_str() {
-                    "error" | "critical" => "Error",
-                    "warning" => "Warning",
-                    "verbose" => "Information",
-                    _ => "Information",
-                };
-                
-                let mut ev = NormalizedEvent::new(
-                    SupportedOs::Windows,
-                    log_name,
-                    map_category(log_name),
-                    provider,
-                    event_id,
-                    severity,
-                    sanitize_message(message),
-                    &profile.host,
-                );
-                
-                if !time.is_empty() {
-                    ev.timestamp = time.to_string();
-                }
+    for warning in parse_winrm_warning_list(&parsed) {
+        if warning.to_ascii_lowercase().contains("access is denied")
+            || warning.to_ascii_lowercase().contains("access denied")
+        {
+            result.warnings.push(warning);
+        } else {
+            result.errors.push(warning);
+        }
+    }
 
-                ev.assign_stable_id();
+    for event in parse_winrm_events(&parsed, profile.host.as_str()) {
+        result.events.push(event);
+    }
 
-                result.events.push(ev);
+    if let Some(summary) = parsed
+        .get("summary")
+        .and_then(|value| parse_remote_summary_json(value.to_string().as_str()))
+    {
+        let hints = summary_hints_from_events(result.events.as_slice());
+        result.events.extend(build_summary_events(
+            &summary,
+            profile.host.as_str(),
+            "WinRM",
+            hints.as_slice(),
+        ));
+    }
+
+    sort_and_cap_remote_events(&mut result.events, max as usize);
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn collect_remote_windows_events_rpc(
+    profile: &RemoteConnectionProfile,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max_events: Option<u32>,
+    channels: Option<&[String]>,
+) -> CollectionResult {
+    let mut result = CollectionResult::default();
+    let max = max_events.unwrap_or(2000).clamp(1, 20000) as usize;
+    let selected_channels = normalize_remote_windows_channels(channels);
+    let per_channel_max =
+        ((max + selected_channels.len().saturating_sub(1)) / selected_channels.len().max(1)).max(1);
+    let query = build_time_query(start, end);
+
+    for channel in selected_channels {
+        let Some(args) =
+            build_rpc_wevtutil_args(profile, channel.as_str(), query.as_deref(), per_channel_max)
+        else {
+            result.errors.push(format!(
+                "RPC/DCOM password authentication for {} requires a stored remote secret in the OS keychain.",
+                profile.host
+            ));
+            return result;
+        };
+        let output = match std::process::Command::new("wevtutil").args(&args).output() {
+            Ok(output) => output,
+            Err(error) => {
+                result.errors.push(format!(
+                    "Failed to execute wevtutil for {}: {}",
+                    channel, error
+                ));
+                continue;
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.to_ascii_lowercase().contains("access is denied")
+                || stderr.to_ascii_lowercase().contains("0x5")
+            {
+                result.warnings.push(format!(
+                    "Access denied reading Windows '{}' channel on {} via RPC/DCOM. {}",
+                    channel, profile.host, stderr
+                ));
+            } else {
+                result.errors.push(format!(
+                    "RPC/DCOM query failed for Windows '{}' channel on {}. {}",
+                    channel, profile.host, stderr
+                ));
+            }
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for fragment in extract_remote_event_fragments(stdout.as_ref()) {
+            if let Some(event) = render_remote_xml_fragment(
+                fragment.as_str(),
+                channel.as_str(),
+                profile.host.as_str(),
+            ) {
+                result.events.push(event);
             }
         }
-        Ok(_) => {
-            // Unlikely, but if only one event matches, it might return a single object, not array.
-            result.warnings.push("Only one event matched. Need to handle singleton parsing.".to_string());
-        }
-        Err(e) => {
-            result.errors.push(format!("Failed to parse WinRM json output: {}", e));
-        }
     }
 
+    if let Some(summary_script) = build_rpc_wmi_summary_script(profile) {
+        match std::process::Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(summary_script)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Some(summary) = parse_remote_summary_json(stdout.as_str()) {
+                    let hints = summary_hints_from_events(result.events.as_slice());
+                    result.events.extend(build_summary_events(
+                        &summary,
+                        profile.host.as_str(),
+                        "RPC/DCOM",
+                        hints.as_slice(),
+                    ));
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                result.warnings.push(format!(
+                    "RPC/DCOM collected Event Logs from {}, but WMI summary access failed. {}",
+                    profile.host, stderr
+                ));
+            }
+            Err(error) => {
+                result.warnings.push(format!(
+                    "RPC/DCOM collected Event Logs from {}, but PowerShell WMI summary could not start: {}",
+                    profile.host, error
+                ));
+            }
+        }
+    } else {
+        result.warnings.push(format!(
+            "RPC/DCOM summary collection for {} requires a stored password secret when explicit credentials are selected.",
+            profile.host
+        ));
+    }
+
+    sort_and_cap_remote_events(&mut result.events, max);
     result
 }

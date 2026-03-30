@@ -35,9 +35,11 @@ import {
   listLlmNetworkInterfaces,
   getRemoteSettings,
   saveRemoteSettings,
+  saveRemoteProfileSecret,
   saveRemoteProviderSecret,
   restartElevated,
   openPathInShell,
+  clearRemoteProfileSecret,
   clearRemoteProviderSecret,
   testRemoteConnection
 } from "./lib/backend";
@@ -1387,6 +1389,7 @@ export default function App() {
     providerAccounts: []
   });
   const [remoteProviderTokenDrafts, setRemoteProviderTokenDrafts] = useState<Record<string, string>>({});
+  const [remoteProfileSecretDrafts, setRemoteProfileSecretDrafts] = useState<Record<string, string>>({});
   const [remoteConnectionResults, setRemoteConnectionResults] = useState<Record<string, RemoteConnectionTestResult>>({});
   const [isTestingRemoteProfile, setIsTestingRemoteProfile] = useState(false);
   useEffect(() => {
@@ -2325,6 +2328,12 @@ export default function App() {
       setExportStatus("Running Jamf Pro managed collection for the selected Mac...");
     } else if (activeRemoteProfile?.os === "macos" && activeRemoteProfile.protocol === "intune") {
       setExportStatus("Submitting and polling Intune managed collection for the selected Mac...");
+    } else if (activeRemoteProfile?.os === "windows" && activeRemoteProfile.protocol === "winrm") {
+      setExportStatus("Running direct WinRM collection for the selected Windows host...");
+    } else if (activeRemoteProfile?.os === "windows" && activeRemoteProfile.protocol === "rpc") {
+      setExportStatus("Running Remote Event Log and WMI collection via RPC/DCOM for the selected Windows host...");
+    } else if (activeRemoteProfile?.os === "windows" && activeRemoteProfile.protocol === "intune") {
+      setExportStatus("Submitting and polling Intune managed collection for the selected Windows host...");
     }
 
     try {
@@ -3366,6 +3375,12 @@ export default function App() {
           return acc;
         }, {})
       );
+      setRemoteProfileSecretDrafts((current) =>
+        saved.profiles.reduce<Record<string, string>>((acc, profile) => {
+          acc[profile.id] = current[profile.id] ?? "";
+          return acc;
+        }, {})
+      );
       setExportStatus("Remote settings saved successfully.");
       window.setTimeout(() => setExportStatus(""), 2500);
     } catch (e: any) {
@@ -3420,6 +3435,44 @@ export default function App() {
     }
   }
 
+  async function saveRemoteProfileSecretNow(profile: RemoteConnectionProfile): Promise<void> {
+    const secret = (remoteProfileSecretDrafts[profile.id] || "").trim();
+    if (!secret) {
+      setLastError(`Enter a password for ${profile.name} first.`);
+      return;
+    }
+    try {
+      await saveRemoteProfileSecret(profile.id, secret);
+      setRemoteSettingsState((prev) => ({
+        ...prev,
+        profiles: prev.profiles.map((entry) =>
+          entry.id === profile.id ? { ...entry, secretConfigured: true } : entry
+        )
+      }));
+      setRemoteProfileSecretDrafts((prev) => ({ ...prev, [profile.id]: "" }));
+      setExportStatus(`${profile.name} remote secret saved to OS keychain.`);
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : `Failed to save remote secret for ${profile.name}.`);
+    }
+  }
+
+  async function clearRemoteProfileSecretNow(profile: RemoteConnectionProfile): Promise<void> {
+    try {
+      await clearRemoteProfileSecret(profile.id);
+      setRemoteSettingsState((prev) => ({
+        ...prev,
+        profiles: prev.profiles.map((entry) =>
+          entry.id === profile.id ? { ...entry, secretConfigured: false } : entry
+        )
+      }));
+      setExportStatus(`${profile.name} remote secret removed from OS keychain.`);
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : `Failed to clear remote secret for ${profile.name}.`);
+    }
+  }
+
   async function testSelectedRemoteProfile(): Promise<void> {
     if (!selectedRemoteProfile) return;
     setLastError("");
@@ -3462,7 +3515,8 @@ export default function App() {
       protocol: "ssh",
       username: "root",
       sshKeyPath: "",
-      authType: "key"
+      authType: "key",
+      secretConfigured: false
     };
     setRemoteSettingsState(prev => ({ ...prev, profiles: [...prev.profiles, newProfile] }));
     setRemoteSelectedId(newProfile.id);
@@ -3492,7 +3546,7 @@ export default function App() {
           current.providerLastResolvedAt = null;
           current.providerLastResolvedName = null;
         }
-        if (value === "windows" && current.protocol !== "winrm") {
+        if (value === "windows" && !["winrm", "rpc", "intune"].includes(current.protocol)) {
           current.protocol = "winrm";
           current.providerDeviceId = null;
           current.providerLastResolvedAt = null;
@@ -3505,7 +3559,7 @@ export default function App() {
           current.sshKeyPath = "";
           current.authType = "key";
         }
-        if (value === "ssh") {
+        if (value === "ssh" || value === "winrm" || value === "rpc") {
           current.providerDeviceId = null;
           current.providerLastResolvedAt = null;
           current.providerLastResolvedName = null;
@@ -3535,7 +3589,9 @@ export default function App() {
     }
     if (profile.os === "windows") {
       return [
-        { id: "winrm", label: "WinRM (HTTPS)" }
+        { id: "winrm", label: "WinRM" },
+        { id: "rpc", label: "Remote Event Log (RPC/DCOM)" },
+        { id: "intune", label: "Intune" }
       ];
     }
     return [{ id: "ssh", label: "SSH" }];
@@ -3550,6 +3606,12 @@ export default function App() {
       ? "Collecting via Jamf..."
       : activeTargetProfile?.os === "macos" && activeTargetProfile.protocol === "intune"
         ? "Polling Intune..."
+        : activeTargetProfile?.os === "windows" && activeTargetProfile.protocol === "rpc"
+          ? "Collecting via RPC/DCOM..."
+          : activeTargetProfile?.os === "windows" && activeTargetProfile.protocol === "winrm"
+            ? "Refreshing via WinRM..."
+            : activeTargetProfile?.os === "windows" && activeTargetProfile.protocol === "intune"
+              ? "Polling Intune..."
         : "Refreshing..."
     : "Refresh Logs";
 
@@ -4531,7 +4593,7 @@ export default function App() {
                           <div className="text-xs text-muted">
                             {account.provider === "jamf"
                               ? "Managed macOS collection and device lookup for Jamf Pro."
-                              : "Managed macOS collection and queued/polling checks for Microsoft Intune."}
+                              : "Managed device lookup and queued/polling collection checks for Microsoft Intune."}
                           </div>
                         </div>
                         <label className="flex items-center gap-2 text-xs text-muted">
@@ -4673,8 +4735,21 @@ export default function App() {
                               </label>
                               <label className="text-xs text-muted">Auth Type
                                 <select className={selectClass} value={selectedRemoteProfile.authType} onChange={e => updateSelectedRemoteProfile("authType", e.target.value)}>
-                                  <option value="password">Password</option>
-                                  <option value="key">Certificate / Keychain</option>
+                                  <option value="key">Current user / integrated</option>
+                                  <option value="password">Stored password</option>
+                                </select>
+                              </label>
+                            </>
+                          )}
+                          {selectedRemoteProfile.protocol === "rpc" && (
+                            <>
+                              <label className="text-xs text-muted">Username
+                                <input className={inputClass} value={selectedRemoteProfile.username} onChange={e => updateSelectedRemoteProfile("username", e.target.value)} />
+                              </label>
+                              <label className="text-xs text-muted">Auth Type
+                                <select className={selectClass} value={selectedRemoteProfile.authType} onChange={e => updateSelectedRemoteProfile("authType", e.target.value)}>
+                                  <option value="key">Current user / integrated</option>
+                                  <option value="password">Stored password</option>
                                 </select>
                               </label>
                             </>
@@ -4690,14 +4765,59 @@ export default function App() {
                             SSH password authentication is not implemented yet. Use SSH key-based auth for Linux/macOS remote collection.
                           </div>
                         )}
-                        {(selectedRemoteProfile.protocol === "jamf" || selectedRemoteProfile.protocol === "intune") && (
+                        {(selectedRemoteProfile.protocol === "jamf" || (selectedRemoteProfile.os === "macos" && selectedRemoteProfile.protocol === "intune")) && (
                           <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
                             This macOS profile uses provider-backed device lookup by the Host field above. `Refresh Logs` collects managed-device troubleshooting evidence rather than a direct SSH session.
                           </div>
                         )}
-                        {selectedRemoteProfile.protocol === "winrm" && selectedRemoteProfile.authType === "password" && (
+                        {selectedRemoteProfile.os === "windows" && selectedRemoteProfile.protocol === "intune" && (
                           <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
-                            WinRM password auth requires a stored remote secret, but the frontend secret workflow is not wired yet.
+                            This Windows profile uses Microsoft Intune device lookup by the Host field above. `Refresh Logs` submits a managed asynchronous collection path rather than a live remote shell session.
+                          </div>
+                        )}
+                        {selectedRemoteProfile.protocol === "rpc" && (
+                          <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                            RPC/DCOM uses Remote Event Log plus WMI/DCOM access. The target may require firewall rules for Remote Event Log Management and WMI.
+                          </div>
+                        )}
+                        {(selectedRemoteProfile.protocol === "winrm" || selectedRemoteProfile.protocol === "rpc") && selectedRemoteProfile.authType === "password" && (
+                          <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                            Password-based Windows remote access uses the OS keychain. Save the password below before testing the connection.
+                          </div>
+                        )}
+                        {(selectedRemoteProfile.protocol === "winrm" || selectedRemoteProfile.protocol === "rpc") && selectedRemoteProfile.authType === "password" && (
+                          <div className="grid gap-2 rounded-lg border border-panel-border bg-panel p-3">
+                            <label className="text-xs text-muted">
+                              Remote password (stored in OS keychain)
+                              <input
+                                className={inputClass}
+                                type="password"
+                                value={remoteProfileSecretDrafts[selectedRemoteProfile.id] ?? ""}
+                                placeholder={
+                                  selectedRemoteProfile.secretConfigured
+                                    ? "Configured in keychain (enter to replace)"
+                                    : "Enter remote account password"
+                                }
+                                onChange={(e) =>
+                                  setRemoteProfileSecretDrafts((prev) => ({
+                                    ...prev,
+                                    [selectedRemoteProfile.id]: e.target.value
+                                  }))
+                                }
+                              />
+                            </label>
+                            <div className="flex flex-wrap gap-2">
+                              <Button size="sm" onClick={() => void saveRemoteProfileSecretNow(selectedRemoteProfile)}>
+                                Save Password
+                              </Button>
+                              <Button
+                                size="sm"
+                                onClick={() => void clearRemoteProfileSecretNow(selectedRemoteProfile)}
+                                disabled={!selectedRemoteProfile.secretConfigured}
+                              >
+                                Clear Password
+                              </Button>
+                            </div>
                           </div>
                         )}
                         {selectedRemoteProviderAccount && (

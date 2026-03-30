@@ -10,7 +10,7 @@
 ## Current Product State
 - Desktop-first log triage app with real host collectors and local SQLite cache.
 - Target switching now allows operators to move between `localhost` and saved remote hosts from the main data workflows.
-- Settings now include remote-host connection profiles (SSH/WinRM/Jamf/Intune), remote provider accounts with keychain-backed tokens, and LLM provider profiles with keychain-backed API-key storage.
+- Settings now include remote-host connection profiles (SSH/WinRM/RPC/Jamf/Intune), remote provider accounts with keychain-backed tokens, and LLM provider profiles with keychain-backed API-key storage.
 - LLM send/RCA windows now preselect the saved default compatible profile and run a quick connection preflight on first use before sending analysis traffic.
 - UI layout now keeps top action bar and bottom selected-event bar always visible.
 - Middle content region is scrollable so Filters/Data Window do not hide core actions.
@@ -30,7 +30,10 @@
   - macOS: `log show --style json`.
   - Remote Linux/macOS collection via SSH.
   - Managed macOS provider-backed collection via Jamf Pro and Microsoft Intune for device lookup and troubleshooting evidence retrieval.
-  - Remote Windows collection via WinRM/PowerShell remoting.
+  - Remote Windows collection via:
+    - WinRM/PowerShell remoting
+    - Remote Event Log + WMI/DCOM (`RPC/DCOM`) fallback
+    - Microsoft Intune managed-device evidence collection
   - Remote collector stderr/auth failures now surface as explicit warnings/errors instead of silently looking like `0` collected events.
 - Crash workflow:
   - host crash import (metadata-first)
@@ -62,7 +65,8 @@
   - remote host profiles (`remote_settings.json`)
   - remote provider accounts (`remote_settings.json`) with secrets/tokens kept in the OS keychain
   - LLM profiles/settings (`llm_settings.json`)
-  - remote-host settings now round-trip with the sanitized backend shape (camelCase) and the Settings view auto-selects the first saved remote profile on load
+- remote-host settings now round-trip with the sanitized backend shape (camelCase) and the Settings view auto-selects the first saved remote profile on load
+- Windows remote-host profiles now surface per-profile OS-keychain password status and save/clear actions for `WinRM` and `RPC/DCOM`.
 - Diagnostics logging:
   - daily JSONL diagnostics logs (`diagnostics-YYYY-MM-DD.log`)
   - automatic 7-day retention prune on startup/day rollover
@@ -93,7 +97,7 @@
 ## Runtime Behavior
 - `npm run tauri dev`:
   - full host collection and persistence enabled
-  - remote host targeting is enabled for configured SSH/WinRM profiles
+  - remote host targeting is enabled for configured SSH/WinRM/RPC/managed-provider profiles
   - startup auto-sync runs if enabled in ingest profile
   - LLM profile testing and local analysis execution are available
   - diagnostics logger initializes at startup and prunes stale log files older than 7 days
@@ -113,14 +117,14 @@
   - local/LAN/cloud profile plumbing exists, but end-to-end connectivity is still inconsistent enough to require manual validation and hardening.
   - localhost detection and LAN scan results should be treated as advisory until revalidated on Windows, macOS, and Garuda with real providers.
   - prompt-only / copy-prompt workflows remain the dependable fallback when provider connection attempts fail.
-- Remote host support is implemented, but the credential workflow is incomplete:
+- Remote host support is implemented, but some credential and parity work remains:
   - SSH key-path configuration is exposed in the UI and is the only supported remote SSH auth path today.
   - interactive SSH password auth is not implemented for Linux/macOS remote collection.
-  - backend keychain support exists for remote secrets/tokens, but WinRM/password UX still needs frontend wiring and validation.
   - selecting a remote target in the top bar does not connect by itself; the operator must click `Refresh Logs`.
   - exact-range `Load Events` is not fully target-aware for remote hosts yet.
   - remote crash import is still local-only.
   - Jamf Pro and Intune macOS paths currently provide managed-device troubleshooting evidence, not true remote unified-log script execution yet.
+  - Windows Intune currently provides managed-device troubleshooting evidence, not true live Event Log transport yet.
 - `cargo audit` reports no vulnerabilities, but Linux-target transitive GTK3 dependencies are flagged as unmaintained/unsound informational warnings via Tauri/Wry stack.
 - Common terminal message during `tauri dev` is usually benign:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
@@ -140,14 +144,21 @@
   - Intune auth + managed-device resolution
 - Jamf Pro and Intune provider accounts can be configured separately in Settings and store their tokens in the OS keychain.
 - Managed macOS profile tests now cache provider device ID, resolved name, and resolution timestamp back into the profile.
-- Remote Windows collection uses WinRM/PowerShell remoting.
+- Remote Windows collection now supports:
+  - WinRM live transport
+  - RPC/DCOM Event Log + WMI fallback
+  - Intune managed-device lookup/evidence path
+- Dedicated `Test Connection` now validates live Windows protocol readiness:
+  - WinRM remote command + log-read smoke test
+  - RPC/DCOM Event Log + WMI summary smoke test
+  - Intune auth + managed-device resolution
 - Remote Linux/macOS collector stderr is now surfaced so permission/auth failures do not masquerade as successful zero-event refreshes.
 - A live remote macOS refresh returned `2000` events on this Linux controller machine without an interactive password prompt, which is consistent with the current non-interactive SSH path using an already available key/agent credential rather than password auth.
 
 ### What Is Not Implemented Yet
 - SSH password auth is not implemented for Linux/macOS remote collection.
-- WinRM password auth cannot be completed end to end from the UI because remote secret set/clear flows are not wired in frontend settings.
 - Jamf Pro and Intune do not yet execute a true remote read-only log collection script; they currently return management-backed troubleshooting evidence into the normalized event flow.
+- Windows Intune does not yet execute a true managed remote Event Log retrieval script; it currently returns management-backed troubleshooting evidence into the normalized event flow.
 - Exact-range `Load Events` is not fully target-aware for remote hosts.
 - Remote crash import is not implemented; current crash import always runs against the local machine.
 
@@ -155,17 +166,14 @@
 1. Deepen managed macOS provider collection:
    - Jamf Pro read-only script execution for `log show` slice + crash/report metadata
    - Intune queued/polling script execution path with operator-visible job state
-2. Implement frontend remote secret UX:
-   - save/remove remote password in OS keychain
-   - clear status/error messaging for WinRM password auth
-3. Decide and implement one supported Linux/macOS password strategy if password-based SSH must be supported:
+2. Decide and implement one supported Linux/macOS password strategy if password-based SSH must be supported:
    - otherwise explicitly document SSH key-only support as the intended product behavior
-4. Make Data view range sync fully remote-aware so `Load Events` respects the selected remote target.
-5. Add remote crash import and remote crash follow-on investigation parity.
-6. Add better target-switch UX:
+3. Make Data view range sync fully remote-aware so `Load Events` respects the selected remote target.
+4. Add remote crash import and remote crash follow-on investigation parity.
+5. Add better target-switch UX:
    - after choosing a remote host, explain that `Refresh Logs` is the next step
    - show the selected target more prominently in Data/Crashes workflows
-7. Validate live remote collectors on all three remote OS families with failure-mode coverage:
+6. Validate live remote collectors on all three remote OS families with failure-mode coverage:
    - unreachable host / DNS failure
    - wrong username
    - missing or unreadable SSH key
@@ -174,14 +182,15 @@
    - macOS `log show` privilege limitations
    - Jamf Pro auth failure / device not found / ambiguous hostname / inventory API denial
    - Intune auth failure / device not found / ambiguous hostname / queued-result timeout
-   - WinRM disabled / firewall blocked / bad credential / bad certificate path
+   - WinRM disabled / firewall blocked / bad credential
+   - RPC/DCOM remote Event Log blocked / WMI blocked / RPC unavailable / firewall blocked / Security-log denied
    - zero-event windows vs actual auth/permission failures
 
 ## Objective Recheck (2026-02-09)
 - 1) UX polish (coverage hint + out-of-range warning): `done`
 - 2) Crash importers (metadata-first): `done`
 - 3) Performance (virtualized table rows): `done`
-- 4) Remote machine support (SSH/WinRM): `done (initial implementation)`
+- 4) Remote machine support (SSH/WinRM/RPC): `done (initial implementation)`
 - Notes:
   - Collectors objective is complete (native Windows/macOS/Linux collectors in place).
   - Crash correlation supports host-imported metadata.
@@ -192,12 +201,12 @@
 1. Stabilize LLM/provider connectivity across localhost, LAN, and cloud profiles; revalidate on Windows, macOS, and Garuda with live providers.
    - When local or LAN Ollama/LM Studio providers are detected and applied, auto-select the currently loaded/available model as the default model for that profile instead of leaving a stale or mismatched model value.
 2. Harden remote-host workflows:
-   - finish remote secret UX for WinRM/password-backed connections
    - deepen Jamf/Intune macOS collection beyond inventory-backed evidence into true script-based collection
+   - deepen Windows Intune collection beyond inventory-backed evidence into richer managed diagnostics
    - decide whether Linux/macOS remote SSH remains key-only or gains supported password auth
    - make exact-range `Load Events` target-aware for remote hosts
    - implement remote crash import
-   - validate SSH/WinRM collectors against real macOS, Windows, and Linux hosts plus failure modes
+   - validate SSH/WinRM/RPC collectors against real macOS, Windows, and Linux hosts plus failure modes
 3. Enrich crash importers with deeper minidump/panic/core parsing and optional symbolication.
 4. Add ingest diagnostics in UI (per-channel counts + timing).
 5. After the above items, target Garuda Linux (Arch-based) validation and compatibility hardening.
@@ -540,7 +549,7 @@ Result:
 - Platform status: `pass`
 - Blockers:
   - Remote SSH validation against a real Linux target was not completed in this pass.
-  - WinRM/password secret UX is still incomplete and remains outside Linux validation scope.
+  - Windows direct remote validation (`WinRM` / `RPC/DCOM`) still remained outside this Linux validation pass.
   - Deterministic GUI action automation under current KDE/Wayland permissions is still blocked without compositor approval.
 - Recommended next actions:
   - Validate one real remote SSH Linux target end to end.

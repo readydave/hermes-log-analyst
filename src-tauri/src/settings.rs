@@ -89,7 +89,10 @@ impl Default for IngestProfile {
         Self {
             auto_sync_on_startup: false,
             max_events_per_sync: DEFAULT_MAX_EVENTS_PER_SYNC,
-            windows_channels: DEFAULT_WINDOWS_CHANNELS.iter().map(|value| value.to_string()).collect(),
+            windows_channels: DEFAULT_WINDOWS_CHANNELS
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
             request_elevation: false,
         }
     }
@@ -114,6 +117,8 @@ pub struct RemoteConnectionProfile {
     pub provider_last_resolved_name: Option<String>,
     #[serde(default)]
     pub provider_last_resolved_at: Option<String>,
+    #[serde(default)]
+    pub secret_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +182,7 @@ fn sanitize_remote_auth_type(value: &str) -> String {
 fn sanitize_remote_protocol(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "winrm" => "winrm".to_string(),
+        "rpc" => "rpc".to_string(),
         "jamf" => "jamf".to_string(),
         "intune" => "intune".to_string(),
         _ => "ssh".to_string(),
@@ -229,6 +235,7 @@ fn sanitize_remote_settings(settings: RemoteSettings) -> RemoteSettings {
                 .provider_last_resolved_at
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
+            profile.secret_configured = false;
             Some(profile)
         })
         .collect();
@@ -417,7 +424,11 @@ pub fn load_ingest_window_days() -> u32 {
     let Ok(raw) = fs::read_to_string(path) else {
         return DEFAULT_INGEST_DAYS;
     };
-    raw.trim().parse::<u32>().ok().filter(|value| *value > 0 && *value <= 365).unwrap_or(DEFAULT_INGEST_DAYS)
+    raw.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0 && *value <= 365)
+        .unwrap_or(DEFAULT_INGEST_DAYS)
 }
 
 fn normalize_windows_channel(value: &str) -> Option<&'static str> {
@@ -433,15 +444,20 @@ fn sanitize_ingest_profile(profile: IngestProfile) -> IngestProfile {
     let mut channels = Vec::new();
     for value in profile.windows_channels {
         if let Some(normalized) = normalize_windows_channel(value.as_str()) {
-            if !channels.iter().any(|entry: &String| entry.eq_ignore_ascii_case(normalized)) {
+            if !channels
+                .iter()
+                .any(|entry: &String| entry.eq_ignore_ascii_case(normalized))
+            {
                 channels.push(normalized.to_string());
             }
         }
     }
-    
+
     IngestProfile {
         auto_sync_on_startup: profile.auto_sync_on_startup,
-        max_events_per_sync: profile.max_events_per_sync.clamp(MIN_MAX_EVENTS_PER_SYNC, MAX_MAX_EVENTS_PER_SYNC),
+        max_events_per_sync: profile
+            .max_events_per_sync
+            .clamp(MIN_MAX_EVENTS_PER_SYNC, MAX_MAX_EVENTS_PER_SYNC),
         windows_channels: channels,
         request_elevation: profile.request_elevation,
     }
@@ -465,9 +481,10 @@ pub fn load_ingest_profile() -> IngestProfile {
 pub fn save_ingest_profile(profile: IngestProfile) -> Result<IngestProfile, String> {
     let sanitized = sanitize_ingest_profile(profile);
     let path = ingest_profile_path()?;
-    let payload =
-        serde_json::to_string_pretty(&sanitized).map_err(|error| format!("Failed to serialize ingest profile: {error}"))?;
-    fs::write(path, payload.as_bytes()).map_err(|error| format!("Failed to save ingest profile: {error}"))?;
+    let payload = serde_json::to_string_pretty(&sanitized)
+        .map_err(|error| format!("Failed to serialize ingest profile: {error}"))?;
+    fs::write(path, payload.as_bytes())
+        .map_err(|error| format!("Failed to save ingest profile: {error}"))?;
     Ok(sanitized)
 }
 
@@ -571,7 +588,10 @@ fn default_profile_name(provider: &str, scope: &str) -> String {
     format!("{provider_name} {scope_name}")
 }
 
-fn sanitize_profile(mut profile: LlmConnectionProfile, used_ids: &mut HashSet<String>) -> LlmConnectionProfile {
+fn sanitize_profile(
+    mut profile: LlmConnectionProfile,
+    used_ids: &mut HashSet<String>,
+) -> LlmConnectionProfile {
     let provider = sanitize_provider_id(profile.provider.as_str());
     let scope = sanitize_scope(profile.scope.as_str(), provider.as_str());
     let mut id = profile.id.trim().to_string();
@@ -621,11 +641,12 @@ fn sanitize_llm_settings(settings: LlmSettings) -> LlmSettings {
     }
 
     let fallback_default_id = profiles[0].id.clone();
-    let default_profile_id = if profile_exists(settings.default_profile_id.trim(), profiles.as_slice()) {
-        settings.default_profile_id.trim().to_string()
-    } else {
-        fallback_default_id
-    };
+    let default_profile_id =
+        if profile_exists(settings.default_profile_id.trim(), profiles.as_slice()) {
+            settings.default_profile_id.trim().to_string()
+        } else {
+            fallback_default_id
+        };
 
     let backup_candidate = settings.backup_profile_id.trim();
     let backup_profile_id =
@@ -718,7 +739,10 @@ fn legacy_profile(
     let migration = if api_key.is_empty() {
         None
     } else {
-        Some(LlmApiKeyMigration { profile_id: id, api_key })
+        Some(LlmApiKeyMigration {
+            profile_id: id,
+            api_key,
+        })
     };
 
     Some((profile, migration))
@@ -814,12 +838,12 @@ pub fn load_llm_settings_with_migration() -> LlmSettingsLoadResult {
 pub fn save_llm_settings(settings: LlmSettings) -> Result<LlmSettings, String> {
     let sanitized = sanitize_llm_settings(settings);
     let path = llm_settings_path()?;
-    let payload =
-        serde_json::to_string_pretty(&sanitized).map_err(|error| format!("Failed to serialize LLM settings: {error}"))?;
-    fs::write(path, payload.as_bytes()).map_err(|error| format!("Failed to save LLM settings: {error}"))?;
+    let payload = serde_json::to_string_pretty(&sanitized)
+        .map_err(|error| format!("Failed to serialize LLM settings: {error}"))?;
+    fs::write(path, payload.as_bytes())
+        .map_err(|error| format!("Failed to save LLM settings: {error}"))?;
     Ok(sanitized)
 }
-
 
 const REMOTE_HOST_KEYCHAIN_SERVICE: &str = "hermes-log-analyst-remote-hosts";
 const REMOTE_PROVIDER_KEYCHAIN_SERVICE: &str = "hermes-log-analyst-remote-providers";

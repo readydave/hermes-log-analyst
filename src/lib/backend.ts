@@ -31,6 +31,7 @@ export interface RemoteConnectionProfile {
   username: string;
   sshKeyPath: string | null;
   authType: string;
+  secretConfigured?: boolean;
   providerDeviceId?: string | null;
   providerLastResolvedName?: string | null;
   providerLastResolvedAt?: string | null;

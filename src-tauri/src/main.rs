@@ -3,7 +3,9 @@ mod db;
 mod diagnostics;
 mod llm;
 mod logs;
+mod remote_common;
 mod remote_macos;
+mod remote_windows;
 mod settings;
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
@@ -12,24 +14,24 @@ use crash::{
     CrashRecord, MinidumpAnalysisResult,
 };
 use db::{
-    cleanup_duplicate_events, correlate_crash_events,
-    get_crash_by_id, get_crashes as read_crashes, get_local_events as read_local_events,
-    get_local_events_range as read_local_events_range,
-    get_local_events_window as read_local_events_window, prune_events_before,
-    prune_events_outside, save_crashes, save_local_events,
+    cleanup_duplicate_events, correlate_crash_events, get_crash_by_id, get_crashes as read_crashes,
+    get_local_events as read_local_events, get_local_events_range as read_local_events_range,
+    get_local_events_window as read_local_events_window, prune_events_before, prune_events_outside,
+    save_crashes, save_local_events,
 };
 use logs::{
     collect_host_events_range_with_windows_channels, detect_host_os,
     estimate_host_events_range_with_windows_channels, CollectionEstimate, CollectionResult,
     NormalizedEvent,
 };
+use remote_common::RemoteConnectionTestResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use settings::{
-    load_export_dir, load_ingest_profile, load_ingest_window_days, load_llm_settings_with_migration,
-    load_theme, save_export_dir, save_ingest_profile, save_ingest_window_days, save_llm_settings,
-    save_theme, IngestProfile, LlmConnectionProfile, LlmSettings, RemoteConnectionProfile,
-    RemoteProviderAccount,
+    load_export_dir, load_ingest_profile, load_ingest_window_days,
+    load_llm_settings_with_migration, load_theme, save_export_dir, save_ingest_profile,
+    save_ingest_window_days, save_llm_settings, save_theme, IngestProfile, LlmConnectionProfile,
+    LlmSettings, RemoteConnectionProfile, RemoteProviderAccount,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,13 +49,32 @@ fn remote_collection_outcome(
     max_events: Option<u32>,
 ) -> logs::CollectionResult {
     match remote.os.to_lowercase().as_str() {
-        "windows" => crate::logs::windows::collect_remote_windows_events(
-            remote,
-            start,
-            end,
-            max_events.or(Some(profile.max_events_per_sync)),
-            Some(profile.windows_channels.as_slice()),
-        ),
+        "windows" => {
+            if remote.protocol.eq_ignore_ascii_case("intune") {
+                let provider_account = resolve_remote_provider_account("intune");
+                let provider_secret = provider_account.as_ref().and_then(|account| {
+                    crate::settings::get_remote_provider_secret(account.id.as_str())
+                        .ok()
+                        .flatten()
+                });
+                crate::remote_windows::collect_remote_windows_events_via_provider(
+                    remote,
+                    provider_account.as_ref(),
+                    provider_secret.as_deref(),
+                    start,
+                    end,
+                    max_events.or(Some(profile.max_events_per_sync)),
+                )
+            } else {
+                crate::logs::windows::collect_remote_windows_events(
+                    remote,
+                    start,
+                    end,
+                    max_events.or(Some(profile.max_events_per_sync)),
+                    Some(profile.windows_channels.as_slice()),
+                )
+            }
+        }
         "linux" => crate::logs::linux::collect_remote_linux_events(
             remote,
             start,
@@ -64,9 +85,11 @@ fn remote_collection_outcome(
         "macos" => {
             if matches!(remote.protocol.as_str(), "jamf" | "intune") {
                 let provider_account = resolve_remote_provider_account(remote.protocol.as_str());
-                let provider_secret = provider_account
-                    .as_ref()
-                    .and_then(|account| crate::settings::get_remote_provider_secret(account.id.as_str()).ok().flatten());
+                let provider_secret = provider_account.as_ref().and_then(|account| {
+                    crate::settings::get_remote_provider_secret(account.id.as_str())
+                        .ok()
+                        .flatten()
+                });
                 crate::remote_macos::collect_remote_macos_events_via_provider(
                     remote,
                     provider_account.as_ref(),
@@ -268,7 +291,6 @@ fn report_collection_estimate(
     })
 }
 
-
 fn command_error(subsystem: &str, context: &str, error: impl AsRef<str>) -> String {
     let message = error.as_ref().to_string();
     diagnostics::error(subsystem, format!("{context}: {message}"));
@@ -462,12 +484,22 @@ fn parse_preferred_model_from_entries(value: &Value) -> Option<String> {
                 || entry
                     .get("state")
                     .and_then(Value::as_str)
-                    .map(|value| matches!(value.to_ascii_lowercase().as_str(), "loaded" | "active" | "ready"))
+                    .map(|value| {
+                        matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "loaded" | "active" | "ready"
+                        )
+                    })
                     .unwrap_or(false)
                 || entry
                     .get("status")
                     .and_then(Value::as_str)
-                    .map(|value| matches!(value.to_ascii_lowercase().as_str(), "loaded" | "active" | "ready"))
+                    .map(|value| {
+                        matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "loaded" | "active" | "ready"
+                        )
+                    })
                     .unwrap_or(false);
 
             if !loaded {
@@ -618,7 +650,10 @@ fn test_openai_compatible_connection(
                 base_url: base_url.to_string(),
                 status_code: Some(status),
                 message: if models.is_empty() {
-                    format!("Connected to {provider}. No models were returned.", provider = provider)
+                    format!(
+                        "Connected to {provider}. No models were returned.",
+                        provider = provider
+                    )
                 } else {
                     format!(
                         "Connected to {provider}. Found {} model(s).",
@@ -635,7 +670,10 @@ fn test_openai_compatible_connection(
             provider: provider.to_string(),
             base_url: base_url.to_string(),
             status_code: None,
-            message: format!("Failed to connect to {provider} endpoint: {error}", provider = provider),
+            message: format!(
+                "Failed to connect to {provider} endpoint: {error}",
+                provider = provider
+            ),
             detected_models: Vec::new(),
             preferred_model: None,
         },
@@ -847,7 +885,10 @@ struct LlmAnalysisResult {
 }
 
 fn provider_is_valid(provider: &str) -> bool {
-    matches!(provider, "ollama" | "lmstudio" | "openai_compatible" | "openai" | "gemini" | "claude" | "perplexity")
+    matches!(
+        provider,
+        "ollama" | "lmstudio" | "openai_compatible" | "openai" | "gemini" | "claude" | "perplexity"
+    )
 }
 
 fn openai_models_endpoint(base_url: &str) -> String {
@@ -868,7 +909,10 @@ fn openai_chat_endpoint(base_url: &str) -> String {
     }
 }
 
-fn fetch_ollama_models(client: &reqwest::blocking::Client, base_url: &str) -> Result<Vec<String>, String> {
+fn fetch_ollama_models(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+) -> Result<Vec<String>, String> {
     let endpoint = join_url(base_url, "/api/tags");
     let response = client
         .get(endpoint)
@@ -877,7 +921,10 @@ fn fetch_ollama_models(client: &reqwest::blocking::Client, base_url: &str) -> Re
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Ollama model list request failed (HTTP {}).", status.as_u16()));
+        return Err(format!(
+            "Ollama model list request failed (HTTP {}).",
+            status.as_u16()
+        ));
     }
     let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
     Ok(parse_model_ids(&parsed))
@@ -918,7 +965,9 @@ fn resolve_model_for_profile(
     let scope = profile.scope.trim().to_ascii_lowercase();
     let configured = profile.model.trim();
 
-    if matches!(provider.as_str(), "ollama" | "lmstudio") && matches!(scope.as_str(), "local" | "lan") {
+    if matches!(provider.as_str(), "ollama" | "lmstudio")
+        && matches!(scope.as_str(), "local" | "lan")
+    {
         let preferred_active = match provider.as_str() {
             "ollama" => fetch_ollama_loaded_models(client, profile.base_url.as_str())
                 .ok()
@@ -946,10 +995,9 @@ fn resolve_model_for_profile(
         _ => Vec::new(),
     };
 
-    discovered
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No model is configured and none were discovered on the endpoint.".to_string())
+    discovered.into_iter().next().ok_or_else(|| {
+        "No model is configured and none were discovered on the endpoint.".to_string()
+    })
 }
 
 fn parse_chat_completion_text(payload: &Value) -> Option<String> {
@@ -1102,17 +1150,25 @@ fn run_gemini_analysis(
         "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
         "generationConfig": { "temperature": 0.2 }
     });
-    
-    let response = client.post(endpoint).query(&[("key", key)]).json(&payload).send()
+
+    let response = client
+        .post(endpoint)
+        .query(&[("key", key)])
+        .json(&payload)
+        .send()
         .map_err(|e| format!("Failed sending prompt to Gemini: {e}"))?;
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Gemini analysis request failed (HTTP {}).", status.as_u16()));
+        return Err(format!(
+            "Gemini analysis request failed (HTTP {}).",
+            status.as_u16()
+        ));
     }
     let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
-    
-    parsed.get("candidates")
+
+    parsed
+        .get("candidates")
         .and_then(Value::as_array)
         .and_then(|c| c.first())
         .and_then(|c| c.get("content"))
@@ -1142,22 +1198,27 @@ fn run_claude_analysis(
         "temperature": 0.2,
         "messages": [{ "role": "user", "content": prompt }]
     });
-    
-    let response = client.post(endpoint)
+
+    let response = client
+        .post(endpoint)
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
         .json(&payload)
         .send()
         .map_err(|e| format!("Failed sending prompt to Claude: {e}"))?;
-    
+
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Claude analysis request failed (HTTP {}).", status.as_u16()));
+        return Err(format!(
+            "Claude analysis request failed (HTTP {}).",
+            status.as_u16()
+        ));
     }
     let parsed: Value = serde_json::from_str(body.as_str()).unwrap_or(Value::Null);
-    
-    parsed.get("content")
+
+    parsed
+        .get("content")
         .and_then(Value::as_array)
         .and_then(|c| c.first())
         .and_then(|c| c.get("text"))
@@ -1166,7 +1227,10 @@ fn run_claude_analysis(
         .ok_or_else(|| "Claude response did not include generated text.".to_string())
 }
 
-fn profile_warning_for_settings(profile: &LlmConnectionProfile, settings: &LlmSettings) -> Option<String> {
+fn profile_warning_for_settings(
+    profile: &LlmConnectionProfile,
+    settings: &LlmSettings,
+) -> Option<String> {
     if !settings.never_send_raw_event_to_untrusted {
         return None;
     }
@@ -1224,16 +1288,22 @@ fn run_profile_analysis(
     let model = resolve_model_for_profile(profile, &client, api_key)?;
     let response = match provider.as_str() {
         "ollama" => run_ollama_analysis(&client, base_url.as_str(), model.as_str(), prompt)?,
-        "lmstudio" | "openai_compatible" | "openai" | "perplexity" => run_openai_compatible_analysis(
-            provider.as_str(),
-            &client,
-            base_url.as_str(),
-            model.as_str(),
-            prompt,
-            api_key,
-        )?,
-        "gemini" => run_gemini_analysis(&client, base_url.as_str(), model.as_str(), prompt, api_key)?,
-        "claude" => run_claude_analysis(&client, base_url.as_str(), model.as_str(), prompt, api_key)?,
+        "lmstudio" | "openai_compatible" | "openai" | "perplexity" => {
+            run_openai_compatible_analysis(
+                provider.as_str(),
+                &client,
+                base_url.as_str(),
+                model.as_str(),
+                prompt,
+                api_key,
+            )?
+        }
+        "gemini" => {
+            run_gemini_analysis(&client, base_url.as_str(), model.as_str(), prompt, api_key)?
+        }
+        "claude" => {
+            run_claude_analysis(&client, base_url.as_str(), model.as_str(), prompt, api_key)?
+        }
         _ => {
             return Err("Selected profile is not configured as a compatible provider.".to_string());
         }
@@ -1242,7 +1312,10 @@ fn run_profile_analysis(
     Ok((model, response))
 }
 
-fn find_profile_by_id<'a>(settings: &'a LlmSettings, profile_id: &str) -> Option<&'a LlmConnectionProfile> {
+fn find_profile_by_id<'a>(
+    settings: &'a LlmSettings,
+    profile_id: &str,
+) -> Option<&'a LlmConnectionProfile> {
     settings
         .profiles
         .iter()
@@ -1270,13 +1343,17 @@ fn candidate_profiles_for_analysis(
         };
         push_unique_profile(&mut candidates, profile);
     } else if !settings.default_profile_id.trim().is_empty() {
-        if let Some(default_profile) = find_profile_by_id(settings, settings.default_profile_id.as_str()) {
+        if let Some(default_profile) =
+            find_profile_by_id(settings, settings.default_profile_id.as_str())
+        {
             push_unique_profile(&mut candidates, default_profile);
         }
     }
 
     if !settings.backup_profile_id.trim().is_empty() {
-        if let Some(backup_profile) = find_profile_by_id(settings, settings.backup_profile_id.as_str()) {
+        if let Some(backup_profile) =
+            find_profile_by_id(settings, settings.backup_profile_id.as_str())
+        {
             push_unique_profile(&mut candidates, backup_profile);
         }
     }
@@ -1360,8 +1437,9 @@ fn analyze_with_local_llm_sync(
     ))
 }
 
-
-fn resolve_target_profile(target_id: Option<&str>) -> Option<crate::settings::RemoteConnectionProfile> {
+fn resolve_target_profile(
+    target_id: Option<&str>,
+) -> Option<crate::settings::RemoteConnectionProfile> {
     let id = target_id?;
     if id == "localhost" || id.trim().is_empty() {
         return None;
@@ -1381,11 +1459,18 @@ fn resolve_remote_provider_account(provider: &str) -> Option<RemoteProviderAccou
 fn hydrate_remote_provider_token_flags(
     mut settings: crate::settings::RemoteSettings,
 ) -> crate::settings::RemoteSettings {
-    for account in &mut settings.provider_accounts {
-        account.api_token_configured = crate::settings::get_remote_provider_secret(account.id.as_str())
+    for profile in &mut settings.profiles {
+        profile.secret_configured = crate::settings::get_remote_profile_secret(profile.id.as_str())
             .ok()
             .flatten()
             .is_some();
+    }
+    for account in &mut settings.provider_accounts {
+        account.api_token_configured =
+            crate::settings::get_remote_provider_secret(account.id.as_str())
+                .ok()
+                .flatten()
+                .is_some();
     }
     settings
 }
@@ -1401,9 +1486,15 @@ async fn refresh_local_events(target_id: Option<String>) -> Result<SyncOperation
     let target = target_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let remote_profile = resolve_target_profile(target.as_deref());
-        
+
         let outcome = if let Some(remote) = remote_profile {
-            remote_collection_outcome(&remote, &profile, Some(start), Some(now), Some(profile.max_events_per_sync))
+            remote_collection_outcome(
+                &remote,
+                &profile,
+                Some(start),
+                Some(now),
+                Some(profile.max_events_per_sync),
+            )
         } else {
             collect_host_events_range_with_windows_channels(
                 Some(start),
@@ -1458,9 +1549,14 @@ async fn estimate_refresh_local_events() -> Result<EventLoadEstimateResult, Stri
 }
 
 #[tauri::command]
-fn get_local_events(target_id: Option<String>, limit: Option<u32>) -> Result<Vec<NormalizedEvent>, String> {
+fn get_local_events(
+    target_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<NormalizedEvent>, String> {
     let limit = limit.unwrap_or(10000).min(50000);
-    let host = resolve_target_profile(target_id.as_deref()).map(|p| p.host).unwrap_or_else(|| "localhost".to_string());
+    let host = resolve_target_profile(target_id.as_deref())
+        .map(|p| p.host)
+        .unwrap_or_else(|| "localhost".to_string());
     read_local_events(limit, Some(&host))
         .map_err(|error| command_error("storage", "Failed to read local events", error))
 }
@@ -1477,7 +1573,9 @@ fn get_local_events_range(
     let limit = limit.unwrap_or(10000).min(50000);
     let start_str = start.to_rfc3339();
     let end_str = end.to_rfc3339();
-    let host = resolve_target_profile(target_id.as_deref()).map(|p| p.host).unwrap_or_else(|| "localhost".to_string());
+    let host = resolve_target_profile(target_id.as_deref())
+        .map(|p| p.host)
+        .unwrap_or_else(|| "localhost".to_string());
     read_local_events_range(start_str.as_str(), end_str.as_str(), limit, Some(&host))
         .map_err(|error| command_error("storage", "Failed to read local events for range", error))
 }
@@ -1497,13 +1595,15 @@ fn get_local_events_window(
     let host = resolve_target_profile(target_id.as_deref())
         .map(|p| p.host)
         .unwrap_or_else(|| "localhost".to_string());
-    read_local_events_window(start_str.as_str(), end_str.as_str(), limit, Some(&host)).map_err(
-        |error| command_error("storage", "Failed to read local events for window", error),
-    )
+    read_local_events_window(start_str.as_str(), end_str.as_str(), limit, Some(&host))
+        .map_err(|error| command_error("storage", "Failed to read local events for window", error))
 }
 
 #[tauri::command]
-async fn import_host_crashes(_target_id: Option<String>, limit: Option<u32>) -> Result<usize, String> {
+async fn import_host_crashes(
+    _target_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<usize, String> {
     let max = limit.unwrap_or(200).clamp(1, 2000) as usize;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -1529,8 +1629,11 @@ async fn import_host_crashes(_target_id: Option<String>, limit: Option<u32>) -> 
 #[tauri::command]
 fn get_crashes(target_id: Option<String>, limit: Option<u32>) -> Result<Vec<CrashRecord>, String> {
     let limit = limit.unwrap_or(250).min(5000);
-    let host = resolve_target_profile(target_id.as_deref()).map(|p| p.host).unwrap_or_else(|| "localhost".to_string());
-    read_crashes(limit, Some(&host)).map_err(|error| command_error("storage", "Failed to read crashes", error))
+    let host = resolve_target_profile(target_id.as_deref())
+        .map(|p| p.host)
+        .unwrap_or_else(|| "localhost".to_string());
+    read_crashes(limit, Some(&host))
+        .map_err(|error| command_error("storage", "Failed to read crashes", error))
 }
 
 #[tauri::command]
@@ -1539,10 +1642,26 @@ fn analyze_minidump(
     window_minutes: Option<i64>,
 ) -> Result<MinidumpAnalysisResult, String> {
     let crash = get_crash_by_id(crash_id.as_str())
-        .map_err(|error| command_error("storage", "Failed to load crash for minidump analysis", error))?
+        .map_err(|error| {
+            command_error(
+                "storage",
+                "Failed to load crash for minidump analysis",
+                error,
+            )
+        })?
         .ok_or_else(|| "Selected crash was not found.".to_string())?;
-    let related = correlate_crash_events(crash_id.as_str(), window_minutes.unwrap_or(15).clamp(1, 180), 250)
-        .map_err(|error| command_error("storage", "Failed to load related events for minidump analysis", error))?;
+    let related = correlate_crash_events(
+        crash_id.as_str(),
+        window_minutes.unwrap_or(15).clamp(1, 180),
+        250,
+    )
+    .map_err(|error| {
+        command_error(
+            "storage",
+            "Failed to load related events for minidump analysis",
+            error,
+        )
+    })?;
 
     // Select the appropriate analyzer based on OS
     let result = if crash.os.eq_ignore_ascii_case("linux") {
@@ -1638,11 +1757,18 @@ fn set_llm_profile_api_key(profile_id: String, api_key: String) -> Result<LlmSet
     }
     let key = api_key.trim().to_string();
     if key.is_empty() {
-        return Err("API key is empty. Use clear_llm_profile_api_key to remove keychain values.".to_string());
+        return Err(
+            "API key is empty. Use clear_llm_profile_api_key to remove keychain values."
+                .to_string(),
+        );
     }
 
     let mut settings = load_llm_settings_with_migration().settings;
-    let Some(profile) = settings.profiles.iter_mut().find(|profile| profile.id == id) else {
+    let Some(profile) = settings
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == id)
+    else {
         return Err("Unknown profile ID.".to_string());
     };
     set_profile_keychain_secret(id.as_str(), key.as_str())
@@ -1660,7 +1786,11 @@ fn clear_llm_profile_api_key(profile_id: String) -> Result<LlmSettings, String> 
     }
 
     let mut settings = load_llm_settings_with_migration().settings;
-    let Some(profile) = settings.profiles.iter_mut().find(|profile| profile.id == id) else {
+    let Some(profile) = settings
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == id)
+    else {
         return Err("Unknown profile ID.".to_string());
     };
     clear_profile_keychain_secret(id.as_str())
@@ -1755,7 +1885,13 @@ fn open_path_in_shell(path: String) -> Result<(), String> {
         } else {
             Command::new("explorer.exe").arg(&target).spawn()
         }
-        .map_err(|error| command_error("runtime", "Failed to launch Windows shell", error.to_string()))?;
+        .map_err(|error| {
+            command_error(
+                "runtime",
+                "Failed to launch Windows shell",
+                error.to_string(),
+            )
+        })?;
     }
 
     #[cfg(target_os = "macos")]
@@ -1775,14 +1911,23 @@ fn open_path_in_shell(path: String) -> Result<(), String> {
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         let open_target = if target.is_file() {
-            target.parent().map(Path::to_path_buf).unwrap_or(target.clone())
+            target
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or(target.clone())
         } else {
             target.clone()
         };
         let status = Command::new("xdg-open")
             .arg(open_target)
             .status()
-            .map_err(|error| command_error("runtime", "Failed to launch file browser", error.to_string()))?;
+            .map_err(|error| {
+                command_error(
+                    "runtime",
+                    "Failed to launch file browser",
+                    error.to_string(),
+                )
+            })?;
         if !status.success() {
             return Err("File browser could not open the requested path.".to_string());
         }
@@ -1878,7 +2023,13 @@ async fn sync_local_events_window(
         let remote_profile = resolve_target_profile(target.as_deref());
 
         let outcome = if let Some(remote) = remote_profile {
-            remote_collection_outcome(&remote, &profile, Some(start_value), Some(end_value), Some(max_events))
+            remote_collection_outcome(
+                &remote,
+                &profile,
+                Some(start_value),
+                Some(end_value),
+                Some(max_events),
+            )
         } else {
             collect_host_events_range_with_windows_channels(
                 Some(start_value),
@@ -2077,7 +2228,10 @@ fn export_events_with_dialog(
 }
 
 #[tauri::command]
-fn save_text_with_dialog(suggested_filename: String, text: String) -> Result<Option<String>, String> {
+fn save_text_with_dialog(
+    suggested_filename: String,
+    text: String,
+) -> Result<Option<String>, String> {
     let lower_name = suggested_filename.to_ascii_lowercase();
     let preferred_extension = if lower_name.ends_with(".md") {
         "md"
@@ -2304,7 +2458,10 @@ fn restart_elevated() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
-        let shell_path = exe_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let shell_path = exe_path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         let script = format!(
             "do shell script quoted form of \"{}\" with administrator privileges",
             shell_path
@@ -2336,21 +2493,15 @@ fn restart_elevated() -> Result<(), String> {
     }
 }
 
-
-
-
-
-
-
-
-
 #[tauri::command]
 fn get_remote_settings() -> crate::settings::RemoteSettings {
     hydrate_remote_provider_token_flags(crate::settings::load_remote_settings())
 }
 
 #[tauri::command]
-fn save_remote_settings(settings: crate::settings::RemoteSettings) -> Result<crate::settings::RemoteSettings, String> {
+fn save_remote_settings(
+    settings: crate::settings::RemoteSettings,
+) -> Result<crate::settings::RemoteSettings, String> {
     crate::settings::save_remote_settings(settings).map(hydrate_remote_provider_token_flags)
 }
 
@@ -2377,7 +2528,7 @@ fn clear_remote_provider_secret(provider_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn test_remote_connection(
     profile: RemoteConnectionProfile,
-) -> Result<remote_macos::RemoteConnectionTestResult, String> {
+) -> Result<RemoteConnectionTestResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let protocol = profile.protocol.to_ascii_lowercase();
         let os = profile.os.to_ascii_lowercase();
@@ -2387,9 +2538,11 @@ async fn test_remote_connection(
             } else {
                 None
             };
-            let provider_secret = provider_account
-                .as_ref()
-                .and_then(|account| crate::settings::get_remote_provider_secret(account.id.as_str()).ok().flatten());
+            let provider_secret = provider_account.as_ref().and_then(|account| {
+                crate::settings::get_remote_provider_secret(account.id.as_str())
+                    .ok()
+                    .flatten()
+            });
             Ok(crate::remote_macos::test_remote_macos_connection(
                 &profile,
                 provider_account.as_ref(),
@@ -2419,19 +2572,21 @@ async fn test_remote_connection(
             ssh_args.push("journalctl --version >/dev/null".to_string());
             let output = Command::new("ssh").args(&ssh_args).output();
             let result = match output {
-                Ok(output) if output.status.success() => remote_macos::RemoteConnectionTestResult {
+                Ok(output) if output.status.success() => RemoteConnectionTestResult {
                     ok: true,
                     protocol,
                     host: profile.host,
                     status: "ready".to_string(),
-                    message: "SSH connection succeeded and the remote host responded to journalctl.".to_string(),
+                    message:
+                        "SSH connection succeeded and the remote host responded to journalctl."
+                            .to_string(),
                     warnings: Vec::new(),
                     collection_mode: "direct".to_string(),
                     provider_device_id: None,
                     provider_resolved_name: None,
                     provider_last_resolved_at: None,
                 },
-                Ok(output) => remote_macos::RemoteConnectionTestResult {
+                Ok(output) => RemoteConnectionTestResult {
                     ok: false,
                     protocol,
                     host: profile.host,
@@ -2446,7 +2601,7 @@ async fn test_remote_connection(
                     provider_resolved_name: None,
                     provider_last_resolved_at: None,
                 },
-                Err(error) => remote_macos::RemoteConnectionTestResult {
+                Err(error) => RemoteConnectionTestResult {
                     ok: false,
                     protocol,
                     host: profile.host,
@@ -2461,32 +2616,27 @@ async fn test_remote_connection(
             };
             Ok(result)
         } else if os == "windows" && protocol == "winrm" {
-            let mut warnings = Vec::new();
-            if profile.auth_type.eq_ignore_ascii_case("password")
-                && crate::settings::get_remote_profile_secret(&profile.id)
-                    .map_err(|error| command_error("settings", "Failed to read WinRM remote secret", error))?
-                    .is_none()
-            {
-                warnings.push("No WinRM password secret is stored in the OS keychain for this profile.".to_string());
-            }
-            Ok(remote_macos::RemoteConnectionTestResult {
-                ok: warnings.is_empty(),
-                protocol,
-                host: profile.host,
-                status: if warnings.is_empty() { "ready" } else { "auth failed" }.to_string(),
-                message: if warnings.is_empty() {
-                    "WinRM profile is configured. Use Refresh Logs for a live transport test.".to_string()
-                } else {
-                    warnings.join(" ")
-                },
-                warnings,
-                collection_mode: "direct".to_string(),
-                provider_device_id: None,
-                provider_resolved_name: None,
-                provider_last_resolved_at: None,
-            })
+            Ok(crate::remote_windows::test_remote_windows_connection(
+                &profile, None, None,
+            ))
+        } else if os == "windows" && (protocol == "rpc" || protocol == "intune") {
+            let provider_account = if protocol == "intune" {
+                resolve_remote_provider_account("intune")
+            } else {
+                None
+            };
+            let provider_secret = provider_account.as_ref().and_then(|account| {
+                crate::settings::get_remote_provider_secret(account.id.as_str())
+                    .ok()
+                    .flatten()
+            });
+            Ok(crate::remote_windows::test_remote_windows_connection(
+                &profile,
+                provider_account.as_ref(),
+                provider_secret.as_deref(),
+            ))
         } else {
-            Ok(remote_macos::RemoteConnectionTestResult {
+            Ok(RemoteConnectionTestResult {
                 ok: false,
                 protocol,
                 host: profile.host,
@@ -2511,7 +2661,6 @@ async fn test_remote_connection(
 }
 
 fn sanitize_filename(filename: &str, extension: &str) -> String {
-
     let raw_name = Path::new(filename)
         .file_name()
         .and_then(|value| value.to_str())
@@ -2810,13 +2959,20 @@ mod tests {
     #[test]
     fn llm_connection_handles_reachable_lmstudio_with_no_models() {
         let (base_url, handle) = spawn_mock_json_server(vec![r#"{"data":[]}"#, r#"{"data":[]}"#]);
-        let result =
-            test_openai_compatible_connection("lmstudio", &test_http_client(), base_url.as_str(), None);
+        let result = test_openai_compatible_connection(
+            "lmstudio",
+            &test_http_client(),
+            base_url.as_str(),
+            None,
+        );
         handle.join().expect("join mock LM Studio server");
 
         assert!(result.ok);
         assert!(result.detected_models.is_empty());
-        assert_eq!(result.message, "Connected to lmstudio. No models were returned.");
+        assert_eq!(
+            result.message,
+            "Connected to lmstudio. No models were returned."
+        );
         assert!(result.preferred_model.is_none());
     }
 
@@ -2837,10 +2993,8 @@ mod tests {
     impl TempXdgDataHome {
         fn new(label: &str) -> Self {
             let guard = env_lock().lock().expect("lock XDG_DATA_HOME test guard");
-            let root = std::env::temp_dir().join(format!(
-                "hermes-log-analyst-{label}-{}",
-                Uuid::new_v4()
-            ));
+            let root =
+                std::env::temp_dir().join(format!("hermes-log-analyst-{label}-{}", Uuid::new_v4()));
             fs::create_dir_all(&root).expect("create temporary XDG_DATA_HOME");
             let original = std::env::var_os("XDG_DATA_HOME");
             std::env::set_var("XDG_DATA_HOME", &root);
