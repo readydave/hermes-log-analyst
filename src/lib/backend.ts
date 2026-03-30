@@ -31,14 +31,67 @@ export interface RemoteConnectionProfile {
   username: string;
   sshKeyPath: string | null;
   authType: string;
+  providerDeviceId?: string | null;
+  providerLastResolvedName?: string | null;
+  providerLastResolvedAt?: string | null;
+}
+
+export interface RemoteProviderAccount {
+  id: string;
+  provider: "jamf" | "intune" | string;
+  name: string;
+  enabled: boolean;
+  baseUrl: string;
+  tenantId: string;
+  apiTokenConfigured: boolean;
+}
+
+export interface RemoteConnectionTestResult {
+  ok: boolean;
+  protocol: string;
+  host: string;
+  status: string;
+  message: string;
+  warnings: string[];
+  collectionMode: "direct" | "managed" | "async-managed" | "unsupported";
+  providerDeviceId: string | null;
+  providerResolvedName: string | null;
+  providerLastResolvedAt: string | null;
 }
 
 export interface RemoteSettings {
   profiles: RemoteConnectionProfile[];
+  providerAccounts: RemoteProviderAccount[];
+}
+
+function createDefaultRemoteSettings(): RemoteSettings {
+  return {
+    profiles: [],
+    providerAccounts: [
+      {
+        id: "provider-jamf",
+        provider: "jamf",
+        name: "Jamf Pro",
+        enabled: false,
+        baseUrl: "",
+        tenantId: "",
+        apiTokenConfigured: false
+      },
+      {
+        id: "provider-intune",
+        provider: "intune",
+        name: "Microsoft Intune",
+        enabled: false,
+        baseUrl: "https://graph.microsoft.com",
+        tenantId: "",
+        apiTokenConfigured: false
+      }
+    ]
+  };
 }
 
 export async function getRemoteSettings(): Promise<RemoteSettings> {
-  if (!isTauriRuntime()) return { profiles: [] };
+  if (!isTauriRuntime()) return createDefaultRemoteSettings();
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<RemoteSettings>("get_remote_settings");
 }
@@ -47,6 +100,51 @@ export async function saveRemoteSettings(settings: RemoteSettings): Promise<Remo
   if (!isTauriRuntime()) return settings;
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<RemoteSettings>("save_remote_settings", { settings });
+}
+
+export async function saveRemoteProfileSecret(profileId: string, secret: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("save_remote_profile_secret", { profileId, secret });
+}
+
+export async function clearRemoteProfileSecret(profileId: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clear_remote_profile_secret", { profileId });
+}
+
+export async function saveRemoteProviderSecret(providerId: string, secret: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("save_remote_provider_secret", { providerId, secret });
+}
+
+export async function clearRemoteProviderSecret(providerId: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clear_remote_provider_secret", { providerId });
+}
+
+export async function testRemoteConnection(
+  profile: RemoteConnectionProfile
+): Promise<RemoteConnectionTestResult> {
+  if (!isTauriRuntime()) {
+    return {
+      ok: false,
+      protocol: profile.protocol,
+      host: profile.host,
+      status: "unsupported",
+      message: "Remote connection tests require desktop runtime.",
+      warnings: [],
+      collectionMode: "unsupported",
+      providerDeviceId: null,
+      providerResolvedName: null,
+      providerLastResolvedAt: null
+    };
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<RemoteConnectionTestResult>("test_remote_connection", { profile });
 }
 
 export interface LlmConnectionProfile {

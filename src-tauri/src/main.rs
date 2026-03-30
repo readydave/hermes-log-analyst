@@ -3,6 +3,7 @@ mod db;
 mod diagnostics;
 mod llm;
 mod logs;
+mod remote_macos;
 mod settings;
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
@@ -27,7 +28,8 @@ use serde_json::Value;
 use settings::{
     load_export_dir, load_ingest_profile, load_ingest_window_days, load_llm_settings_with_migration,
     load_theme, save_export_dir, save_ingest_profile, save_ingest_window_days, save_llm_settings,
-    save_theme, IngestProfile, LlmConnectionProfile, LlmSettings,
+    save_theme, IngestProfile, LlmConnectionProfile, LlmSettings, RemoteConnectionProfile,
+    RemoteProviderAccount,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,6 +38,56 @@ use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Manager};
 
 const LLM_KEYCHAIN_SERVICE: &str = "hermes-log-analyst.llm";
+
+fn remote_collection_outcome(
+    remote: &RemoteConnectionProfile,
+    profile: &IngestProfile,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max_events: Option<u32>,
+) -> logs::CollectionResult {
+    match remote.os.to_lowercase().as_str() {
+        "windows" => crate::logs::windows::collect_remote_windows_events(
+            remote,
+            start,
+            end,
+            max_events.or(Some(profile.max_events_per_sync)),
+            Some(profile.windows_channels.as_slice()),
+        ),
+        "linux" => crate::logs::linux::collect_remote_linux_events(
+            remote,
+            start,
+            end,
+            max_events.or(Some(profile.max_events_per_sync)),
+            Some(profile.windows_channels.as_slice()),
+        ),
+        "macos" => {
+            if matches!(remote.protocol.as_str(), "jamf" | "intune") {
+                let provider_account = resolve_remote_provider_account(remote.protocol.as_str());
+                let provider_secret = provider_account
+                    .as_ref()
+                    .and_then(|account| crate::settings::get_remote_provider_secret(account.id.as_str()).ok().flatten());
+                crate::remote_macos::collect_remote_macos_events_via_provider(
+                    remote,
+                    provider_account.as_ref(),
+                    provider_secret.as_deref(),
+                    start,
+                    end,
+                    max_events.or(Some(profile.max_events_per_sync)),
+                )
+            } else {
+                crate::logs::macos::collect_remote_macos_events(
+                    remote,
+                    start,
+                    end,
+                    max_events.or(Some(profile.max_events_per_sync)),
+                    Some(profile.windows_channels.as_slice()),
+                )
+            }
+        }
+        _ => crate::logs::CollectionResult::default(),
+    }
+}
 
 #[tauri::command]
 fn host_os() -> String {
@@ -1318,6 +1370,26 @@ fn resolve_target_profile(target_id: Option<&str>) -> Option<crate::settings::Re
     settings.profiles.into_iter().find(|p| p.id == id)
 }
 
+fn resolve_remote_provider_account(provider: &str) -> Option<RemoteProviderAccount> {
+    let settings = crate::settings::load_remote_settings();
+    settings
+        .provider_accounts
+        .into_iter()
+        .find(|account| account.provider.eq_ignore_ascii_case(provider))
+}
+
+fn hydrate_remote_provider_token_flags(
+    mut settings: crate::settings::RemoteSettings,
+) -> crate::settings::RemoteSettings {
+    for account in &mut settings.provider_accounts {
+        account.api_token_configured = crate::settings::get_remote_provider_secret(account.id.as_str())
+            .ok()
+            .flatten()
+            .is_some();
+    }
+    settings
+}
+
 #[tauri::command]
 async fn refresh_local_events(target_id: Option<String>) -> Result<SyncOperationResult, String> {
     let days = load_ingest_window_days();
@@ -1331,12 +1403,7 @@ async fn refresh_local_events(target_id: Option<String>) -> Result<SyncOperation
         let remote_profile = resolve_target_profile(target.as_deref());
         
         let outcome = if let Some(remote) = remote_profile {
-            match remote.os.to_lowercase().as_str() {
-                "windows" => crate::logs::windows::collect_remote_windows_events(&remote, Some(start), Some(now), Some(profile.max_events_per_sync), Some(profile.windows_channels.as_slice())),
-                "linux" => crate::logs::linux::collect_remote_linux_events(&remote, Some(start), Some(now), Some(profile.max_events_per_sync), Some(profile.windows_channels.as_slice())),
-                "macos" => crate::logs::macos::collect_remote_macos_events(&remote, Some(start), Some(now), Some(profile.max_events_per_sync), Some(profile.windows_channels.as_slice())),
-                _ => crate::logs::CollectionResult::default()
-            }
+            remote_collection_outcome(&remote, &profile, Some(start), Some(now), Some(profile.max_events_per_sync))
         } else {
             collect_host_events_range_with_windows_channels(
                 Some(start),
@@ -1811,30 +1878,7 @@ async fn sync_local_events_window(
         let remote_profile = resolve_target_profile(target.as_deref());
 
         let outcome = if let Some(remote) = remote_profile {
-            match remote.os.to_lowercase().as_str() {
-                "windows" => crate::logs::windows::collect_remote_windows_events(
-                    &remote,
-                    Some(start_value),
-                    Some(end_value),
-                    Some(max_events),
-                    Some(profile.windows_channels.as_slice()),
-                ),
-                "linux" => crate::logs::linux::collect_remote_linux_events(
-                    &remote,
-                    Some(start_value),
-                    Some(end_value),
-                    Some(max_events),
-                    Some(profile.windows_channels.as_slice()),
-                ),
-                "macos" => crate::logs::macos::collect_remote_macos_events(
-                    &remote,
-                    Some(start_value),
-                    Some(end_value),
-                    Some(max_events),
-                    Some(profile.windows_channels.as_slice()),
-                ),
-                _ => crate::logs::CollectionResult::default(),
-            }
+            remote_collection_outcome(&remote, &profile, Some(start_value), Some(end_value), Some(max_events))
         } else {
             collect_host_events_range_with_windows_channels(
                 Some(start_value),
@@ -2302,12 +2346,12 @@ fn restart_elevated() -> Result<(), String> {
 
 #[tauri::command]
 fn get_remote_settings() -> crate::settings::RemoteSettings {
-    crate::settings::load_remote_settings()
+    hydrate_remote_provider_token_flags(crate::settings::load_remote_settings())
 }
 
 #[tauri::command]
 fn save_remote_settings(settings: crate::settings::RemoteSettings) -> Result<crate::settings::RemoteSettings, String> {
-    crate::settings::save_remote_settings(settings)
+    crate::settings::save_remote_settings(settings).map(hydrate_remote_provider_token_flags)
 }
 
 #[tauri::command]
@@ -2318,6 +2362,152 @@ fn save_remote_profile_secret(profile_id: String, secret: String) -> Result<(), 
 #[tauri::command]
 fn clear_remote_profile_secret(profile_id: String) -> Result<(), String> {
     crate::settings::clear_remote_profile_secret(&profile_id)
+}
+
+#[tauri::command]
+fn save_remote_provider_secret(provider_id: String, secret: String) -> Result<(), String> {
+    crate::settings::set_remote_provider_secret(&provider_id, &secret)
+}
+
+#[tauri::command]
+fn clear_remote_provider_secret(provider_id: String) -> Result<(), String> {
+    crate::settings::clear_remote_provider_secret(&provider_id)
+}
+
+#[tauri::command]
+async fn test_remote_connection(
+    profile: RemoteConnectionProfile,
+) -> Result<remote_macos::RemoteConnectionTestResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let protocol = profile.protocol.to_ascii_lowercase();
+        let os = profile.os.to_ascii_lowercase();
+        if os == "macos" {
+            let provider_account = if protocol == "jamf" || protocol == "intune" {
+                resolve_remote_provider_account(protocol.as_str())
+            } else {
+                None
+            };
+            let provider_secret = provider_account
+                .as_ref()
+                .and_then(|account| crate::settings::get_remote_provider_secret(account.id.as_str()).ok().flatten());
+            Ok(crate::remote_macos::test_remote_macos_connection(
+                &profile,
+                provider_account.as_ref(),
+                provider_secret.as_deref(),
+            ))
+        } else if os == "linux" && protocol == "ssh" {
+            let mut ssh_args = vec![
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=no".to_string(),
+                "-o".to_string(),
+                "ConnectTimeout=10".to_string(),
+            ];
+            if let Some(key_path) = &profile.ssh_key_path {
+                if !key_path.trim().is_empty() {
+                    ssh_args.push("-i".to_string());
+                    ssh_args.push(key_path.trim().to_string());
+                }
+            }
+            let user_host = if profile.username.trim().is_empty() {
+                profile.host.trim().to_string()
+            } else {
+                format!("{}@{}", profile.username.trim(), profile.host.trim())
+            };
+            ssh_args.push(user_host);
+            ssh_args.push("journalctl --version >/dev/null".to_string());
+            let output = Command::new("ssh").args(&ssh_args).output();
+            let result = match output {
+                Ok(output) if output.status.success() => remote_macos::RemoteConnectionTestResult {
+                    ok: true,
+                    protocol,
+                    host: profile.host,
+                    status: "ready".to_string(),
+                    message: "SSH connection succeeded and the remote host responded to journalctl.".to_string(),
+                    warnings: Vec::new(),
+                    collection_mode: "direct".to_string(),
+                    provider_device_id: None,
+                    provider_resolved_name: None,
+                    provider_last_resolved_at: None,
+                },
+                Ok(output) => remote_macos::RemoteConnectionTestResult {
+                    ok: false,
+                    protocol,
+                    host: profile.host,
+                    status: "auth failed".to_string(),
+                    message: format!(
+                        "Linux SSH test failed. {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                    warnings: Vec::new(),
+                    collection_mode: "direct".to_string(),
+                    provider_device_id: None,
+                    provider_resolved_name: None,
+                    provider_last_resolved_at: None,
+                },
+                Err(error) => remote_macos::RemoteConnectionTestResult {
+                    ok: false,
+                    protocol,
+                    host: profile.host,
+                    status: "collection unsupported".to_string(),
+                    message: format!("Failed to launch SSH client: {error}"),
+                    warnings: Vec::new(),
+                    collection_mode: "direct".to_string(),
+                    provider_device_id: None,
+                    provider_resolved_name: None,
+                    provider_last_resolved_at: None,
+                },
+            };
+            Ok(result)
+        } else if os == "windows" && protocol == "winrm" {
+            let mut warnings = Vec::new();
+            if profile.auth_type.eq_ignore_ascii_case("password")
+                && crate::settings::get_remote_profile_secret(&profile.id)
+                    .map_err(|error| command_error("settings", "Failed to read WinRM remote secret", error))?
+                    .is_none()
+            {
+                warnings.push("No WinRM password secret is stored in the OS keychain for this profile.".to_string());
+            }
+            Ok(remote_macos::RemoteConnectionTestResult {
+                ok: warnings.is_empty(),
+                protocol,
+                host: profile.host,
+                status: if warnings.is_empty() { "ready" } else { "auth failed" }.to_string(),
+                message: if warnings.is_empty() {
+                    "WinRM profile is configured. Use Refresh Logs for a live transport test.".to_string()
+                } else {
+                    warnings.join(" ")
+                },
+                warnings,
+                collection_mode: "direct".to_string(),
+                provider_device_id: None,
+                provider_resolved_name: None,
+                provider_last_resolved_at: None,
+            })
+        } else {
+            Ok(remote_macos::RemoteConnectionTestResult {
+                ok: false,
+                protocol,
+                host: profile.host,
+                status: "collection unsupported".to_string(),
+                message: "This remote protocol/OS combination is not implemented.".to_string(),
+                warnings: Vec::new(),
+                collection_mode: "unsupported".to_string(),
+                provider_device_id: None,
+                provider_resolved_name: None,
+                provider_last_resolved_at: None,
+            })
+        }
+    })
+    .await
+    .map_err(|error| {
+        command_error(
+            "runtime",
+            "Failed to join remote connection test task",
+            error.to_string(),
+        )
+    })?
 }
 
 fn sanitize_filename(filename: &str, extension: &str) -> String {
@@ -2507,6 +2697,9 @@ fn main() {
             save_remote_settings,
             save_remote_profile_secret,
             clear_remote_profile_secret,
+            save_remote_provider_secret,
+            clear_remote_provider_secret,
+            test_remote_connection,
             open_external_url,
             restart_elevated,
             refresh_local_events,

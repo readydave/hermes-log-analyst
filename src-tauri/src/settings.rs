@@ -108,17 +108,61 @@ pub struct RemoteConnectionProfile {
     pub ssh_key_path: Option<String>,
     #[serde(alias = "auth_type")]
     pub auth_type: String, // "key_only" or "password"
+    #[serde(default)]
+    pub provider_device_id: Option<String>,
+    #[serde(default)]
+    pub provider_last_resolved_name: Option<String>,
+    #[serde(default)]
+    pub provider_last_resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderAccount {
+    pub id: String,
+    pub provider: String,
+    pub name: String,
+    pub enabled: bool,
+    pub base_url: String,
+    #[serde(default)]
+    pub tenant_id: String,
+    #[serde(default)]
+    pub api_token_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteSettings {
     pub profiles: Vec<RemoteConnectionProfile>,
+    #[serde(default)]
+    pub provider_accounts: Vec<RemoteProviderAccount>,
 }
 
 impl Default for RemoteSettings {
     fn default() -> Self {
-        Self { profiles: Vec::new() }
+        Self {
+            profiles: Vec::new(),
+            provider_accounts: vec![
+                RemoteProviderAccount {
+                    id: "provider-jamf".to_string(),
+                    provider: "jamf".to_string(),
+                    name: "Jamf Pro".to_string(),
+                    enabled: false,
+                    base_url: String::new(),
+                    tenant_id: String::new(),
+                    api_token_configured: false,
+                },
+                RemoteProviderAccount {
+                    id: "provider-intune".to_string(),
+                    provider: "intune".to_string(),
+                    name: "Microsoft Intune".to_string(),
+                    enabled: false,
+                    base_url: "https://graph.microsoft.com".to_string(),
+                    tenant_id: String::new(),
+                    api_token_configured: false,
+                },
+            ],
+        }
     }
 }
 
@@ -133,6 +177,8 @@ fn sanitize_remote_auth_type(value: &str) -> String {
 fn sanitize_remote_protocol(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "winrm" => "winrm".to_string(),
+        "jamf" => "jamf".to_string(),
+        "intune" => "intune".to_string(),
         _ => "ssh".to_string(),
     }
 }
@@ -171,11 +217,76 @@ fn sanitize_remote_settings(settings: RemoteSettings) -> RemoteSettings {
                 .ssh_key_path
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
+            profile.provider_device_id = profile
+                .provider_device_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            profile.provider_last_resolved_name = profile
+                .provider_last_resolved_name
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            profile.provider_last_resolved_at = profile
+                .provider_last_resolved_at
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
             Some(profile)
         })
         .collect();
 
-    RemoteSettings { profiles }
+    let mut seen_provider_ids = HashSet::new();
+    let mut provider_accounts = settings
+        .provider_accounts
+        .into_iter()
+        .filter_map(|mut account| {
+            let normalized_provider = match account.provider.trim().to_ascii_lowercase().as_str() {
+                "jamf" => "jamf".to_string(),
+                "intune" => "intune".to_string(),
+                _ => return None,
+            };
+            let id = if account.id.trim().is_empty() {
+                format!("provider-{normalized_provider}")
+            } else {
+                account.id.trim().to_string()
+            };
+            if !seen_provider_ids.insert(id.to_ascii_lowercase()) {
+                return None;
+            }
+
+            account.id = id;
+            account.provider = normalized_provider.clone();
+            account.name = if account.name.trim().is_empty() {
+                match normalized_provider.as_str() {
+                    "jamf" => "Jamf Pro".to_string(),
+                    "intune" => "Microsoft Intune".to_string(),
+                    _ => "Remote Provider".to_string(),
+                }
+            } else {
+                account.name.trim().to_string()
+            };
+            account.base_url = account.base_url.trim().trim_end_matches('/').to_string();
+            if normalized_provider == "intune" && account.base_url.is_empty() {
+                account.base_url = "https://graph.microsoft.com".to_string();
+            }
+            account.tenant_id = account.tenant_id.trim().to_string();
+            Some(account)
+        })
+        .collect::<Vec<_>>();
+
+    for default_account in RemoteSettings::default().provider_accounts {
+        if !provider_accounts
+            .iter()
+            .any(|account| account.provider == default_account.provider)
+        {
+            provider_accounts.push(default_account);
+        }
+    }
+
+    provider_accounts.sort_by(|left, right| left.provider.cmp(&right.provider));
+
+    RemoteSettings {
+        profiles,
+        provider_accounts,
+    }
 }
 
 fn settings_dir() -> Result<PathBuf, String> {
@@ -711,6 +822,7 @@ pub fn save_llm_settings(settings: LlmSettings) -> Result<LlmSettings, String> {
 
 
 const REMOTE_HOST_KEYCHAIN_SERVICE: &str = "hermes-log-analyst-remote-hosts";
+const REMOTE_PROVIDER_KEYCHAIN_SERVICE: &str = "hermes-log-analyst-remote-providers";
 
 pub fn set_remote_profile_secret(profile_id: &str, secret: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(REMOTE_HOST_KEYCHAIN_SERVICE, profile_id)
@@ -732,6 +844,41 @@ pub fn clear_remote_profile_secret(profile_id: &str) -> Result<(), String> {
 
 pub fn get_remote_profile_secret(profile_id: &str) -> Result<Option<String>, String> {
     let entry = keyring::Entry::new(REMOTE_HOST_KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    match entry.get_password() {
+        Ok(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Unable to read secret from OS keychain: {error}")),
+    }
+}
+
+pub fn set_remote_provider_secret(provider_id: &str, secret: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(REMOTE_PROVIDER_KEYCHAIN_SERVICE, provider_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    entry
+        .set_password(secret)
+        .map_err(|error| format!("Unable to save secret in OS keychain: {error}"))
+}
+
+pub fn clear_remote_provider_secret(provider_id: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(REMOTE_PROVIDER_KEYCHAIN_SERVICE, provider_id)
+        .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
+    match entry.delete_credential() {
+        Ok(_) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Unable to clear secret from OS keychain: {error}")),
+    }
+}
+
+pub fn get_remote_provider_secret(provider_id: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(REMOTE_PROVIDER_KEYCHAIN_SERVICE, provider_id)
         .map_err(|error| format!("Unable to open OS keychain entry: {error}"))?;
     match entry.get_password() {
         Ok(value) => {

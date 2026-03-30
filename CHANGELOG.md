@@ -6,6 +6,28 @@ This changelog is intentionally sanitized. It excludes machine names, user-speci
 
 The project does not currently publish formal version tags for each change group below, so entries are organized by date and representative commit.
 
+## 2026-03-30
+
+### Added
+- macOS remote-host protocol expansion in Settings with profile-level support for `SSH`, `Jamf Pro`, and `Intune`.
+- Separate managed-provider account settings for Jamf Pro and Microsoft Intune with OS-keychain-backed token storage.
+- Real `Test Connection` support for remote profiles:
+  - macOS SSH transport/log-read smoke test
+  - Jamf Pro authentication + device resolution test
+  - Intune authentication + device resolution test
+- Cached managed-device metadata on remote host profiles:
+  - provider device ID
+  - resolved device name
+  - last resolved timestamp
+
+### Changed
+- `Refresh Logs` now adapts its operator messaging for managed macOS targets instead of implying every remote connection behaves like a live SSH session.
+- Remote settings now persist both host profiles and provider-account metadata in a sanitized backend shape while keeping provider secrets out of settings files.
+
+### Fixed
+- macOS remote-connection setup no longer forces operators into SSH-only workflows when a managed-device path is more appropriate.
+- Remote configuration now has a first-class path for validating provider-backed macOS profiles before attempting collection.
+
 ## 2026-03-27
 
 ### Added

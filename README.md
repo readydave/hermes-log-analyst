@@ -11,9 +11,14 @@ Hermes Log Analyst is a cross-platform desktop app for viewing and analyzing hos
   - Linux: `journalctl --since/--until -o json`.
   - macOS: `log show --style json` with start/end range.
 - Remote host collection:
-  - Linux and macOS via SSH.
+  - Linux via SSH.
+  - macOS via:
+    - SSH for direct remote-log access when Remote Login is enabled
+    - Jamf Pro for managed-device lookup and provider-backed evidence collection
+    - Microsoft Intune for managed-device lookup and queued/polling evidence collection
   - Windows via WinRM/PowerShell remoting.
   - Saved remote-host profiles and target switching across data-loading views.
+  - Dedicated remote `Test Connection` flow in Settings for validating transport/provider readiness before a log pull.
   - Current supported remote SSH path is key-based auth; interactive SSH password auth is not implemented.
 - Crash workflow:
   - Host crash metadata import (Windows WER + dumps, macOS DiagnosticReports, Linux apport/coredump).
@@ -139,9 +144,10 @@ Use these defaults for fast startup with useful breadth:
 - Remote host collection is implemented, but the credential UX is still rough:
   - SSH key-path workflows are wired in the Settings UI.
   - SSH password auth is not implemented for Linux/macOS remote collection.
+  - Jamf Pro and Intune provider tokens can be stored in the OS keychain from Settings.
   - WinRM/password secret management exists in the backend, but needs a cleaner frontend flow and broader validation.
-  - there is no dedicated `Test Remote Connection` action yet; use `Target Host -> Refresh Logs` as the current live validation path.
   - remote crash import is not implemented yet.
+  - Jamf Pro / Intune macOS collection currently returns managed-device troubleshooting evidence rather than a true remote `log show` slice.
 - If no events appear for a chosen date range, confirm:
   - `Load Events` completed for that exact range.
   - Filters (date/log type/severity/category/text) are not excluding results.
@@ -149,7 +155,8 @@ Use these defaults for fast startup with useful breadth:
 - If a remote host refresh returns zero events or fails:
   - Linux/macOS SSH targets must already be reachable non-interactively (for example via key file or ssh-agent).
   - Linux remote users must have permission to read `journalctl`.
-  - macOS remote users only see what `log show` permits for that account.
+  - macOS SSH users only see what `log show` permits for that account.
+  - Jamf Pro and Intune macOS targets must exist as uniquely resolvable managed devices for the configured provider account.
   - Windows WinRM/password auth still requires backend secret wiring from the frontend before it is operator-ready.
 - During `tauri dev`, this message is typically benign if app behavior is otherwise normal:
   - `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
@@ -166,7 +173,7 @@ Use these defaults for fast startup with useful breadth:
   - complete manual validation on Windows, macOS, and Garuda before treating provider flows as production-ready.
 - Deeper crash artifact parsing and optional symbolication pipeline.
 - Remote collection hardening:
-  - add a real `Test Remote Connection` action in Settings.
+  - deepen managed macOS provider collection from inventory/evidence summaries into true remote script-based log gathering.
   - tighten credential UX and validation for SSH/WinRM targets.
   - decide whether Linux/macOS SSH remains key-only or gains supported password auth.
   - make remote exact-range `Load Events` target-aware.

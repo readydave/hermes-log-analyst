@@ -35,8 +35,11 @@ import {
   listLlmNetworkInterfaces,
   getRemoteSettings,
   saveRemoteSettings,
+  saveRemoteProviderSecret,
   restartElevated,
-  openPathInShell
+  openPathInShell,
+  clearRemoteProviderSecret,
+  testRemoteConnection
 } from "./lib/backend";
 import type {
   IngestProfile,
@@ -50,7 +53,9 @@ import type {
   MinidumpAnalysisResult,
   SyncOperationResult,
   RemoteSettings,
-  RemoteConnectionProfile
+  RemoteConnectionProfile,
+  RemoteProviderAccount,
+  RemoteConnectionTestResult
 } from "./lib/backend";
 import { exportAsCsv, exportAsJson, exportAsText } from "./lib/export";
 import { applyFilters, defaultFilters } from "./lib/filters";
@@ -1377,10 +1382,26 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("home");
   const [targetHostId, setTargetHostId] = useState<string>("localhost");
   const [remoteSelectedId, setRemoteSelectedId] = useState<string>("");
-  const [remoteSettings, setRemoteSettingsState] = useState<RemoteSettings>({ profiles: [] });
+  const [remoteSettings, setRemoteSettingsState] = useState<RemoteSettings>({
+    profiles: [],
+    providerAccounts: []
+  });
+  const [remoteProviderTokenDrafts, setRemoteProviderTokenDrafts] = useState<Record<string, string>>({});
+  const [remoteConnectionResults, setRemoteConnectionResults] = useState<Record<string, RemoteConnectionTestResult>>({});
+  const [isTestingRemoteProfile, setIsTestingRemoteProfile] = useState(false);
   useEffect(() => {
     if (isTauriRuntime()) {
-      getRemoteSettings().then(setRemoteSettingsState).catch(console.error);
+      getRemoteSettings()
+        .then((settings) => {
+          setRemoteSettingsState(settings);
+          setRemoteProviderTokenDrafts(
+            settings.providerAccounts.reduce<Record<string, string>>((acc, account) => {
+              acc[account.id] = "";
+              return acc;
+            }, {})
+          );
+        })
+        .catch(console.error);
     }
   }, []);
 
@@ -2295,6 +2316,16 @@ export default function App() {
     setIsLoading(true);
     setLastError("");
     dismissCollectorWarning();
+
+    const activeRemoteProfile =
+      targetHostId !== "localhost"
+        ? remoteSettings.profiles.find((profile) => profile.id === targetHostId)
+        : undefined;
+    if (activeRemoteProfile?.os === "macos" && activeRemoteProfile.protocol === "jamf") {
+      setExportStatus("Running Jamf Pro managed collection for the selected Mac...");
+    } else if (activeRemoteProfile?.os === "macos" && activeRemoteProfile.protocol === "intune") {
+      setExportStatus("Submitting and polling Intune managed collection for the selected Mac...");
+    }
 
     try {
       const result = await refreshLocalEvents(targetHostId !== "localhost" ? targetHostId : undefined);
@@ -3329,10 +3360,96 @@ export default function App() {
     try {
       const saved = await saveRemoteSettings(remoteSettings);
       setRemoteSettingsState(saved);
+      setRemoteProviderTokenDrafts((current) =>
+        saved.providerAccounts.reduce<Record<string, string>>((acc, account) => {
+          acc[account.id] = current[account.id] ?? "";
+          return acc;
+        }, {})
+      );
       setExportStatus("Remote settings saved successfully.");
       window.setTimeout(() => setExportStatus(""), 2500);
     } catch (e: any) {
       setLastError(e.message || "Failed to save remote settings");
+    }
+  }
+
+  function updateRemoteProviderAccount(id: string, key: keyof RemoteProviderAccount, value: string | boolean) {
+    setRemoteSettingsState((prev) => ({
+      ...prev,
+      providerAccounts: prev.providerAccounts.map((account) =>
+        account.id === id ? { ...account, [key]: value } : account
+      )
+    }));
+  }
+
+  async function saveRemoteProviderTokenNow(account: RemoteProviderAccount): Promise<void> {
+    const secret = (remoteProviderTokenDrafts[account.id] || "").trim();
+    if (!secret) {
+      setLastError(`Enter a token for ${account.name} first.`);
+      return;
+    }
+    try {
+      await saveRemoteProviderSecret(account.id, secret);
+      setRemoteSettingsState((prev) => ({
+        ...prev,
+        providerAccounts: prev.providerAccounts.map((entry) =>
+          entry.id === account.id ? { ...entry, apiTokenConfigured: true } : entry
+        )
+      }));
+      setRemoteProviderTokenDrafts((prev) => ({ ...prev, [account.id]: "" }));
+      setExportStatus(`${account.name} token saved to OS keychain.`);
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : `Failed to save token for ${account.name}.`);
+    }
+  }
+
+  async function clearRemoteProviderTokenNow(account: RemoteProviderAccount): Promise<void> {
+    try {
+      await clearRemoteProviderSecret(account.id);
+      setRemoteSettingsState((prev) => ({
+        ...prev,
+        providerAccounts: prev.providerAccounts.map((entry) =>
+          entry.id === account.id ? { ...entry, apiTokenConfigured: false } : entry
+        )
+      }));
+      setExportStatus(`${account.name} token removed from OS keychain.`);
+      window.setTimeout(() => setExportStatus(""), 2500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : `Failed to clear token for ${account.name}.`);
+    }
+  }
+
+  async function testSelectedRemoteProfile(): Promise<void> {
+    if (!selectedRemoteProfile) return;
+    setLastError("");
+    setIsTestingRemoteProfile(true);
+    try {
+      const result = await testRemoteConnection(selectedRemoteProfile);
+      setRemoteConnectionResults((prev) => ({ ...prev, [selectedRemoteProfile.id]: result }));
+      if (result.ok && (result.providerDeviceId || result.providerResolvedName || result.providerLastResolvedAt)) {
+        setRemoteSettingsState((prev) => ({
+          ...prev,
+          profiles: prev.profiles.map((profile) =>
+            profile.id === selectedRemoteProfile.id
+              ? {
+                  ...profile,
+                  providerDeviceId: result.providerDeviceId ?? profile.providerDeviceId ?? null,
+                  providerLastResolvedName:
+                    result.providerResolvedName ?? profile.providerLastResolvedName ?? null,
+                  providerLastResolvedAt:
+                    result.providerLastResolvedAt ?? profile.providerLastResolvedAt ?? null
+                }
+              : profile
+          )
+        }));
+      }
+      setExportStatus(result.message);
+      window.setTimeout(() => setExportStatus(""), 3500);
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : "Remote connection test failed.");
+    } finally {
+      setIsTestingRemoteProfile(false);
     }
   }
 
@@ -3347,14 +3464,14 @@ export default function App() {
       sshKeyPath: "",
       authType: "key"
     };
-    setRemoteSettingsState(prev => ({ profiles: [...prev.profiles, newProfile] }));
+    setRemoteSettingsState(prev => ({ ...prev, profiles: [...prev.profiles, newProfile] }));
     setRemoteSelectedId(newProfile.id);
   }
 
   function deleteSelectedRemoteProfile() {
     setRemoteSettingsState(prev => {
       const arr = prev.profiles.filter(p => p.id !== remoteSelectedId);
-      return { profiles: arr };
+      return { ...prev, profiles: arr };
     });
     setRemoteSelectedId("");
   }
@@ -3364,12 +3481,77 @@ export default function App() {
       const idx = prev.profiles.findIndex(p => p.id === remoteSelectedId);
       if (idx === -1) return prev;
       const clone = [...prev.profiles];
-      clone[idx] = { ...clone[idx], [key]: value };
-      return { profiles: clone };
+      const current = { ...clone[idx], [key]: value } as RemoteConnectionProfile;
+      if (key === "os") {
+        if (value === "macos" && !["ssh", "jamf", "intune"].includes(current.protocol)) {
+          current.protocol = "ssh";
+        }
+        if (value === "linux") {
+          current.protocol = "ssh";
+          current.providerDeviceId = null;
+          current.providerLastResolvedAt = null;
+          current.providerLastResolvedName = null;
+        }
+        if (value === "windows" && current.protocol !== "winrm") {
+          current.protocol = "winrm";
+          current.providerDeviceId = null;
+          current.providerLastResolvedAt = null;
+          current.providerLastResolvedName = null;
+        }
+      }
+      if (key === "protocol") {
+        if (value === "jamf" || value === "intune") {
+          current.username = "";
+          current.sshKeyPath = "";
+          current.authType = "key";
+        }
+        if (value === "ssh") {
+          current.providerDeviceId = null;
+          current.providerLastResolvedAt = null;
+          current.providerLastResolvedName = null;
+        }
+      }
+      clone[idx] = current;
+      return { ...prev, profiles: clone };
     });
   }
 
   const selectedRemoteProfile = remoteSettings.profiles.find(p => p.id === remoteSelectedId);
+  const selectedRemoteProviderAccount = selectedRemoteProfile
+    ? remoteSettings.providerAccounts.find((account) => account.provider === selectedRemoteProfile.protocol)
+    : undefined;
+  const selectedRemoteConnectionResult = selectedRemoteProfile
+    ? remoteConnectionResults[selectedRemoteProfile.id]
+    : undefined;
+
+  function getRemoteProtocolOptions(profile?: RemoteConnectionProfile) {
+    if (!profile) return [{ id: "ssh", label: "SSH" }];
+    if (profile.os === "macos") {
+      return [
+        { id: "ssh", label: "SSH" },
+        { id: "jamf", label: "Jamf Pro" },
+        { id: "intune", label: "Intune" }
+      ];
+    }
+    if (profile.os === "windows") {
+      return [
+        { id: "winrm", label: "WinRM (HTTPS)" }
+      ];
+    }
+    return [{ id: "ssh", label: "SSH" }];
+  }
+
+  const activeTargetProfile =
+    targetHostId !== "localhost"
+      ? remoteSettings.profiles.find((profile) => profile.id === targetHostId)
+      : undefined;
+  const refreshButtonLabel = isLoading
+    ? activeTargetProfile?.os === "macos" && activeTargetProfile.protocol === "jamf"
+      ? "Collecting via Jamf..."
+      : activeTargetProfile?.os === "macos" && activeTargetProfile.protocol === "intune"
+        ? "Polling Intune..."
+        : "Refreshing..."
+    : "Refresh Logs";
 
   async function performSaveIngestWindow(): Promise<void> {
     setLastError("");
@@ -3664,7 +3846,7 @@ export default function App() {
               </select>
             </div>
             <Button variant="primary" onClick={() => void refreshNow()} disabled={isLoading}>
-              {isLoading ? "Refreshing..." : "Refresh Logs"}
+              {refreshButtonLabel}
             </Button>
             <Button onClick={() => openHelpTab("quick-start")}>Help</Button>
             <Button variant="danger" onClick={() => void quitApp()}>Exit</Button>
@@ -4339,6 +4521,94 @@ export default function App() {
             <div className="grid gap-3 border-t border-panel-border pt-4">
               <div className="text-sm font-semibold">Remote Hosts (Connections)</div>
               <div className="grid gap-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted">Provider Accounts</div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {remoteSettings.providerAccounts.map((account) => (
+                    <div key={account.id} className="rounded-lg border border-panel-border bg-panel p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="text-sm font-semibold text-text">{account.name}</div>
+                          <div className="text-xs text-muted">
+                            {account.provider === "jamf"
+                              ? "Managed macOS collection and device lookup for Jamf Pro."
+                              : "Managed macOS collection and queued/polling checks for Microsoft Intune."}
+                          </div>
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-muted">
+                          <input
+                            type="checkbox"
+                            checked={account.enabled}
+                            onChange={(e) => updateRemoteProviderAccount(account.id, "enabled", e.target.checked)}
+                          />
+                          Enabled
+                        </label>
+                      </div>
+                      <div className="mt-3 grid gap-2">
+                        <label className="text-xs text-muted">
+                          Display name
+                          <input
+                            className={inputClass}
+                            value={account.name}
+                            onChange={(e) => updateRemoteProviderAccount(account.id, "name", e.target.value)}
+                          />
+                        </label>
+                        <label className="text-xs text-muted">
+                          Base URL
+                          <input
+                            className={inputClass}
+                            value={account.baseUrl}
+                            placeholder={account.provider === "jamf" ? "https://yourtenant.jamfcloud.com" : "https://graph.microsoft.com"}
+                            onChange={(e) => updateRemoteProviderAccount(account.id, "baseUrl", e.target.value)}
+                          />
+                        </label>
+                        {account.provider === "intune" && (
+                          <label className="text-xs text-muted">
+                            Tenant ID / Directory hint
+                            <input
+                              className={inputClass}
+                              value={account.tenantId}
+                              placeholder="Optional tenant identifier"
+                              onChange={(e) => updateRemoteProviderAccount(account.id, "tenantId", e.target.value)}
+                            />
+                          </label>
+                        )}
+                        <label className="text-xs text-muted">
+                          API token (stored in OS keychain)
+                          <input
+                            className={inputClass}
+                            type="password"
+                            value={remoteProviderTokenDrafts[account.id] ?? ""}
+                            placeholder={
+                              account.apiTokenConfigured
+                                ? "Configured in keychain (enter to replace)"
+                                : "Paste provider API token"
+                            }
+                            onChange={(e) =>
+                              setRemoteProviderTokenDrafts((prev) => ({
+                                ...prev,
+                                [account.id]: e.target.value
+                              }))
+                            }
+                          />
+                        </label>
+                        <div className="flex flex-wrap gap-2">
+                          <Button size="sm" onClick={() => void saveRemoteProviderTokenNow(account)}>
+                            Save Token
+                          </Button>
+                          <Button
+                            size="sm"
+                            onClick={() => void clearRemoteProviderTokenNow(account)}
+                            disabled={!account.apiTokenConfigured}
+                          >
+                            Clear Token
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="grid gap-2 rounded-lg border border-panel-border bg-[var(--field-bg)] p-3">
                 <div className="text-xs font-semibold uppercase tracking-wide text-muted">Hosts</div>
                 <div className="grid gap-3 md:grid-cols-[280px_1fr]">
                   <div className="space-y-2">
@@ -4376,19 +4646,39 @@ export default function App() {
                           </label>
                           <label className="text-xs text-muted">Protocol
                             <select className={selectClass} value={selectedRemoteProfile.protocol} onChange={e => updateSelectedRemoteProfile("protocol", e.target.value)}>
-                              <option value="ssh">SSH</option>
-                              <option value="winrm">WinRM (HTTPS)</option>
+                              {getRemoteProtocolOptions(selectedRemoteProfile).map((option) => (
+                                <option key={option.id} value={option.id}>
+                                  {option.label}
+                                </option>
+                              ))}
                             </select>
                           </label>
-                          <label className="text-xs text-muted">Username
-                            <input className={inputClass} value={selectedRemoteProfile.username} onChange={e => updateSelectedRemoteProfile("username", e.target.value)} />
-                          </label>
-                          <label className="text-xs text-muted">Auth Type
-                            <select className={selectClass} value={selectedRemoteProfile.authType} onChange={e => updateSelectedRemoteProfile("authType", e.target.value)}>
-                              <option value="key">SSH Key / OS Keychain</option>
-                              <option value="password">Password</option>
-                            </select>
-                          </label>
+                          {selectedRemoteProfile.protocol === "ssh" && (
+                            <>
+                              <label className="text-xs text-muted">Username
+                                <input className={inputClass} value={selectedRemoteProfile.username} onChange={e => updateSelectedRemoteProfile("username", e.target.value)} />
+                              </label>
+                              <label className="text-xs text-muted">Auth Type
+                                <select className={selectClass} value={selectedRemoteProfile.authType} onChange={e => updateSelectedRemoteProfile("authType", e.target.value)}>
+                                  <option value="key">SSH Key / OS Keychain</option>
+                                  <option value="password">Password</option>
+                                </select>
+                              </label>
+                            </>
+                          )}
+                          {selectedRemoteProfile.protocol === "winrm" && (
+                            <>
+                              <label className="text-xs text-muted">Username
+                                <input className={inputClass} value={selectedRemoteProfile.username} onChange={e => updateSelectedRemoteProfile("username", e.target.value)} />
+                              </label>
+                              <label className="text-xs text-muted">Auth Type
+                                <select className={selectClass} value={selectedRemoteProfile.authType} onChange={e => updateSelectedRemoteProfile("authType", e.target.value)}>
+                                  <option value="password">Password</option>
+                                  <option value="key">Certificate / Keychain</option>
+                                </select>
+                              </label>
+                            </>
+                          )}
                         </div>
                         {selectedRemoteProfile.authType === "key" && selectedRemoteProfile.protocol === "ssh" && (
                           <label className="text-xs text-muted block mt-2">SSH Key Path (IdentityFile)
@@ -4400,12 +4690,63 @@ export default function App() {
                             SSH password authentication is not implemented yet. Use SSH key-based auth for Linux/macOS remote collection.
                           </div>
                         )}
+                        {(selectedRemoteProfile.protocol === "jamf" || selectedRemoteProfile.protocol === "intune") && (
+                          <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                            This macOS profile uses provider-backed device lookup by the Host field above. `Refresh Logs` collects managed-device troubleshooting evidence rather than a direct SSH session.
+                          </div>
+                        )}
                         {selectedRemoteProfile.protocol === "winrm" && selectedRemoteProfile.authType === "password" && (
                           <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
                             WinRM password auth requires a stored remote secret, but the frontend secret workflow is not wired yet.
                           </div>
                         )}
-                        <Button variant="primary" size="sm" className="mt-3" onClick={() => void saveRemoteHostSettings()}>Save Remote Layout</Button>
+                        {selectedRemoteProviderAccount && (
+                          <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                            Provider account: <span className="font-semibold text-text">{selectedRemoteProviderAccount.name}</span>
+                            {selectedRemoteProviderAccount.enabled ? "" : " (disabled)"}
+                            {selectedRemoteProfile.providerLastResolvedName && (
+                              <>
+                                <br />
+                                Cached device: <span className="font-semibold text-text">{selectedRemoteProfile.providerLastResolvedName}</span>
+                              </>
+                            )}
+                            {selectedRemoteProfile.providerDeviceId && (
+                              <>
+                                <br />
+                                Provider device ID: <span className="font-semibold text-text">{selectedRemoteProfile.providerDeviceId}</span>
+                              </>
+                            )}
+                            {selectedRemoteProfile.providerLastResolvedAt && (
+                              <>
+                                <br />
+                                Last resolved: {new Date(selectedRemoteProfile.providerLastResolvedAt).toLocaleString()}
+                              </>
+                            )}
+                          </div>
+                        )}
+                        {selectedRemoteConnectionResult && (
+                          <div className="rounded-lg border border-panel-border bg-panel px-3 py-2 text-xs text-muted">
+                            <div className="font-semibold text-text">
+                              Status: {selectedRemoteConnectionResult.status}
+                            </div>
+                            <div className="mt-1">{selectedRemoteConnectionResult.message}</div>
+                            {selectedRemoteConnectionResult.warnings.length > 0 && (
+                              <div className="mt-2 space-y-1">
+                                {selectedRemoteConnectionResult.warnings.map((warning, index) => (
+                                  <div key={`${selectedRemoteConnectionResult.host}-${index}`}>{warning}</div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Button variant="primary" size="sm" onClick={() => void saveRemoteHostSettings()}>
+                            Save Remote Layout
+                          </Button>
+                          <Button size="sm" onClick={() => void testSelectedRemoteProfile()} disabled={!selectedRemoteProfile || isTestingRemoteProfile}>
+                            {isTestingRemoteProfile ? "Testing..." : "Test Connection"}
+                          </Button>
+                        </div>
                       </>
                     )}
                   </div>
