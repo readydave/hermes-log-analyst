@@ -1,4 +1,4 @@
-use super::{CollectionEstimate, CollectionResult};
+use super::{CollectionEstimate, CollectionResult, NormalizedEvent, SupportedOs};
 use crate::settings::RemoteConnectionProfile;
 #[cfg(target_os = "windows")]
 use chrono::SecondsFormat;
